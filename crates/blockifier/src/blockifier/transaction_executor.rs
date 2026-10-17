@@ -147,6 +147,19 @@ impl<S: StateReader> TransactionExecutor<S> {
         }
     }
 
+    /// Seeds the SNOS output predictor with state changes applied before transaction execution.
+    pub fn seed_snos_output_shadow_from_block_state(&mut self) -> StateResult<()> {
+        let state_changes_keys = self
+            .block_state
+            .as_mut()
+            .expect("Blockifier block context has been taken")
+            .to_state_diff()?
+            .state_maps
+            .keys();
+        lock_bouncer(&self.bouncer).seed_snos_output_shadow(state_changes_keys);
+        Ok(())
+    }
+
     /// Executes the given transaction on the state maintained by the executor.
     /// Returns the execution result (info or error) if there is room for the transaction;
     /// Otherwise, returns BlockFull error.
