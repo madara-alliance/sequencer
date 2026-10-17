@@ -208,7 +208,8 @@ fn test_block_weights_has_room_n_txs(
     class_hashes_to_migrate: HashMap::from([
         (class_hash!(0_u128), (CompiledClassHash(felt!(2_u128)), CompiledClassHash(felt!(1_u128)))),
     ]),
-}
+},
+    snos_output_shadow: Default::default(),
 })]
 fn test_bouncer_update(#[case] initial_bouncer: Bouncer) {
     // TODO(Aviv): Use expect! to avoid magic numbers.
@@ -546,6 +547,26 @@ fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
     assert_eq!(prediction.modified_contracts, 2);
     assert_eq!(prediction.storage_updates, 5);
     assert_eq!(prediction.cells, 41);
+}
+
+#[test]
+fn test_snos_output_shadow_prediction_includes_preprocessed_state_changes() {
+    let versioned_constants = VersionedConstants::create_for_account_testing();
+    let contract_address = contract_address!(0x1_u128);
+    let storage_key = storage_key!(0x123_u128);
+    let preprocessed_state_changes_keys = StateChangesKeys {
+        storage_keys: HashSet::from([(contract_address, storage_key)]),
+        modified_contracts: HashSet::from([contract_address]),
+        ..StateChangesKeys::default()
+    };
+    let mut bouncer = Bouncer::empty();
+
+    bouncer.seed_snos_output_shadow(preprocessed_state_changes_keys);
+
+    let prediction = bouncer.snos_output_shadow_prediction(&versioned_constants);
+    assert_eq!(prediction.modified_contracts, 1);
+    assert_eq!(prediction.storage_updates, 1);
+    assert_eq!(prediction.cells, 23);
 }
 
 /// This test verifies that `get_tx_weights` returns a reasonable casm hash computation data.
