@@ -542,6 +542,7 @@ pub struct Bouncer {
 #[derive(Debug, Default, PartialEq)]
 #[cfg_attr(test, derive(Clone))]
 struct SnosOutputShadowTracker {
+    preprocessed_state_changes_keys: StateChangesKeys,
     checked_alias_candidates: HashSet<StorageKey>,
     new_alias_keys: HashSet<StorageKey>,
     alias_counter_was_zero: Option<bool>,
@@ -574,6 +575,13 @@ impl Bouncer {
 
     pub fn get_bouncer_weights(&self) -> &BouncerWeights {
         &self.accumulated_weights.bouncer_weights
+    }
+
+    pub(crate) fn seed_snos_output_shadow(
+        &mut self,
+        preprocessed_state_changes_keys: StateChangesKeys,
+    ) {
+        self.snos_output_shadow.preprocessed_state_changes_keys = preprocessed_state_changes_keys;
     }
 
     pub fn get_mut_casm_hash_computation_data_sierra_gas(
@@ -755,8 +763,12 @@ impl Bouncer {
         &self,
         versioned_constants: &VersionedConstants,
     ) -> SnosOutputShadowPrediction {
-        let mut storage_updates = self.state_changes_keys.storage_keys.clone();
-        let mut modified_contracts = self.state_changes_keys.modified_contracts.clone();
+        let mut storage_updates =
+            self.snos_output_shadow.preprocessed_state_changes_keys.storage_keys.clone();
+        storage_updates.extend(self.state_changes_keys.storage_keys.iter().copied());
+        let mut modified_contracts =
+            self.snos_output_shadow.preprocessed_state_changes_keys.modified_contracts.clone();
+        modified_contracts.extend(self.state_changes_keys.modified_contracts.iter().copied());
 
         if versioned_constants.enable_stateful_compression {
             let alias_contract_address =
