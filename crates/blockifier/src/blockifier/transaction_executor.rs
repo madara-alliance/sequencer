@@ -163,6 +163,7 @@ impl<S: StateReader> TransactionExecutor<S> {
                 let state_diff = transactional_state.to_state_diff()?.state_maps;
                 let tx_state_changes_keys = state_diff.keys();
                 lock_bouncer(&self.bouncer).try_update(
+                    self.block_context.block_info.block_number,
                     &transactional_state,
                     &tx_state_changes_keys,
                     &tx_execution_info.summarize(&self.block_context.versioned_constants),
@@ -281,6 +282,12 @@ pub(crate) fn finalize_block<S: StateReader>(
     block_state.set_compiled_class_hash_migration(&class_hashes_to_migrate)?;
 
     let state_diff = block_state.to_state_diff()?.state_maps;
+
+    bouncer.log_snos_output_shadow_final(
+        block_context.block_info.block_number,
+        &state_diff,
+        &block_context.versioned_constants,
+    );
 
     let compressed_state_diff = if block_context.versioned_constants.enable_stateful_compression {
         Some(compress(&state_diff, block_state, alias_contract_address)?.into())
