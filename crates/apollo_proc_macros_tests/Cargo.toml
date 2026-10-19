@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license-file.workspace = true
+description = "Tests for Apollo procedural macros."
 
 [dependencies]
 apollo_proc_macros.workspace = true
@@ -16,6 +17,7 @@ metrics-exporter-prometheus.workspace = true
 papyrus_common.workspace = true
 prometheus-parse.workspace = true
 rstest.workspace = true
+static_assertions.workspace = true
 
 [lints]
 workspace = true

@@ -3,7 +3,11 @@ use std::sync::Arc;
 
 use assert_matches::assert_matches;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
-use blockifier_test_utils::calldata::{create_calldata, create_trivial_calldata};
+use blockifier_test_utils::calldata::{
+    cairo0_proven_revert_scenario_calldata,
+    create_calldata,
+    create_trivial_calldata,
+};
 use blockifier_test_utils::contracts::FeatureContract;
 use cairo_lang_runner::short_string::as_cairo_short_string;
 use cairo_vm::types::builtin_name::BuiltinName;
@@ -17,7 +21,7 @@ use starknet_api::abi::abi_utils::{
     get_storage_var_address,
     selector_from_name,
 };
-use starknet_api::block::{FeeType, GasPrice};
+use starknet_api::block::{BlockHash, BlockNumber, FeeType, GasPrice};
 use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
 use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{
@@ -40,13 +44,16 @@ use starknet_api::test_utils::declare::executable_declare_tx;
 use starknet_api::test_utils::deploy_account::executable_deploy_account_tx;
 use starknet_api::test_utils::invoke::{executable_invoke_tx, InvokeTxArgs};
 use starknet_api::test_utils::{
+    test_block_hash,
     NonceManager,
+    CURRENT_BLOCK_NUMBER,
     DEFAULT_L1_DATA_GAS_MAX_AMOUNT,
     DEFAULT_L1_GAS_AMOUNT,
     DEFAULT_L2_GAS_MAX_AMOUNT,
     DEFAULT_STRK_L1_GAS_PRICE,
     DEFAULT_STRK_L2_GAS_PRICE,
     MAX_FEE,
+    TEST_OS_CONFIG_HASH,
 };
 use starknet_api::transaction::constants::TRANSFER_ENTRY_POINT_NAME;
 use starknet_api::transaction::fields::{
@@ -55,9 +62,13 @@ use starknet_api::transaction::fields::{
     ContractAddressSalt,
     Fee,
     GasVectorComputationMode,
+    ProofFacts,
     Resource,
     ResourceBounds,
+    SnosProofFacts,
     ValidResourceBounds,
+    VIRTUAL_OS_OUTPUT_VERSION,
+    VIRTUAL_SNOS,
 };
 use starknet_api::transaction::{
     DeclareTransaction,
@@ -79,6 +90,7 @@ use starknet_api::{
 };
 use starknet_types_core::felt::Felt;
 
+use crate::abi::constants::STORED_BLOCK_HASH_BUFFER;
 use crate::context::{BlockContext, TransactionContext};
 use crate::execution::call_info::CallInfo;
 use crate::execution::contract_class::TrackedResource;
@@ -105,8 +117,10 @@ use crate::test_utils::initial_test_state::{fund_account, test_state};
 use crate::test_utils::syscall::build_recurse_calldata;
 use crate::test_utils::test_templates::cairo_version;
 use crate::test_utils::{
+    create_valid_proof_facts_for_testing,
     get_const_syscall_resources,
     get_tx_resources,
+    get_valid_virtual_os_program_hash,
     CompilerBasedVersion,
     BALANCE,
 };
@@ -223,7 +237,8 @@ fn test_rc96_holes(
                 .receipt
                 .resources
                 .computation
-                .total_vm_resources()
+                .total_extended_vm_resources()
+                .vm_resources
                 .builtin_instance_counter[&BuiltinName::range_check96],
             24
         );
@@ -262,7 +277,7 @@ fn test_fee_enforcement(
     });
     let deploy_account_tx = AccountTransaction::new_for_sequencing(tx);
 
-    let enforce_fee = deploy_account_tx.enforce_fee();
+    let enforce_fee = deploy_account_tx.create_tx_info().enforce_fee();
     assert_ne!(zero_bounds, enforce_fee);
     let result = deploy_account_tx.execute(state, &block_context);
     // When fee is enforced, execution should fail because the account doesn't have sufficient
@@ -298,7 +313,7 @@ fn test_all_bounds_combinations_enforce_fee(
             },
         ),
     });
-    assert_eq!(account_tx.enforce_fee(), expected_enforce_fee);
+    assert_eq!(account_tx.create_tx_info().enforce_fee(), expected_enforce_fee);
 }
 
 #[rstest]
@@ -1386,7 +1401,13 @@ fn test_max_fee_to_max_steps_conversion(
     );
     let max_steps_limit1 = execution_context1.vm_run_resources.get_n_steps();
     let tx_execution_info1 = account_tx1.execute(&mut state, &block_context).unwrap();
-    let n_steps1 = tx_execution_info1.receipt.resources.computation.total_vm_resources().n_steps;
+    let n_steps1 = tx_execution_info1
+        .receipt
+        .resources
+        .computation
+        .total_extended_vm_resources()
+        .vm_resources
+        .n_steps;
     let gas_used_vector1 = tx_execution_info1.receipt.resources.to_gas_vector(
         &block_context.versioned_constants,
         block_context.block_info.use_kzg_da,
@@ -1411,7 +1432,13 @@ fn test_max_fee_to_max_steps_conversion(
     );
     let max_steps_limit2 = execution_context2.vm_run_resources.get_n_steps();
     let tx_execution_info2 = account_tx2.execute(&mut state, &block_context).unwrap();
-    let n_steps2 = tx_execution_info2.receipt.resources.computation.total_vm_resources().n_steps;
+    let n_steps2 = tx_execution_info2
+        .receipt
+        .resources
+        .computation
+        .total_extended_vm_resources()
+        .vm_resources
+        .n_steps;
     let gas_used_vector2 = tx_execution_info2.receipt.resources.to_gas_vector(
         &block_context.versioned_constants,
         block_context.block_info.use_kzg_da,
@@ -2189,5 +2216,202 @@ fn test_missing_validate_entrypoint_rejects(
         error,
         TransactionExecutionError::ValidateCairo0Error(ret)
         if ret == retdata![Felt::from_hex(ENTRYPOINT_NOT_FOUND_ERROR).unwrap()]
+    );
+}
+
+/// Converts SnosProofFacts to ProofFacts for testing.
+fn snos_to_proof_facts(snos: SnosProofFacts) -> ProofFacts {
+    vec![
+        snos.proof_version,
+        VIRTUAL_SNOS,
+        snos.program_hash,
+        VIRTUAL_OS_OUTPUT_VERSION,
+        felt!(snos.block_number.0),
+        snos.block_hash.0,
+        snos.config_hash,
+    ]
+    .into()
+}
+
+/// Returns valid proof_facts with the maximum allowed block number.
+fn proof_facts_with_max_allowed_block() -> ProofFacts {
+    let block_number = CURRENT_BLOCK_NUMBER - STORED_BLOCK_HASH_BUFFER;
+    create_valid_proof_facts_for_testing()
+        .try_into()
+        .map(|mut snos: SnosProofFacts| {
+            snos.block_number = BlockNumber(block_number);
+            snos.block_hash = test_block_hash(block_number);
+            snos_to_proof_facts(snos)
+        })
+        .unwrap()
+}
+
+/// Returns invalid proof_facts with a too recent block number (at the boundary).
+fn proof_facts_with_too_recent_block() -> ProofFacts {
+    // Set the proof block number to the first invalid value:
+    // `current_block_number - STORED_BLOCK_HASH_BUFFER + 1`
+    // (i.e. last allowed block + 1).
+    create_valid_proof_facts_for_testing()
+        .try_into()
+        .map(|mut snos: SnosProofFacts| {
+            snos.block_number = BlockNumber(CURRENT_BLOCK_NUMBER - STORED_BLOCK_HASH_BUFFER + 1);
+            snos_to_proof_facts(snos)
+        })
+        .unwrap()
+}
+
+/// Returns invalid proof_facts with a mismatched block hash.
+fn proof_facts_with_mismatched_hash() -> ProofFacts {
+    create_valid_proof_facts_for_testing()
+        .try_into()
+        .map(|mut snos: SnosProofFacts| {
+            snos.block_hash = BlockHash(snos.block_hash.0 + 1);
+            snos_to_proof_facts(snos)
+        })
+        .unwrap()
+}
+
+/// Returns invalid proof_facts with a zero block hash.
+fn proof_facts_with_zero_block_hash() -> ProofFacts {
+    create_valid_proof_facts_for_testing()
+        .try_into()
+        .map(|mut snos: SnosProofFacts| {
+            snos.block_hash = BlockHash(Felt::ZERO);
+            snos_to_proof_facts(snos)
+        })
+        .unwrap()
+}
+
+/// Returns invalid proof_facts with an invalid program hash.
+fn proof_facts_with_invalid_program_hash() -> ProofFacts {
+    ProofFacts::custom_proof_facts_for_testing(Felt::from(0x12345678_u64), *TEST_OS_CONFIG_HASH)
+}
+
+/// Returns invalid proof_facts with a mismatched config hash.
+fn proof_facts_with_invalid_config_hash() -> ProofFacts {
+    ProofFacts::custom_proof_facts_for_testing(
+        get_valid_virtual_os_program_hash(),
+        Felt::from(0x12345678_u64),
+    )
+}
+
+/// Tests the `validate_proof_facts` function for Invoke V3 transactions.
+/// The test runs `perform_pre_validation_stage` and asserts that invalid cases
+/// fail with `InvalidProofFacts`, while valid cases pass.
+#[rstest]
+#[case::valid(proof_facts_with_max_allowed_block(), CURRENT_BLOCK_NUMBER, None)]
+#[case::block_number_too_recent(
+    proof_facts_with_too_recent_block(),
+    CURRENT_BLOCK_NUMBER,
+    Some("is too recent")
+)]
+#[case::current_block_number_too_small(
+    create_valid_proof_facts_for_testing(),
+    STORED_BLOCK_HASH_BUFFER - 1,
+    Some("is below the required")
+)]
+#[case::block_hash_mismatched(
+    proof_facts_with_mismatched_hash(),
+    CURRENT_BLOCK_NUMBER,
+    Some("Block hash mismatch")
+)]
+#[case::block_hash_zero(
+    proof_facts_with_zero_block_hash(),
+    CURRENT_BLOCK_NUMBER,
+    Some("block hash is zero")
+)]
+#[case::program_hash_invalid(
+    proof_facts_with_invalid_program_hash(),
+    CURRENT_BLOCK_NUMBER,
+    Some("is not allowed")
+)]
+#[case::config_hash_invalid(
+    proof_facts_with_invalid_config_hash(),
+    CURRENT_BLOCK_NUMBER,
+    Some("OS config hash mismatch")
+)]
+fn test_validate_proof_facts(
+    default_all_resource_bounds: ValidResourceBounds,
+    #[case] proof_facts: ProofFacts,
+    #[case] current_block_number: u64,
+    #[case] expected_error: Option<&str>,
+) {
+    let mut block_context = BlockContext::create_for_account_testing();
+    block_context.block_info.block_number = BlockNumber(current_block_number);
+
+    let chain_info = &block_context.chain_info;
+    let account =
+        FeatureContract::AccountWithoutValidations(CairoVersion::Cairo1(RunnableCairo1::Casm));
+    let mut state = test_state(chain_info, BALANCE, &[(account, 1u16)]);
+    let account_address = account.get_instance_address(0_u16);
+
+    let tx = invoke_tx_with_default_flags(invoke_tx_args! {
+        sender_address: account_address,
+        resource_bounds: default_all_resource_bounds,
+        proof_facts,
+    });
+
+    // Run only pre-validation stage (which includes proof facts validation).
+    let tx_context = block_context.to_tx_context(&tx);
+    let result = tx.perform_pre_validation_stage(&mut state, &tx_context);
+
+    match expected_error {
+        Some(expected_msg) => {
+            let err = result.expect_err("Expected validation to fail");
+            assert_matches!(err, TransactionPreValidationError::InvalidProofFacts(msg) if msg.contains(expected_msg));
+        }
+        None => {
+            assert_matches!(result, Ok(()));
+        }
+    }
+}
+
+/// Test that changes in a cairo0 call that is part of a cairo1-reverted call tree are indeed
+/// reverted.
+#[rstest]
+fn test_cairo0_proven_revert(
+    block_context: BlockContext,
+    default_all_resource_bounds: ValidResourceBounds,
+) {
+    let chain_info = &block_context.chain_info;
+    let test_contract_cairo1 =
+        FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
+    let test_contract_cairo0 = FeatureContract::TestContract(CairoVersion::Cairo0);
+    let account =
+        FeatureContract::AccountWithoutValidations(CairoVersion::Cairo1(RunnableCairo1::Casm));
+    let mut state = test_state(
+        chain_info,
+        BALANCE,
+        &[(account, 1u16), (test_contract_cairo1, 1u16), (test_contract_cairo0, 1u16)],
+    );
+
+    let storage_key = Felt::from(1234u16);
+    let storage_value = Felt::from(1u16);
+    let account_address = account.get_instance_address(0_u16);
+    let cairo1_contract_address = test_contract_cairo1.get_instance_address(0_u16);
+    let cairo0_contract_address = test_contract_cairo0.get_instance_address(0_u16);
+
+    let calldata = cairo0_proven_revert_scenario_calldata(
+        cairo1_contract_address,
+        cairo0_contract_address,
+        storage_key,
+        storage_value,
+    );
+
+    let tx = executable_invoke_tx(invoke_tx_args! {
+        sender_address: account_address,
+        resource_bounds: default_all_resource_bounds,
+        calldata: calldata,
+    });
+    let account_tx = AccountTransaction { tx, execution_flags: AccountExecutionFlags::default() };
+    let tx_execution_info = account_tx.execute(&mut state, &block_context).unwrap();
+
+    // Verify that the storage write on the Cairo 0 contract was reverted, but the entire tx was
+    // not.
+    assert_matches!(tx_execution_info.revert_error, None);
+    assert!(!tx_execution_info.execute_call_info.unwrap().execution.failed);
+    assert_eq!(
+        state.get_storage_at(cairo0_contract_address, storage_key.try_into().unwrap()).unwrap(),
+        Felt::ZERO
     );
 }

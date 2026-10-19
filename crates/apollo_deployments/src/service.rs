@@ -3,7 +3,6 @@ use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
 use std::iter::once;
-use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
@@ -14,184 +13,101 @@ use apollo_infra_utils::dumping::serialize_to_file_test;
 use apollo_node_config::component_config::ComponentConfig;
 use apollo_node_config::component_execution_config::{
     ReactiveComponentExecutionConfig,
+    DEFAULT_INVALID_PORT,
     DEFAULT_URL,
 };
 use apollo_node_config::config_utils::{config_to_preset, prune_by_is_none};
 use phf::phf_set;
-use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 use serde_json::{from_str, json, Map, Value};
-use strum::{Display, EnumVariantNames, IntoEnumIterator};
-use strum_macros::{EnumDiscriminants, EnumIter, IntoStaticStr};
+use strum::{Display, EnumDiscriminants, EnumIter, IntoEnumIterator, IntoStaticStr, VariantNames};
 
-use crate::config_override::{deployment_replacer_file_path, instance_replacer_file_path};
-use crate::deployment::build_service_namespace_domain_address;
-use crate::deployment_definitions::{
-    ComponentConfigInService,
-    Environment,
-    InfraServicePort,
-    ServicePort,
-    CONFIG_BASE_DIR,
-};
+use crate::deployment_definitions::{ComponentConfigInService, CONFIG_BASE_DIR};
 use crate::deployments::consolidated::ConsolidatedNodeServiceName;
 use crate::deployments::distributed::DistributedNodeServiceName;
 use crate::deployments::hybrid::HybridNodeServiceName;
-use crate::k8s::{
-    Controller,
-    ExternalSecret,
-    Ingress,
-    IngressParams,
-    K8sServiceConfig,
-    K8sServiceConfigParams,
-    Resources,
-    Toleration,
-};
 use crate::replacers::insert_replacer_annotations;
 use crate::scale_policy::ScalePolicy;
 #[cfg(test)]
 use crate::test_utils::FIX_BINARY_NAME;
-use crate::update_strategy::UpdateStrategy;
 
 const SERVICES_DIR_NAME: &str = "services/";
+const REMOTE_SERVICE_URL_PLACEHOLDER: &str = "remote_service";
 
+// TODO(Tsabary): remove ports and mempool ttl from this list.
 pub static KEYS_TO_BE_REPLACED: phf::Set<&'static str> = phf_set! {
     "base_layer_config.bpo1_start_block_number",
     "base_layer_config.bpo2_start_block_number",
     "base_layer_config.fusaka_no_bpo_start_block_number",
-    "batcher_config.contract_class_manager_config.native_compiler_config.max_cpu_time",
-    "batcher_config.block_builder_config.bouncer_config.block_max_capacity.n_events",
-    "batcher_config.block_builder_config.bouncer_config.block_max_capacity.state_diff_size",
-    "batcher_config.block_builder_config.execute_config.n_workers",
-    "batcher_config.block_builder_config.proposer_idle_detection_delay_millis",
-    "batcher_config.contract_class_manager_config.cairo_native_run_config.native_classes_whitelist",
-    "class_manager_config.class_manager_config.max_compiled_contract_class_object_size",
+    "base_layer_config.starknet_contract_address",
+    "batcher_config.static_config.block_builder_config.bouncer_config.block_max_capacity.n_events",
+    "batcher_config.static_config.block_builder_config.bouncer_config.block_max_capacity.state_diff_size",
+    "batcher_config.static_config.block_builder_config.execute_config.n_workers",
+    "batcher_config.static_config.block_builder_config.n_concurrent_txs",
+    "batcher_config.static_config.block_builder_config.proposer_idle_detection_delay_millis",
+    "batcher_config.static_config.first_block_with_partial_block_hash.#is_none",
+    "batcher_config.static_config.first_block_with_partial_block_hash.block_number",
+    "batcher_config.static_config.first_block_with_partial_block_hash.block_hash",
+    "batcher_config.static_config.first_block_with_partial_block_hash.parent_block_hash",
+    "chain_id",
+    "class_manager_config.static_config.class_manager_config.max_compiled_contract_class_object_size",
+    "committer_config.storage_config.cache_size",
+    "committer_config.verify_state_diff_hash",
+    "consensus_manager_config.consensus_manager_config.dynamic_config.require_virtual_proposer_vote",
     "consensus_manager_config.consensus_manager_config.dynamic_config.timeouts.proposal.base",
     "consensus_manager_config.consensus_manager_config.dynamic_config.timeouts.proposal.max",
-    "consensus_manager_config.context_config.build_proposal_margin_millis",
-    "consensus_manager_config.context_config.override_eth_to_fri_rate",
-    "consensus_manager_config.context_config.override_eth_to_fri_rate.#is_none",
-    "consensus_manager_config.context_config.override_l1_data_gas_price_wei",
-    "consensus_manager_config.context_config.override_l1_data_gas_price_wei.#is_none",
-    "consensus_manager_config.context_config.override_l1_gas_price_wei",
-    "consensus_manager_config.context_config.override_l1_gas_price_wei.#is_none",
-    "consensus_manager_config.context_config.override_l2_gas_price_fri",
-    "consensus_manager_config.context_config.override_l2_gas_price_fri.#is_none",
-    "gateway_config.authorized_declarer_accounts",
-    "gateway_config.authorized_declarer_accounts.#is_none",
-    "gateway_config.contract_class_manager_config.native_compiler_config.max_cpu_time",
-    "gateway_config.stateful_tx_validator_config.max_allowed_nonce_gap",
-    "gateway_config.stateless_tx_validator_config.min_gas_price",
+    "consensus_manager_config.context_config.static_config.build_proposal_margin_millis",
+    "consensus_manager_config.context_config.dynamic_config.min_l2_gas_price_per_height",
+    "consensus_manager_config.context_config.dynamic_config.override_eth_to_fri_rate.#is_none",
+    "consensus_manager_config.context_config.dynamic_config.override_eth_to_fri_rate",
+    "consensus_manager_config.context_config.dynamic_config.override_l1_data_gas_price_fri.#is_none",
+    "consensus_manager_config.context_config.dynamic_config.override_l1_data_gas_price_fri",
+    "consensus_manager_config.context_config.dynamic_config.override_l1_gas_price_fri.#is_none",
+    "consensus_manager_config.context_config.dynamic_config.override_l1_gas_price_fri",
+    "consensus_manager_config.context_config.dynamic_config.override_l2_gas_price_fri.#is_none",
+    "consensus_manager_config.context_config.dynamic_config.override_l2_gas_price_fri",
+    "consensus_manager_config.context_config.dynamic_config.compare_retrospective_block_hash",
+    "consensus_manager_config.network_config.advertised_multiaddr.#is_none",
+    "consensus_manager_config.network_config.advertised_multiaddr",
+    "consensus_manager_config.network_config.bootstrap_peer_multiaddr.#is_none",
+    "consensus_manager_config.network_config.bootstrap_peer_multiaddr",
+    "consensus_manager_config.network_config.port",
+    "consensus_manager_config.staking_manager_config.dynamic_config.default_committee",
+    "consensus_manager_config.staking_manager_config.dynamic_config.override_committee.#is_none",
+    "consensus_manager_config.staking_manager_config.dynamic_config.override_committee",
+    "eth_fee_token_address",
+    "gateway_config.static_config.authorized_declarer_accounts.#is_none",
+    "gateway_config.static_config.authorized_declarer_accounts",
+    "gateway_config.static_config.proof_archive_writer_config.bucket_name",
+    "gateway_config.static_config.stateful_tx_validator_config.max_allowed_nonce_gap",
+    "gateway_config.static_config.stateless_tx_validator_config.min_gas_price",
+    "http_server_config.static_config.port",
     "mempool_config.dynamic_config.transaction_ttl",
+    "mempool_p2p_config.network_config.advertised_multiaddr.#is_none",
+    "mempool_p2p_config.network_config.advertised_multiaddr",
+    "mempool_p2p_config.network_config.bootstrap_peer_multiaddr.#is_none",
+    "mempool_p2p_config.network_config.bootstrap_peer_multiaddr",
+    "mempool_p2p_config.network_config.port",
+    "monitoring_endpoint_config.port",
+    "native_classes_whitelist",
+    "recorder_url",
+    "sierra_compiler_config.audited_libfuncs_only",
     "sierra_compiler_config.max_bytecode_size",
+    "starknet_url",
+    "state_sync_config.static_config.central_sync_client_config.#is_none",
+    "state_sync_config.static_config.central_sync_client_config.sync_config.store_sierras_and_casms_block_threshold",
+    "state_sync_config.static_config.network_config.#is_none",
+    "state_sync_config.static_config.p2p_sync_client_config.#is_none",
+    "state_sync_config.static_config.rpc_config.port",
+    "strk_fee_token_address",
+    "validator_id",
     "versioned_constants_overrides.max_n_events",
 };
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct Service {
-    #[serde(rename = "name")]
-    node_service: NodeService,
-    controller: Controller,
-    #[serde(serialize_with = "serialize_vec_strip_prefix")]
-    config_paths: Vec<String>,
-    ingress: Option<Ingress>,
-    k8s_service_config: Option<K8sServiceConfig>,
-    #[serde(rename = "autoscale")]
-    scale_policy: ScalePolicy,
-    replicas: usize,
-    storage: Option<usize>,
-    toleration: Option<Toleration>,
-    resources: Resources,
-    external_secret: Option<ExternalSecret>,
-    anti_affinity: bool,
-    #[serde(rename = "update_strategy_type")]
-    update_strategy: UpdateStrategy,
-    ports: BTreeMap<ServicePort, u16>,
-}
-
-impl Service {
-    pub fn new(
-        node_service: NodeService,
-        external_secret: Option<ExternalSecret>,
-        config_filenames: Vec<String>,
-        ingress_params: IngressParams,
-        k8s_service_config_params: Option<K8sServiceConfigParams>,
-        environment: Environment,
-    ) -> Self {
-        // Configs are loaded by order such that a config may override previous ones.
-        // We first list the base config, and then follow with the overrides, and finally, the
-        // service config file.
-
-        // TODO(Tsabary): reduce visibility of relevant functions and consts.
-
-        let components_in_service = node_service
-            .get_components_in_service()
-            .into_iter()
-            .flat_map(|c| c.get_component_config_file_paths())
-            .collect::<Vec<_>>();
-        let config_paths = components_in_service
-            .clone()
-            .into_iter()
-            .chain(config_filenames.clone())
-            .chain(once(node_service.get_service_file_path()))
-            .collect();
-
-        let controller = node_service.get_controller();
-        let scale_policy = node_service.get_scale_policy();
-        let toleration = node_service.get_toleration(&environment);
-        let ingress = node_service.get_ingress(&environment, ingress_params);
-        let k8s_service_config = node_service.get_k8s_service_config(k8s_service_config_params);
-        let storage = node_service.get_storage(&environment);
-        let resources = node_service.get_resources(&environment);
-        let replicas = node_service.get_replicas(&environment);
-        let anti_affinity = node_service.get_anti_affinity(&environment);
-        let ports = node_service.get_service_port_mapping();
-        let update_strategy = node_service.get_update_strategy();
-        Self {
-            node_service,
-            config_paths,
-            controller,
-            ingress,
-            k8s_service_config,
-            scale_policy,
-            replicas,
-            storage,
-            toleration,
-            resources,
-            external_secret,
-            anti_affinity,
-            update_strategy,
-            ports,
-        }
-    }
-
-    pub fn get_service_config_paths(&self) -> Vec<String> {
-        self.config_paths.clone()
-    }
-}
-
-fn serialize_vec_strip_prefix<S>(vec: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut seq = serializer.serialize_seq(Some(vec.len()))?;
-
-    for s in vec {
-        if let Some(stripped) = s.strip_prefix(CONFIG_BASE_DIR) {
-            seq.serialize_element(stripped)?;
-        } else {
-            return Err(serde::ser::Error::custom(format!(
-                "Expected all items to start with '{CONFIG_BASE_DIR}', got '{s}'"
-            )));
-        }
-    }
-
-    seq.end()
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumDiscriminants)]
 #[strum_discriminants(
     name(NodeType),
-    derive(IntoStaticStr, EnumIter, EnumVariantNames, Serialize, Display),
+    derive(IntoStaticStr, EnumIter, VariantNames, Serialize, Display),
     strum(serialize_all = "snake_case")
 )]
 pub enum NodeService {
@@ -212,30 +128,8 @@ impl NodeService {
             .to_string()
     }
 
-    fn get_config_file_path(&self) -> String {
-        format!("{}.json", self.as_inner())
-    }
-
     fn get_replacer_config_file_path(&self) -> String {
         format!("replacer_{}.json", self.as_inner())
-    }
-
-    pub fn create_service(
-        &self,
-        environment: &Environment,
-        external_secret: &Option<ExternalSecret>,
-        config_filenames: Vec<String>,
-        ingress_params: IngressParams,
-        k8s_service_config_params: Option<K8sServiceConfigParams>,
-    ) -> Service {
-        Service::new(
-            Into::<NodeService>::into(*self),
-            external_secret.clone(),
-            config_filenames,
-            ingress_params.clone(),
-            k8s_service_config_params,
-            environment.clone(),
-        )
     }
 
     fn as_inner(&self) -> &dyn ServiceNameInner {
@@ -244,66 +138,6 @@ impl NodeService {
             NodeService::Hybrid(inner) => inner,
             NodeService::Distributed(inner) => inner,
         }
-    }
-
-    pub fn get_controller(&self) -> Controller {
-        self.as_inner().get_controller()
-    }
-
-    pub fn get_scale_policy(&self) -> ScalePolicy {
-        self.as_inner().get_scale_policy()
-    }
-
-    pub fn get_toleration(&self, environment: &Environment) -> Option<Toleration> {
-        self.as_inner().get_toleration(environment)
-    }
-
-    pub fn get_ingress(
-        &self,
-        environment: &Environment,
-        ingress_params: IngressParams,
-    ) -> Option<Ingress> {
-        self.as_inner().get_ingress(environment, ingress_params)
-    }
-
-    pub fn get_k8s_service_config(
-        &self,
-        k8s_service_config_params: Option<K8sServiceConfigParams>,
-    ) -> Option<K8sServiceConfig> {
-        self.as_inner().get_k8s_service_config(k8s_service_config_params)
-    }
-
-    pub fn get_storage(&self, environment: &Environment) -> Option<usize> {
-        self.as_inner().get_storage(environment)
-    }
-
-    pub fn get_resources(&self, environment: &Environment) -> Resources {
-        self.as_inner().get_resources(environment)
-    }
-
-    pub fn get_replicas(&self, environment: &Environment) -> usize {
-        self.as_inner().get_replicas(environment)
-    }
-
-    pub fn get_anti_affinity(&self, environment: &Environment) -> bool {
-        // TODO(Tsabary): implement anti-affinity logic.
-        self.as_inner().get_anti_affinity(environment)
-    }
-
-    // Kubernetes service name as defined by CDK8s.
-    pub fn k8s_service_name(&self) -> String {
-        self.as_inner().k8s_service_name()
-    }
-
-    // TODO(Tsabary): deprecate this function after we complete the transition to the replacer
-    // format.
-    fn get_service_file_path(&self) -> String {
-        PathBuf::from(CONFIG_BASE_DIR)
-            .join(SERVICES_DIR_NAME)
-            .join(NodeType::from(self).get_folder_name())
-            .join(self.get_config_file_path())
-            .to_string_lossy()
-            .to_string()
     }
 
     fn get_replacer_service_file_path(&self) -> String {
@@ -317,14 +151,6 @@ impl NodeService {
 
     pub fn get_components_in_service(&self) -> BTreeSet<ComponentConfigInService> {
         self.as_inner().get_components_in_service()
-    }
-
-    pub fn get_service_port_mapping(&self) -> BTreeMap<ServicePort, u16> {
-        self.as_inner().get_service_port_mapping()
-    }
-
-    pub fn get_update_strategy(&self) -> UpdateStrategy {
-        self.as_inner().get_update_strategy()
     }
 
     fn replacer_app_config_files(&self) -> Vec<(Value, String)> {
@@ -363,11 +189,8 @@ impl NodeService {
             .zip(replacer_components_in_service.clone())
             .collect();
 
-        let replacer_config_filenames: Vec<String> =
-            vec![deployment_replacer_file_path(), instance_replacer_file_path()];
         let replacer_config_paths: Vec<String> = replacer_components_in_service
             .into_iter()
-            .chain(replacer_config_filenames)
             .chain(once(self.get_replacer_service_file_path()))
             .collect();
         let replacer_deployment_file_path = self.replacer_deployment_file_path();
@@ -392,90 +215,11 @@ impl NodeService {
 }
 
 pub(crate) trait ServiceNameInner: Display {
-    fn get_controller(&self) -> Controller;
-
     fn get_scale_policy(&self) -> ScalePolicy;
 
     fn get_retries(&self) -> usize;
 
-    fn get_toleration(&self, environment: &Environment) -> Option<Toleration>;
-
-    fn get_ingress(
-        &self,
-        environment: &Environment,
-        ingress_params: IngressParams,
-    ) -> Option<Ingress>;
-
-    fn get_k8s_service_config(
-        &self,
-        k8s_service_config_params: Option<K8sServiceConfigParams>,
-    ) -> Option<K8sServiceConfig> {
-        if self.has_p2p_interface() {
-            if let Some(K8sServiceConfigParams { namespace, domain, p2p_communication_type }) =
-                k8s_service_config_params
-            {
-                let service_namespace_domain = build_service_namespace_domain_address(
-                    &self.k8s_service_name(),
-                    &namespace,
-                    &domain,
-                );
-                return Some(K8sServiceConfig::new(
-                    Some(service_namespace_domain),
-                    p2p_communication_type,
-                ));
-            }
-        }
-        None
-    }
-
-    fn has_p2p_interface(&self) -> bool;
-
-    fn get_storage(&self, environment: &Environment) -> Option<usize>;
-
-    fn get_resources(&self, environment: &Environment) -> Resources;
-
-    fn get_replicas(&self, environment: &Environment) -> usize;
-
-    fn get_anti_affinity(&self, environment: &Environment) -> bool;
-
-    fn get_service_ports(&self) -> BTreeSet<ServicePort>;
-
-    fn get_service_port_mapping(&self) -> BTreeMap<ServicePort, u16> {
-        let mut ports = BTreeMap::new();
-
-        for service_port in self.get_service_ports() {
-            let port = service_port.get_port();
-            ports.insert(service_port, port);
-        }
-        ports
-    }
-
-    fn get_infra_service_port_mapping(&self) -> BTreeMap<InfraServicePort, u16> {
-        let mut ports = BTreeMap::new();
-
-        for service_port in self.get_service_ports() {
-            match service_port {
-                ServicePort::Infra(service) => {
-                    let port = service.get_port();
-                    ports.insert(service, port);
-                }
-                ServicePort::BusinessLogic(_) => {
-                    continue;
-                }
-            }
-        }
-        ports
-    }
-
-    // Kubernetes service name as defined by CDK8s.
-    fn k8s_service_name(&self) -> String {
-        let formatted_service_name = self.to_string().replace('_', "");
-        format!("sequencer-{formatted_service_name}-service")
-    }
-
     fn get_components_in_service(&self) -> BTreeSet<ComponentConfigInService>;
-
-    fn get_update_strategy(&self) -> UpdateStrategy;
 }
 
 impl NodeType {
@@ -540,13 +284,8 @@ impl NodeType {
                 ComponentConfigsSerializationWrapper::new(component_config, components_in_service);
             let flattened = config_to_preset(&json!(wrapper.dump()));
             let pruned = prune_by_is_none(flattened);
-            // TODO(Tsabary): deprecate this section after we complete the transition to the
-            // replacer format. Dumping in the original format.
-            let file_path = node_service.get_service_file_path();
-            writer(&pruned, &file_path);
 
             // Dumping in the replacer format.
-
             let pruned_with_replacer_annotations =
                 insert_replacer_annotations(pruned, replace_pred);
             let file_path = node_service.get_replacer_service_file_path();
@@ -618,12 +357,13 @@ fn replace_pred(key: &str, value: &Value) -> bool {
         return true;
     }
 
+    let invalid_port: u64 = DEFAULT_INVALID_PORT.into();
+
     // Condition 1: ports set by the infra: ".port" suffix and a non-zero integer value
-    let port_cond = key.ends_with(".port") && value.as_u64().map(|n| n != 0).unwrap_or(false);
+    let port_cond = key.ends_with(".port") && value.as_u64().is_some_and(|n| n != invalid_port);
 
     // Condition 2: service urls: ".url" suffix and a non-localhost string value
-    let url_cond =
-        key.ends_with(".url") && value.as_str().map(|s| s != DEFAULT_URL).unwrap_or(false);
+    let url_cond = key.ends_with(".url") && value.as_str().is_some_and(|s| s != DEFAULT_URL);
 
     port_cond || url_cond
 }
@@ -635,8 +375,7 @@ pub(crate) trait GetComponentConfigs: ServiceNameInner {
     /// connections from remote components.
     fn component_config_for_local_service(&self, port: u16) -> ReactiveComponentExecutionConfig {
         ReactiveComponentExecutionConfig::local_with_remote_enabled(
-            self.k8s_service_name(),
-            IpAddr::from(Ipv4Addr::UNSPECIFIED),
+            REMOTE_SERVICE_URL_PLACEHOLDER.to_string(),
             port,
         )
     }
@@ -645,13 +384,9 @@ pub(crate) trait GetComponentConfigs: ServiceNameInner {
     fn component_config_for_remote_service(&self, port: u16) -> ReactiveComponentExecutionConfig {
         let idle_connections = self.get_scale_policy().idle_connections();
         let retries = self.get_retries();
-        ReactiveComponentExecutionConfig::remote(
-            self.k8s_service_name(),
-            IpAddr::from(Ipv4Addr::UNSPECIFIED),
-            port,
-        )
-        .with_idle_connections(idle_connections)
-        .with_retries(retries)
+        ReactiveComponentExecutionConfig::remote(REMOTE_SERVICE_URL_PLACEHOLDER.to_string(), port)
+            .with_idle_connections(idle_connections)
+            .with_retries(retries)
     }
 
     fn component_config_pair(&self, port: u16) -> ComponentConfigPair {

@@ -1,23 +1,21 @@
 use std::sync::Arc;
 
-use apollo_consensus::types::Round;
-use apollo_state_sync_types::communication::{SharedStateSyncClient, StateSyncClientError};
+use apollo_batcher_types::communication::BatcherClientError;
+use apollo_protobuf::consensus::Round;
+use apollo_state_sync_types::communication::StateSyncClientError;
 use async_trait::async_trait;
-use blockifier::context::BlockContext;
-use blockifier::execution::errors::EntryPointExecutionError;
-use blockifier::state::state_api::StateReader;
 use starknet_api::block::BlockNumber;
 use starknet_api::core::ContractAddress;
 use starknet_api::staking::StakingWeight;
 use starknet_types_core::felt::Felt;
 use thiserror::Error;
 
-use crate::contract_types::RetdataDeserializationError;
+use crate::staking_contract::StakingContractError;
 
-pub type Committee = Vec<Staker>;
+pub type StakerSet = Vec<Staker>;
 
 #[cfg_attr(test, derive(Clone))]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Staker {
     // A contract address of the staker, to which rewards are sent.
     pub address: ContractAddress,
@@ -30,47 +28,66 @@ pub struct Staker {
 
 #[derive(Debug, Error)]
 pub enum CommitteeProviderError {
-    #[error(transparent)]
-    EntryPointExecutionError(#[from] EntryPointExecutionError),
-    #[error(transparent)]
-    RetdataDeserializationError(#[from] RetdataDeserializationError),
-    #[error(transparent)]
-    StateSyncClientError(#[from] StateSyncClientError),
     #[error("Committee is empty.")]
     EmptyCommittee,
+    #[error("Committee info unavailable for height {height}.")]
+    InvalidHeight { height: BlockNumber },
+    #[error("Missing epoch information for epoch {epoch_id}.")]
+    MissingInformation { epoch_id: u64 },
+    #[error(transparent)]
+    StakingContractError(#[from] StakingContractError),
+    #[error(
+        "Failed retrieving block hash for block {block_number:?}, because both Batcher and State \
+         Sync returned errors. Batcher error: {batcher_error:?}, State sync error: \
+         {state_sync_error:?}"
+    )]
+    BlockHashFetchFailed {
+        block_number: BlockNumber,
+        batcher_error: BatcherClientError,
+        state_sync_error: StateSyncClientError,
+    },
 }
 
 pub type CommitteeProviderResult<T> = Result<T, CommitteeProviderError>;
 
-#[cfg_attr(test, derive(Clone))]
-pub struct ExecutionContext<S: StateReader> {
-    pub state_reader: S,
-    pub block_context: Arc<BlockContext>,
-    pub state_sync_client: SharedStateSyncClient,
+#[derive(Debug, Error)]
+pub enum CommitteeError {
+    #[error("Committee is empty.")]
+    EmptyCommittee,
 }
 
-/// Trait for managing committee operations including fetching and selecting committee members
-/// and proposers for consensus.
-/// The committee is a subset of nodes (proposer and validators) that are selected to participate in
-/// the consensus at a given epoch, responsible for proposing blocks and voting on them.
-#[async_trait]
-pub trait CommitteeProvider {
-    /// Returns a list of the committee members at the given epoch.
-    /// The state's most recent block should be provided in the execution_context.
-    fn get_committee<S: StateReader>(
-        &mut self,
-        epoch: u64,
-        execution_context: ExecutionContext<S>,
-    ) -> CommitteeProviderResult<Arc<Committee>>;
+pub type CommitteeResult<T> = Result<T, CommitteeError>;
+
+/// Trait for committee operations including proposer selection.
+/// This trait is implemented by committee instances and provides synchronous methods
+/// for determining proposers based on height and round.
+#[cfg_attr(feature = "testing", mockall::automock)]
+pub trait CommitteeTrait: Send + Sync {
+    /// Returns a reference to the committee members.
+    fn members(&self) -> &StakerSet;
 
     /// Returns the address of the proposer for the specified height and round.
     ///
-    /// The proposer is deterministically selected for a given height and round, from the committee
-    /// corresponding to the epoch associated with that height.
-    async fn get_proposer<S: StateReader + Send>(
-        &mut self,
+    /// The proposer is deterministically selected for a given height and round using
+    /// weighted random selection based on staker weights.
+    fn get_proposer(&self, height: BlockNumber, round: Round) -> CommitteeResult<ContractAddress>;
+
+    /// Returns the address of the actual proposer for the specified height and round.
+    ///
+    /// Uses deterministic round-robin selection from eligible proposers:
+    /// `(height + round) % eligible_count`.
+    fn get_actual_proposer(&self, height: BlockNumber, round: Round) -> ContractAddress;
+}
+
+/// Trait for managing committee operations including fetching committee instances.
+/// The committee is a subset of nodes (proposer and validators) that are selected to participate in
+/// the consensus at a given epoch, responsible for proposing blocks and voting on them.
+#[async_trait]
+#[cfg_attr(feature = "testing", mockall::automock)]
+pub trait CommitteeProvider: Send + Sync {
+    /// Returns a committee instance for the epoch of the given height.
+    async fn get_committee(
+        &self,
         height: BlockNumber,
-        round: Round,
-        execution_context: ExecutionContext<S>,
-    ) -> CommitteeProviderResult<ContractAddress>;
+    ) -> CommitteeProviderResult<Arc<dyn CommitteeTrait>>;
 }

@@ -1,33 +1,43 @@
-use std::fs;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
-use apollo_infra_utils::cairo0_compiler::cairo0_format;
+use apollo_infra_utils::cairo0_compiler_test_utils::cairo0_format_batch;
 use apollo_infra_utils::compile_time_cargo_manifest_dir;
+use expect_test::expect_file;
+use rstest::rstest;
 
-use crate::CAIRO_FILES_MAP;
+use crate::{CAIRO_FILES_MAP, CONSTANTS_CAIRO_PATH};
 
+/// Cairo files to format, excluding auto-generated files.
+/// Skip constants.cairo — it is auto-generated and validated by test_os_constants, which
+/// also formats it. Including it here would cause a race condition between the two tests.
+static CAIRO_FILES_TO_FORMAT: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+    CAIRO_FILES_MAP
+        .iter()
+        .filter(|(path, _)| path.as_str() != CONSTANTS_CAIRO_PATH)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+});
+
+#[rstest]
 #[test]
 fn test_cairo0_formatting() {
     // Get the path to the apollo_starknet_os directory.
     let apollo_starknet_os_path =
         PathBuf::from(compile_time_cargo_manifest_dir!()).join("src/cairo");
 
-    let fix = std::env::var("FIX_CAIRO_FORMATTING").is_ok();
-    // Read all cairo files recursively from the directory.
-    for (relative_path, contents) in CAIRO_FILES_MAP.iter() {
-        let formatted = cairo0_format(contents);
-        if fix {
-            // If FIX_CAIRO_FORMAT is set, overwrite the original file with the formatted content.
-            let full_path = apollo_starknet_os_path.join(relative_path);
-            fs::write(full_path, formatted).unwrap();
-        } else {
-            assert_eq!(
-                formatted, *contents,
-                "Cairo file formatting mismatch in '{relative_path}'.\nTo automatically fix \
-                 formatting, run the test with the environment variable \
-                 FIX_CAIRO_FORMATTING=1:\n\n    FIX_CAIRO_FORMATTING=1 cargo test -p \
-                 apollo_starknet_os_program test_cairo0_formatting\n"
-            );
-        }
+    // Format all files in a single batch (much faster than per-file).
+    let formatted_files = cairo0_format_batch(CAIRO_FILES_TO_FORMAT.clone());
+    // Sanity check.
+    assert_eq!(
+        formatted_files.keys().collect::<HashSet<_>>(),
+        CAIRO_FILES_TO_FORMAT.keys().collect::<HashSet<_>>(),
+    );
+
+    // Verify each formatted file matches the expected output.
+    for (relative_path, formatted) in formatted_files {
+        let path = apollo_starknet_os_path.join(&relative_path);
+        expect_file![path].assert_eq(&formatted);
     }
 }

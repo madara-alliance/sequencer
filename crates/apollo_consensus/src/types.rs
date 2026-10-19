@@ -2,14 +2,15 @@
 use std::fmt::Debug;
 use std::time::Duration;
 
+use apollo_batcher_types::communication::BatcherClientError;
 use apollo_network::network_manager::{
     BroadcastTopicChannels,
     BroadcastTopicClient,
     GenericReceiver,
 };
 use apollo_network_types::network_types::BroadcastedMessageMetadata;
+use apollo_protobuf::consensus::{BuildParam, ProposalInit, Vote};
 pub use apollo_protobuf::consensus::{ProposalCommitment, Round};
-use apollo_protobuf::consensus::{ProposalInit, Vote};
 use apollo_protobuf::converters::ProtobufConversionError;
 use async_trait::async_trait;
 use futures::channel::{mpsc, oneshot};
@@ -46,7 +47,7 @@ pub trait ConsensusContext {
     /// parallel to the block being built.
     ///
     /// Params:
-    /// - `init`: The `ProposalInit` that is broadcast to the network.
+    /// - `build_param`: The `BuildParam` that is broadcast to the network.
     /// - `timeout`: The maximum time to wait for the block to be built.
     ///
     /// Returns:
@@ -55,9 +56,9 @@ pub trait ConsensusContext {
     ///   ConsensusContext.
     async fn build_proposal(
         &mut self,
-        init: ProposalInit,
+        build_param: BuildParam,
         timeout: Duration,
-    ) -> oneshot::Receiver<ProposalCommitment>;
+    ) -> Result<oneshot::Receiver<ProposalCommitment>, ConsensusError>;
 
     /// This function is called by consensus to validate a block. It expects that this call will
     /// return immediately and that context can then stream in the block's content in parallel to
@@ -84,20 +85,9 @@ pub trait ConsensusContext {
     /// validated proposal. It broadcasts the proposal to the network.
     ///
     /// Params:
-    /// - `id`: The `ProposalCommitment` associated with the block's content.
-    /// - `init`: The `ProposalInit` that is broadcast to the network.
-    async fn repropose(&mut self, id: ProposalCommitment, init: ProposalInit);
-
-    /// Get the set of validators for a given height. These are the nodes that can propose and vote
-    /// on blocks.
-    // TODO(matan): We expect this to change in the future to BTreeMap. Why?
-    // 1. Map - The nodes will have associated information (e.g. voting weight).
-    // 2. BTreeMap - We want a stable ordering of the nodes for deterministic leader selection.
-    async fn validators(&self, height: BlockNumber) -> Vec<ValidatorId>;
-
-    /// Calculates the ID of the Proposer based on the inputs.
-    // TODO(matan): Consider passing the validator set in order to keep this sync.
-    fn proposer(&self, height: BlockNumber, round: Round) -> ValidatorId;
+    /// - `proposal_commitment`: The `ProposalCommitment` associated with the block's content.
+    /// - `build_param`: The consensus metadata for reproposing.
+    async fn repropose(&mut self, proposal_commitment: ProposalCommitment, build_param: BuildParam);
 
     async fn broadcast(&mut self, message: Vote) -> Result<(), ConsensusError>;
 
@@ -106,7 +96,9 @@ pub trait ConsensusContext {
     async fn decision_reached(
         &mut self,
         height: BlockNumber,
+        round: Round,
         commitment: ProposalCommitment,
+        wait_for_last_commitment: bool,
     ) -> Result<(), ConsensusError>;
 
     /// Attempt to learn of a decision from the sync protocol.
@@ -115,7 +107,11 @@ pub trait ConsensusContext {
 
     /// Update the context with the current height and round.
     /// Must be called at the beginning of each height.
-    async fn set_height_and_round(&mut self, height: BlockNumber, round: Round);
+    async fn set_height_and_round(
+        &mut self,
+        height: BlockNumber,
+        round: Round,
+    ) -> Result<(), ConsensusError>;
 }
 
 #[derive(PartialEq, Debug)]
@@ -144,22 +140,11 @@ impl From<BroadcastTopicChannels<Vote>> for BroadcastVoteChannel {
 #[derive(thiserror::Error, PartialEq, Debug)]
 pub enum ConsensusError {
     #[error(transparent)]
-    Canceled(#[from] oneshot::Canceled),
-    #[error(transparent)]
-    ProtobufConversionError(#[from] ProtobufConversionError),
-    #[error(transparent)]
-    SendError(#[from] mpsc::SendError),
+    BatcherError(#[from] BatcherClientError),
+    #[error("Committee error: {0}")]
+    CommitteeError(String),
     // Indicates an error in communication between consensus and the node's networking component.
     // As opposed to an error between this node and peer nodes.
     #[error("{0}")]
     InternalNetworkError(String),
-    #[error("{0}")]
-    SyncError(String),
-    // For example the state machine and SHC are out of sync.
-    #[error("{0}")]
-    InternalInconsistency(String),
-    #[error("Block info conversion error: {0}")]
-    BlockInfoConversion(#[from] starknet_api::StarknetApiError),
-    #[error("{0}")]
-    Other(String),
 }

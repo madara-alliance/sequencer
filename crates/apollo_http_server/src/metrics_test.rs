@@ -1,6 +1,7 @@
 use apollo_gateway_types::communication::{GatewayClientError, MockGatewayClient};
 use apollo_gateway_types::gateway_types::{GatewayOutput, InvokeGatewayOutput};
 use apollo_infra::component_client::ClientError;
+use apollo_proc_macros::unique_u16;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rstest::rstest;
 use starknet_api::transaction::TransactionHash;
@@ -11,10 +12,10 @@ use crate::metrics::{
     ADDED_TRANSACTIONS_TOTAL,
 };
 use crate::test_utils::{
-    add_tx_http_client,
     deprecated_gateway_invoke_tx,
     rpc_invoke_tx,
     GatewayTransaction,
+    HttpClientServerSetupBuilder,
 };
 
 type InvalidTransaction = &'static str;
@@ -33,8 +34,8 @@ fn success_gateway_client_output() -> GatewayOutput {
 }
 
 #[rstest]
-#[case::add_deprecated_gateway_tx(0, deprecated_gateway_invoke_tx())]
-#[case::add_rpc_tx(1, rpc_invoke_tx())]
+#[case::add_deprecated_gateway_tx(unique_u16!(), deprecated_gateway_invoke_tx())]
+#[case::add_rpc_tx(unique_u16!(), rpc_invoke_tx())]
 #[tokio::test]
 async fn add_tx_metrics_test(#[case] index: u16, #[case] tx: impl GatewayTransaction) {
     // Create a mock gateway client that returns a successful response and a failure response.
@@ -59,7 +60,10 @@ async fn add_tx_metrics_test(#[case] index: u16, #[case] tx: impl GatewayTransac
     let _recorder_guard = metrics::set_default_local_recorder(&recorder);
     let prometheus_handle = recorder.handle();
 
-    let http_client = add_tx_http_client(mock_gateway_client, 14 + index).await;
+    let http_client = HttpClientServerSetupBuilder::new(index)
+        .with_mock_gateway_client(mock_gateway_client)
+        .build()
+        .await;
 
     // Send transactions to the server.
     for _ in std::iter::repeat_n((), SUCCESS_TXS_TO_SEND + FAILURE_TXS_TO_SEND) {
@@ -78,19 +82,12 @@ async fn add_tx_metrics_test(#[case] index: u16, #[case] tx: impl GatewayTransac
 
 #[tokio::test]
 async fn add_tx_serde_failure_metrics_test() {
-    let mut mock_gateway_client = MockGatewayClient::new();
-    // Set the successful response.
-    mock_gateway_client
-        .expect_add_tx()
-        .times(1)
-        .return_once(move |_| Ok(success_gateway_client_output()));
-
     // Initialize the metrics directly instead of spawning a monitoring endpoint task.
     let recorder = PrometheusBuilder::new().build_recorder();
     let _recorder_guard = metrics::set_default_local_recorder(&recorder);
     let prometheus_handle = recorder.handle();
 
-    let http_client = add_tx_http_client(mock_gateway_client, 16).await;
+    let http_client = HttpClientServerSetupBuilder::new(unique_u16!()).build().await;
 
     // Send a transaction that fails deserialization.
     let tx: InvalidTransaction = "invalid transaction";

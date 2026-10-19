@@ -1,16 +1,30 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
+use apollo_config_manager_types::communication::MockConfigManagerClient;
 use apollo_gateway_types::communication::MockGatewayClient;
 use apollo_gateway_types::gateway_types::GatewayOutput;
-use apollo_http_server_config::config::{HttpServerConfig, DEFAULT_MAX_SIERRA_PROGRAM_SIZE};
+use apollo_http_server_config::config::{
+    HttpServerConfig,
+    HttpServerDynamicConfig,
+    DEFAULT_MAX_SIERRA_PROGRAM_SIZE,
+};
 use apollo_infra_utils::test_utils::{AvailablePorts, TestIdentifier};
 use blockifier_test_utils::cairo_versions::CairoVersion;
-use mempool_test_utils::starknet_api_test_utils::{declare_tx, deploy_account_tx, invoke_tx};
-use reqwest::{Body, Client, Response, StatusCode};
+use http::StatusCode;
+use mempool_test_utils::starknet_api_test_utils::{
+    declare_tx,
+    deploy_account_tx,
+    invoke_tx,
+    invoke_tx_client_side_proving,
+};
+use reqwest::{Body, Client, Response};
 use serde::Serialize;
 use starknet_api::rpc_transaction::RpcTransaction;
+use starknet_api::transaction::fields::{Proof, ProofFacts};
 use starknet_api::transaction::TransactionHash;
+use tokio::time::sleep;
 
 use crate::deprecated_gateway_transaction::DeprecatedGatewayTransactionV3;
 use crate::http_server::HttpServer;
@@ -80,33 +94,110 @@ impl HttpTestClient {
             .await
             .unwrap()
     }
-}
 
-pub fn create_http_server_config(socket: SocketAddr) -> HttpServerConfig {
-    HttpServerConfig {
-        ip: socket.ip(),
-        port: socket.port(),
-        max_sierra_program_size: DEFAULT_MAX_SIERRA_PROGRAM_SIZE,
+    pub async fn add_rpc_tx_with_zstd(&self, compressed_body: Vec<u8>) -> Response {
+        self.client
+            .post(format!("http://{}/gateway/add_rpc_transaction", self.socket))
+            .header("content-type", "application/json")
+            .header("content-encoding", "zstd")
+            .body(Body::from(compressed_body))
+            .send()
+            .await
+            .unwrap()
     }
 }
 
-/// Creates an HTTP server and an HttpTestClient that can interact with it.
-pub async fn http_client_server_setup(
-    mock_gateway_client: MockGatewayClient,
+pub fn create_http_server_config(socket: SocketAddr) -> HttpServerConfig {
+    HttpServerConfig::new(socket.ip(), socket.port(), DEFAULT_MAX_SIERRA_PROGRAM_SIZE)
+}
+
+pub struct HttpClientServerSetupBuilder {
     http_server_config: HttpServerConfig,
-) -> HttpTestClient {
-    // Create and run the server.
-    let mut http_server =
-        HttpServer::new(http_server_config.clone(), Arc::new(mock_gateway_client));
-    tokio::spawn(async move { http_server.run().await });
+    mock_config_manager_client: Option<MockConfigManagerClient>,
+    mock_gateway_client: Option<MockGatewayClient>,
+}
 
-    let HttpServerConfig { ip, port, .. } = http_server_config;
-    let add_tx_http_client = HttpTestClient::new(SocketAddr::from((ip, port)));
+impl HttpClientServerSetupBuilder {
+    // The builder must be invoked with different port_index values to support concurrent execution,
+    // otherwise leading to Address already in use (os error 98) errors.
+    // The input port_index is used to construct the http_server_config.
+    pub fn new(port_index: u16) -> Self {
+        let ip = IpAddr::from(Ipv4Addr::LOCALHOST);
+        println!("Using port index {}", port_index);
+        let mut available_ports =
+            AvailablePorts::new(TestIdentifier::HttpServerUnitTests.into(), port_index);
+        let http_server_config = HttpServerConfig::new(
+            ip,
+            available_ports.get_next_port(),
+            DEFAULT_MAX_SIERRA_PROGRAM_SIZE,
+        );
+        Self::new_from_http_server_config(http_server_config)
+    }
 
-    // Ensure the server starts running.
-    tokio::task::yield_now().await;
+    // If a custom http server config is needed, don't hesitate to make this method public.
+    fn new_from_http_server_config(http_server_config: HttpServerConfig) -> Self {
+        Self { http_server_config, mock_config_manager_client: None, mock_gateway_client: None }
+    }
 
-    add_tx_http_client
+    pub fn with_max_request_body_size(mut self, max_request_body_size: usize) -> Self {
+        self.http_server_config.static_config.max_request_body_size = max_request_body_size;
+        self
+    }
+
+    pub fn with_mock_config_manager_client(
+        mut self,
+        mock_config_manager_client: MockConfigManagerClient,
+    ) -> Self {
+        self.mock_config_manager_client = Some(mock_config_manager_client);
+        self
+    }
+
+    pub fn with_mock_gateway_client(mut self, mock_gateway_client: MockGatewayClient) -> Self {
+        self.mock_gateway_client = Some(mock_gateway_client);
+        self
+    }
+
+    // Creates a client for testing the http server functionality.
+    pub async fn build(self) -> HttpTestClient {
+        let config_manager_client = Arc::new(
+            self.mock_config_manager_client.unwrap_or_else(|| get_mock_config_manager_client(true)),
+        );
+        let gateway_client = Arc::new(self.mock_gateway_client.unwrap_or_default());
+
+        // Spawn an http server wrapped in a retry mechanism.
+        let mut remaining_retries: u8 = 5;
+        loop {
+            // Create the server struct (consumed by the spawned task).
+            let mut http_server = HttpServer::new(
+                self.http_server_config.clone(),
+                config_manager_client.clone(),
+                gateway_client.clone(),
+            );
+            // Spawn the server.
+            let handle = tokio::spawn(async move { http_server.run().await });
+
+            // Let it run for a few milliseconds to ensure it has successfully started.
+            const SLEEP_DURATION: Duration = Duration::from_millis(10);
+            sleep(SLEEP_DURATION).await;
+
+            // Check if the server is still running, if so, continue. Otherwise, log and repeat.
+            if !handle.is_finished() {
+                break;
+            } else {
+                println!("Server handle: {handle:?}");
+                remaining_retries -= 1;
+                assert!(remaining_retries > 0, "Failed spawning test http server");
+            }
+        }
+
+        let (ip, port) = self.http_server_config.ip_and_port();
+        let add_tx_http_client = HttpTestClient::new(SocketAddr::from((ip, port)));
+
+        // Ensure the server starts running.
+        tokio::task::yield_now().await;
+
+        add_tx_http_client
+    }
 }
 
 pub trait GatewayTransaction: Serialize + Clone {
@@ -148,27 +239,24 @@ impl GatewayTransaction for TransactionSerialization {
     }
 }
 
-pub async fn add_tx_http_client(
-    mock_gateway_client: MockGatewayClient,
-    port_index: u16,
-) -> HttpTestClient {
-    let ip = IpAddr::from(Ipv4Addr::LOCALHOST);
-    let mut available_ports =
-        AvailablePorts::new(TestIdentifier::HttpServerUnitTests.into(), port_index);
-    let http_server_config = HttpServerConfig {
-        ip,
-        port: available_ports.get_next_port(),
-        max_sierra_program_size: DEFAULT_MAX_SIERRA_PROGRAM_SIZE,
-    };
-    http_client_server_setup(mock_gateway_client, http_server_config).await
-}
-
 pub fn rpc_invoke_tx() -> RpcTransaction {
     invoke_tx(CairoVersion::default())
 }
 
+pub fn rpc_invoke_tx_client_side_proving() -> RpcTransaction {
+    invoke_tx_client_side_proving(
+        CairoVersion::default(),
+        ProofFacts::snos_proof_facts_for_testing(),
+        Proof::proof_for_testing(),
+    )
+}
+
 pub fn deprecated_gateway_invoke_tx() -> DeprecatedGatewayTransactionV3 {
     DeprecatedGatewayTransactionV3::from(rpc_invoke_tx())
+}
+
+pub fn deprecated_gateway_invoke_tx_client_side_proving() -> DeprecatedGatewayTransactionV3 {
+    DeprecatedGatewayTransactionV3::from(rpc_invoke_tx_client_side_proving())
 }
 
 pub fn deprecated_gateway_deploy_account_tx() -> DeprecatedGatewayTransactionV3 {
@@ -177,4 +265,14 @@ pub fn deprecated_gateway_deploy_account_tx() -> DeprecatedGatewayTransactionV3 
 
 pub fn deprecated_gateway_declare_tx() -> DeprecatedGatewayTransactionV3 {
     DeprecatedGatewayTransactionV3::from(declare_tx())
+}
+
+// A mock config manager client returning the an http server dynamic config that accepts/rejects
+// transactions for an unlimited number of requests.
+pub fn get_mock_config_manager_client(accept_new_txs: bool) -> MockConfigManagerClient {
+    let mut mock_config_manager_client = MockConfigManagerClient::new();
+    mock_config_manager_client
+        .expect_get_http_server_dynamic_config()
+        .returning(move || Ok(HttpServerDynamicConfig { accept_new_txs, ..Default::default() }));
+    mock_config_manager_client
 }

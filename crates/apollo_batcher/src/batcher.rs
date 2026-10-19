@@ -2,12 +2,18 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 
-use apollo_batcher_config::config::BatcherConfig;
+use apollo_batcher_config::config::{
+    BatcherConfig,
+    BatcherDynamicConfig,
+    FirstBlockWithPartialBlockHash,
+};
 use apollo_batcher_types::batcher_types::{
     BatcherResult,
     CentralObjects,
     DecisionReachedInput,
     DecisionReachedResponse,
+    FinishedProposalInfo,
+    FinishedProposalInfoWithoutParent,
     GetHeightResponse,
     GetProposalContent,
     GetProposalContentInput,
@@ -24,22 +30,34 @@ use apollo_batcher_types::batcher_types::{
     ValidateBlockInput,
 };
 use apollo_batcher_types::errors::BatcherError;
-use apollo_class_manager_types::transaction_converter::TransactionConverter;
 use apollo_class_manager_types::SharedClassManagerClient;
+use apollo_committer_types::committer_types::RevertBlockResponse;
 use apollo_committer_types::communication::SharedCommitterClient;
+use apollo_config_manager_types::communication::SharedConfigManagerClient;
 use apollo_infra::component_definitions::{default_component_start_fn, ComponentStarter};
 use apollo_l1_provider_types::errors::{L1ProviderClientError, L1ProviderError};
 use apollo_l1_provider_types::{SessionState, SharedL1ProviderClient};
 use apollo_mempool_types::communication::SharedMempoolClient;
 use apollo_mempool_types::mempool_types::CommitBlockArgs;
+use apollo_proof_manager_types::SharedProofManagerClient;
 use apollo_reverts::revert_block;
 use apollo_state_sync_types::state_sync_types::SyncBlock;
-use apollo_storage::block_hash_marker::BlockHashMarkerStorageReader;
+use apollo_storage::block_hash::{BlockHashStorageReader, BlockHashStorageWriter};
+use apollo_storage::global_root::{GlobalRootStorageReader, GlobalRootStorageWriter};
+use apollo_storage::global_root_marker::{
+    GlobalRootMarkerStorageReader,
+    GlobalRootMarkerStorageWriter,
+};
 use apollo_storage::metrics::BATCHER_STORAGE_OPEN_READ_TRANSACTIONS;
-use apollo_storage::partial_block_hash::PartialBlockHashComponentsStorageWriter;
+use apollo_storage::partial_block_hash::{
+    PartialBlockHashComponentsStorageReader,
+    PartialBlockHashComponentsStorageWriter,
+};
 use apollo_storage::state::{StateStorageReader, StateStorageWriter};
+use apollo_storage::storage_reader_server::ServerConfig;
+use apollo_storage::storage_reader_types::GenericStorageReaderServer;
 use apollo_storage::{
-    open_storage_with_metric,
+    open_storage_with_metric_and_server,
     StorageError,
     StorageReader,
     StorageResult,
@@ -52,14 +70,17 @@ use futures::FutureExt;
 use indexmap::{IndexMap, IndexSet};
 #[cfg(test)]
 use mockall::automock;
-use starknet_api::block::BlockNumber;
-use starknet_api::block_hash::block_hash_calculator::PartialBlockHashComponents;
-use starknet_api::block_hash::state_diff_hash::calculate_state_diff_hash;
+use starknet_api::block::{BlockHash, BlockNumber, UnixTimestamp};
+use starknet_api::block_hash::block_hash_calculator::{
+    PartialBlockHash,
+    PartialBlockHashComponents,
+};
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
-use starknet_api::core::{ContractAddress, Nonce};
+use starknet_api::core::{ContractAddress, GlobalRoot, Nonce, StateDiffCommitment};
 use starknet_api::state::{StateNumber, ThinStateDiff};
 use starknet_api::transaction::TransactionHash;
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 use tracing::{debug, error, info, instrument, trace, Instrument};
 
 use crate::block_builder::{
@@ -72,11 +93,19 @@ use crate::block_builder::{
     BlockMetadata,
 };
 use crate::cende_client_types::CendeBlockMetadata;
+use crate::commitment_manager::commitment_manager_impl::{
+    ApolloCommitmentManager,
+    CommitmentManager,
+};
+use crate::commitment_manager::types::RevertTaskOutput;
 use crate::metrics::{
     register_metrics,
     ProposalMetricsHandle,
     BATCHED_TRANSACTIONS,
     BATCHER_L1_PROVIDER_ERRORS,
+    BUILDING_HEIGHT,
+    GLOBAL_ROOT_HEIGHT,
+    L2_GAS_IN_LAST_BLOCK,
     LAST_BATCHED_BLOCK_HEIGHT,
     LAST_PROPOSED_BLOCK_HEIGHT,
     LAST_SYNCED_BLOCK_HEIGHT,
@@ -86,7 +115,6 @@ use crate::metrics::{
     REVERTED_BLOCKS,
     REVERTED_TRANSACTIONS,
     SIERRA_GAS_IN_LAST_BLOCK,
-    STORAGE_HEIGHT,
     SYNCED_TRANSACTIONS,
 };
 use crate::pre_confirmed_block_writer::{
@@ -96,7 +124,6 @@ use crate::pre_confirmed_block_writer::{
 };
 use crate::pre_confirmed_cende_client::PreconfirmedCendeClientTrait;
 use crate::transaction_provider::{
-    ProofValidator,
     ProposeTransactionProvider,
     TxProviderPhase,
     ValidateTransactionProvider,
@@ -112,6 +139,7 @@ use crate::utils::{
 type OutputStreamReceiver = tokio::sync::mpsc::UnboundedReceiver<InternalConsensusTransaction>;
 type InputStreamSender = tokio::sync::mpsc::Sender<InternalConsensusTransaction>;
 
+#[cfg_attr(test, apollo_proc_macros::upgrade_fields_visibility(pub(crate)))]
 pub struct Batcher {
     pub config: BatcherConfig,
     pub storage_reader: Arc<dyn BatcherStorageReader>,
@@ -119,7 +147,7 @@ pub struct Batcher {
     pub committer_client: SharedCommitterClient,
     pub l1_provider_client: SharedL1ProviderClient,
     pub mempool_client: SharedMempoolClient,
-    pub transaction_converter: TransactionConverter,
+    pub config_manager_client: SharedConfigManagerClient,
 
     /// Used to create block builders.
     /// Using the factory pattern to allow for easier testing.
@@ -157,6 +185,12 @@ pub struct Batcher {
     /// The proposal commitment of the previous height.
     /// This is returned by the decision_reached function.
     prev_proposal_commitment: Option<(BlockNumber, ProposalCommitment)>,
+
+    commitment_manager: ApolloCommitmentManager,
+
+    // Kept alive to maintain the server running.
+    #[allow(dead_code)]
+    storage_reader_server_handle: Option<AbortHandle>,
 }
 
 impl Batcher {
@@ -168,9 +202,11 @@ impl Batcher {
         committer_client: SharedCommitterClient,
         l1_provider_client: SharedL1ProviderClient,
         mempool_client: SharedMempoolClient,
-        transaction_converter: TransactionConverter,
+        config_manager_client: SharedConfigManagerClient,
         block_builder_factory: Box<dyn BlockBuilderFactoryTrait>,
         pre_confirmed_block_writer_factory: Box<dyn PreconfirmedBlockWriterFactoryTrait>,
+        commitment_manager: ApolloCommitmentManager,
+        storage_reader_server_handle: Option<AbortHandle>,
     ) -> Self {
         Self {
             config,
@@ -179,7 +215,7 @@ impl Batcher {
             committer_client,
             l1_provider_client,
             mempool_client,
-            transaction_converter,
+            config_manager_client,
             block_builder_factory,
             pre_confirmed_block_writer_factory,
             active_height: None,
@@ -191,7 +227,13 @@ impl Batcher {
             // Allow the first few proposals to be without L1 txs while system starts up.
             proposals_counter: 1,
             prev_proposal_commitment: None,
+            commitment_manager,
+            storage_reader_server_handle,
         }
+    }
+
+    pub(crate) fn update_dynamic_config(&mut self, dynamic_config: BatcherDynamicConfig) {
+        self.config.dynamic_config = dynamic_config;
     }
 
     #[instrument(skip(self), err)]
@@ -216,6 +258,8 @@ impl Batcher {
         Ok(())
     }
 
+    // TODO(Rotem): Once the fallback option to state sync is removed - remove
+    // `retrospective_block_hash` from the input and get it from storage instead.
     #[instrument(skip(self), err)]
     pub async fn propose_block(
         &mut self,
@@ -269,7 +313,9 @@ impl Batcher {
                 BATCHER_L1_PROVIDER_ERRORS.increment(1);
             });
 
-        let start_phase = if self.proposals_counter.is_multiple_of(self.config.propose_l1_txs_every)
+        let start_phase = if self
+            .proposals_counter
+            .is_multiple_of(self.config.static_config.propose_l1_txs_every)
         {
             TxProviderPhase::L1
         } else {
@@ -278,7 +324,7 @@ impl Batcher {
         let tx_provider = ProposeTransactionProvider::new(
             self.mempool_client.clone(),
             self.l1_provider_client.clone(),
-            self.config.max_l1_handler_txs_per_block_proposal,
+            self.config.static_config.max_l1_handler_txs_per_block_proposal,
             propose_block_input.block_info.block_number,
             start_phase,
         );
@@ -306,9 +352,11 @@ impl Batcher {
                     is_validator: false,
                     proposer_idle_detection_delay: self
                         .config
+                        .static_config
                         .block_builder_config
                         .proposer_idle_detection_delay_millis,
                 },
+                self.config.dynamic_config.native_classes_whitelist.clone(),
                 Box::new(tx_provider),
                 Some(output_tx_sender),
                 Some(candidate_tx_sender),
@@ -371,17 +419,15 @@ impl Batcher {
 
         // A channel to send the transactions to include in the block being validated.
         let (input_tx_sender, input_tx_receiver) =
-            tokio::sync::mpsc::channel(self.config.input_stream_content_buffer_size);
+            tokio::sync::mpsc::channel(self.config.static_config.input_stream_content_buffer_size);
         let (final_n_executed_txs_sender, final_n_executed_txs_receiver) =
             tokio::sync::oneshot::channel();
-        let proof_validator = ProofValidator::new();
 
         let tx_provider = ValidateTransactionProvider::new(
             input_tx_receiver,
             final_n_executed_txs_receiver,
             self.l1_provider_client.clone(),
             validate_block_input.block_info.block_number,
-            proof_validator,
         );
         let (block_builder, abort_signal_sender) = self
             .block_builder_factory
@@ -395,9 +441,11 @@ impl Batcher {
                     is_validator: true,
                     proposer_idle_detection_delay: self
                         .config
+                        .static_config
                         .block_builder_config
                         .proposer_idle_detection_delay_millis,
                 },
+                self.config.dynamic_config.native_classes_whitelist.clone(),
                 Box::new(tx_provider),
                 None,
                 None,
@@ -452,6 +500,7 @@ impl Batcher {
     }
 
     /// Clear all the proposals from the previous height.
+    #[cfg_attr(any(test, feature = "testing"), apollo_proc_macros::make_visibility(pub))]
     async fn abort_active_height(&mut self) {
         self.abort_active_proposal().await;
         self.executed_proposals.lock().await.clear();
@@ -507,7 +556,7 @@ impl Batcher {
         let proposal_result =
             self.get_completed_proposal_result(proposal_id).await.expect("Proposal should exist.");
         let proposal_status = match proposal_result {
-            Ok((commitment, _)) => ProposalStatus::Finished(commitment),
+            Ok(info) => ProposalStatus::Finished(info),
             Err(err) => proposal_status_from(err)?,
         };
         Ok(SendProposalContentResponse { response: proposal_status })
@@ -532,7 +581,7 @@ impl Batcher {
     }
 
     fn get_height_from_storage(&self) -> BatcherResult<BlockNumber> {
-        self.storage_reader.height().map_err(|err| {
+        self.storage_reader.state_diff_height().map_err(|err| {
             error!("Failed to get height from storage: {}", err);
             BatcherError::InternalError
         })
@@ -542,6 +591,14 @@ impl Batcher {
     pub async fn get_height(&self) -> BatcherResult<GetHeightResponse> {
         let height = self.get_height_from_storage()?;
         Ok(GetHeightResponse { height })
+    }
+
+    #[instrument(skip(self), err)]
+    pub async fn get_timestamp(&self) -> BatcherResult<UnixTimestamp> {
+        self.mempool_client.get_timestamp().await.map_err(|err| {
+            error!("Failed to get timestamp from mempool: {err}");
+            BatcherError::InternalError
+        })
     }
 
     #[instrument(skip(self), err)]
@@ -558,8 +615,9 @@ impl Batcher {
 
         // Blocking until we have some txs to stream or the proposal is done.
         let mut txs = Vec::new();
-        let n_executed_txs =
-            tx_stream.recv_many(&mut txs, self.config.outstream_content_buffer_size).await;
+        let n_executed_txs = tx_stream
+            .recv_many(&mut txs, self.config.static_config.outstream_content_buffer_size)
+            .await;
 
         if n_executed_txs != 0 {
             debug!("Streaming {} txs", n_executed_txs);
@@ -568,7 +626,7 @@ impl Batcher {
 
         // Finished streaming all the transactions.
         self.propose_tx_streams.remove(&proposal_id);
-        let (commitment, final_n_executed_txs) = self
+        let finished_proposal_info = self
             .get_completed_proposal_result(proposal_id)
             .await
             .expect("Proposal should exist.")
@@ -577,11 +635,11 @@ impl Batcher {
                 BatcherError::InternalError
             })?;
         info!(
-            "BATCHER_FIN_PROPOSER: Finished building proposal {proposal_id} with \
-             {final_n_executed_txs} transactions."
+            "BATCHER_FIN_PROPOSER: Finished building proposal {proposal_id} with {} transactions.",
+            finished_proposal_info.final_n_executed_txs
         );
         Ok(GetProposalContentResponse {
-            content: GetProposalContent::Finished { id: commitment, final_n_executed_txs },
+            content: GetProposalContent::Finished(finished_proposal_info),
         })
     }
 
@@ -612,10 +670,22 @@ impl Batcher {
         }
 
         let address_to_nonce = state_diff.nonces.iter().map(|(k, v)| (*k, *v)).collect();
-        let partial_block_hash_components =
-            if block_header_without_hash.starknet_version.has_partial_block_hash_components() {
-                match block_header_commitments {
-                    Some(header_commitments) => Some(PartialBlockHashComponents {
+
+        let storage_commitment_block_hash = if block_header_without_hash
+            .starknet_version
+            .has_partial_block_hash_components()
+        {
+            self.maybe_handle_first_block_with_partial_block_hash(
+                block_header_without_hash.parent_hash,
+                block_number,
+            )
+            .map_err(|err| {
+                error!("Error handling block number {block_number} with partial block hash: {err}");
+                BatcherError::InternalError
+            })?;
+            match block_header_commitments {
+                Some(header_commitments) => {
+                    StorageCommitmentBlockHash::Partial(PartialBlockHashComponents {
                         header_commitments,
                         block_number,
                         l1_gas_price: block_header_without_hash.l1_gas_price,
@@ -624,21 +694,54 @@ impl Batcher {
                         sequencer: block_header_without_hash.sequencer,
                         timestamp: block_header_without_hash.timestamp,
                         starknet_version: block_header_without_hash.starknet_version,
-                    }),
-                    None => return Err(BatcherError::MissingHeaderCommitments { block_number }),
+                    })
                 }
-            } else {
-                None
-            };
+                None => return Err(BatcherError::MissingHeaderCommitments { block_number }),
+            }
+        } else {
+            let first_block_with_partial_block_hash_number = self
+                .config
+                .static_config
+                .first_block_with_partial_block_hash
+                .as_ref()
+                .expect(
+                    "Since an old block was learned via sync, first block with partial block hash \
+                     components should be configured.",
+                )
+                .block_number;
+            assert!(
+                height < first_block_with_partial_block_hash_number,
+                "Height {height} is at least the first block configured to include a partial hash \
+                 ({first_block_with_partial_block_hash_number}) but does not include one.",
+            );
+            StorageCommitmentBlockHash::ParentHash(block_header_without_hash.parent_hash)
+        };
+
+        let optional_state_diff_commitment = match &storage_commitment_block_hash {
+            StorageCommitmentBlockHash::ParentHash(_) => None,
+            StorageCommitmentBlockHash::Partial(PartialBlockHashComponents {
+                ref header_commitments,
+                ..
+            }) => Some(header_commitments.state_diff_commitment),
+        };
+
         self.commit_proposal_and_block(
             height,
-            state_diff,
+            state_diff.clone(),
             address_to_nonce,
             l1_transaction_hashes.iter().copied().collect(),
             Default::default(),
-            partial_block_hash_components,
+            storage_commitment_block_hash,
         )
         .await?;
+
+        self.write_commitment_results_and_add_new_task(
+            height,
+            state_diff,
+            optional_state_diff_commitment,
+        )
+        .await?;
+
         LAST_SYNCED_BLOCK_HEIGHT.set_lossy(block_number.0);
         SYNCED_TRANSACTIONS.increment(
             (account_transaction_hashes.len() + l1_transaction_hashes.len()).try_into().unwrap(),
@@ -677,8 +780,9 @@ impl Batcher {
         )
         .expect("Number of reverted transactions should fit in u64");
         let partial_block_hash_components =
-            block_execution_artifacts.partial_block_hash_components().await;
-        let block_header_commitments = partial_block_hash_components.header_commitments.clone();
+            block_execution_artifacts.partial_block_hash_components();
+        let state_diff_commitment =
+            partial_block_hash_components.header_commitments.state_diff_commitment;
         let parent_proposal_commitment = self.get_parent_proposal_commitment(height)?;
         self.commit_proposal_and_block(
             height,
@@ -686,7 +790,14 @@ impl Batcher {
             block_execution_artifacts.address_to_nonce(),
             block_execution_artifacts.execution_data.consumed_l1_handler_tx_hashes,
             block_execution_artifacts.execution_data.rejected_tx_hashes,
-            Some(partial_block_hash_components),
+            StorageCommitmentBlockHash::Partial(partial_block_hash_components),
+        )
+        .await?;
+
+        self.write_commitment_results_and_add_new_task(
+            height,
+            state_diff.clone(), // TODO(Nimrod): Remove the clone here.
+            Some(state_diff_commitment),
         )
         .await?;
 
@@ -705,10 +816,10 @@ impl Batcher {
         SIERRA_GAS_IN_LAST_BLOCK.set_lossy(block_execution_artifacts.bouncer_weights.sierra_gas.0);
         PROVING_GAS_IN_LAST_BLOCK
             .set_lossy(block_execution_artifacts.bouncer_weights.proving_gas.0);
+        L2_GAS_IN_LAST_BLOCK.set_lossy(block_execution_artifacts.l2_gas_used.0);
 
         Ok(DecisionReachedResponse {
             state_diff,
-            l2_gas_used: block_execution_artifacts.l2_gas_used,
             central_objects: CentralObjects {
                 execution_infos,
                 bouncer_weights: block_execution_artifacts.bouncer_weights,
@@ -721,12 +832,9 @@ impl Batcher {
                     .compiled_class_hashes_for_migration,
                 parent_proposal_commitment,
             },
-            block_header_commitments,
         })
     }
 
-    // The `partial_block_hash_components` is optional as it doesn't exist for old blocks coming
-    // from sync.
     async fn commit_proposal_and_block(
         &mut self,
         height: BlockNumber,
@@ -734,7 +842,7 @@ impl Batcher {
         address_to_nonce: HashMap<ContractAddress, Nonce>,
         consumed_l1_handler_tx_hashes: IndexSet<TransactionHash>,
         rejected_tx_hashes: IndexSet<TransactionHash>,
-        partial_block_hash_components: Option<PartialBlockHashComponents>,
+        storage_commitment_block_hash: StorageCommitmentBlockHash,
     ) -> BatcherResult<()> {
         info!(
             "Committing block at height {} and notifying mempool & L1 event provider of the block.",
@@ -742,18 +850,36 @@ impl Batcher {
         );
         trace!("Rejected transactions: {:#?}, State diff: {:#?}.", rejected_tx_hashes, state_diff);
 
-        let state_diff_commitment = calculate_state_diff_hash(&state_diff);
+        // Proposal commitment is the the partial block hash when it's available, and None
+        // otherwise. The commitment is computed here to set the prev_proposal_commitment cache. As
+        // this cache is only used for blocks obtained through the decision_reached flow, it can
+        // be None for old (pre 0.13.2) blocks.
+        let proposal_commitment = match &storage_commitment_block_hash {
+            StorageCommitmentBlockHash::Partial(components) => Some((
+                height,
+                ProposalCommitment {
+                    partial_block_hash: PartialBlockHash::from_partial_block_hash_components(
+                        components,
+                    )
+                    .map_err(|e| {
+                        error!("Failed to compute partial block hash: {}", e);
+                        BatcherError::InternalError
+                    })?,
+                },
+            )),
+            StorageCommitmentBlockHash::ParentHash(_) => None,
+        };
 
         // Commit the proposal to the storage.
         self.storage_writer
-            .commit_proposal(height, state_diff, partial_block_hash_components)
+            .commit_proposal(height, state_diff, storage_commitment_block_hash)
             .map_err(|err| {
                 error!("Failed to commit proposal to storage: {}", err);
                 BatcherError::InternalError
             })?;
         info!("Successfully committed proposal for block {} to storage.", height);
-        self.prev_proposal_commitment =
-            Some((height, ProposalCommitment { state_diff_commitment }));
+
+        self.prev_proposal_commitment = proposal_commitment;
 
         // Notify the L1 provider of the new block.
         let rejected_l1_handler_tx_hashes = rejected_tx_hashes
@@ -801,7 +927,7 @@ impl Batcher {
             error!("Failed to commit block to mempool: {}", mempool_err);
         };
 
-        STORAGE_HEIGHT.increment(1);
+        BUILDING_HEIGHT.increment(1);
         Ok(())
     }
 
@@ -899,22 +1025,21 @@ impl Batcher {
         Ok(())
     }
 
-    // Returns a completed proposal result, either its commitment and final_n_executed_txs or an
-    // error if the proposal failed. If the proposal doesn't exist, or it's still active,
-    // returns None.
+    // Returns a completed proposal result, either its FinishedProposalInfo or an error if the
+    // proposal failed. If the proposal doesn't exist, or it's still active, returns None.
     async fn get_completed_proposal_result(
         &self,
         proposal_id: ProposalId,
-    ) -> Option<ProposalResult<(ProposalCommitment, usize)>> {
+    ) -> Option<ProposalResult<FinishedProposalInfo>> {
         let guard = self.executed_proposals.lock().await;
-        let proposal_result = guard.get(&proposal_id);
-        match proposal_result {
-            Some(Ok(artifacts)) => {
-                Some(Ok((artifacts.commitment(), artifacts.final_n_executed_txs)))
-            }
-            Some(Err(e)) => Some(Err(e.clone())),
-            None => None,
-        }
+        let artifact_derived = match guard.get(&proposal_id) {
+            Some(Ok(artifacts)) => finished_proposal_info_from_artifacts(artifacts),
+            Some(Err(e)) => return Some(Err(e.clone())),
+            None => return None,
+        };
+        let parent_proposal_commitment =
+            self.active_height.and_then(|h| self.get_parent_proposal_commitment(h).ok().flatten());
+        Some(Ok(FinishedProposalInfo::new(artifact_derived, parent_proposal_commitment)))
     }
 
     // Ends the current active proposal.
@@ -924,6 +1049,50 @@ impl Batcher {
         if let Some(proposal_task) = self.active_proposal_task.take() {
             proposal_task.abort_signal_sender.send(()).ok();
         }
+    }
+
+    /// If the optional configuration
+    /// [`apollo_batcher_config::config::BatcherStaticConfig::first_block_with_partial_block_hash`]
+    /// is set, and the given height is the first block with partial block hash components, we
+    /// will set the parent hash of this block and verify the configured value.
+    /// Assumption: we call this function only for new blocks.
+    fn maybe_handle_first_block_with_partial_block_hash(
+        &mut self,
+        parent_block_hash_from_sync: BlockHash,
+        height: BlockNumber,
+    ) -> StorageResult<()> {
+        let Some(FirstBlockWithPartialBlockHash { block_number, parent_block_hash, .. }) =
+            self.config.static_config.first_block_with_partial_block_hash.as_ref()
+        else {
+            // No config is set, nothing to do.
+            return Ok(());
+        };
+        assert!(
+            height >= *block_number,
+            "Block number {height} is a new block but is older than the configured first block \
+             with partial block hash components {block_number}"
+        );
+        if height > *block_number {
+            // Config is set but given height is not the first new block - nothing to do.
+            return Ok(());
+        }
+        // Sanity check: verify that the parent block hash from sync matches the configured one.
+        assert_eq!(
+            *parent_block_hash, parent_block_hash_from_sync,
+            "The parent block hash from sync ({parent_block_hash_from_sync:?}) does not match the \
+             configured parent block hash ({parent_block_hash:?}) of the first new block"
+        );
+
+        info!(
+            "The first block with partial block hash components ({block_number}) has been \
+             reached. Subsequent blocks will include partial block hash components."
+        );
+
+        // Set the parent hash of the first block with partial block hash components.
+        let parent_block_number = block_number
+            .prev()
+            .expect("First block with partial block hash should not be the genesis block.");
+        self.storage_writer.set_block_hash(parent_block_number, *parent_block_hash)
     }
 
     pub async fn await_active_proposal(
@@ -980,8 +1149,12 @@ impl Batcher {
             self.abort_active_height().await;
         }
 
+        // Wait for the revert commitment to be completed before reverting the storage.
+        self.revert_commitment(height).await;
+
         self.storage_writer.revert_block(height);
-        STORAGE_HEIGHT.decrement(1);
+        BUILDING_HEIGHT.decrement(1);
+        GLOBAL_ROOT_HEIGHT.decrement(1);
         REVERTED_BLOCKS.increment(1);
         Ok(())
     }
@@ -989,7 +1162,7 @@ impl Batcher {
     // Returns the proposal commitment of the previous height.
     // NOTE: Assumes that the previous height was committed to the storage.
     fn get_parent_proposal_commitment(
-        &mut self,
+        &self,
         height: BlockNumber,
     ) -> BatcherResult<Option<ProposalCommitment>> {
         let Some(prev_height) = height.prev() else {
@@ -1003,28 +1176,159 @@ impl Batcher {
                 Ok(Some(commitment))
             }
             None => {
-                // Parent proposal commitment is not cached. Compute it from the stored state diff.
-                let mut state_diff = self
+                // Parent proposal commitment is not cached. Read partial block hash
+                // components from storage and compute the partial block hash.
+                let (_, components) = self
                     .storage_reader
-                    .get_state_diff(prev_height)
+                    .get_parent_hash_and_partial_block_hash_components(prev_height)
                     .map_err(|err| {
                         error!(
-                            "Failed to read state diff for previous height {prev_height}: {}",
+                            "Failed to read partial block hash components for previous height \
+                             {prev_height}: {}",
                             err
                         );
                         BatcherError::InternalError
-                    })?
-                    .expect("Missing state diff for previous height.");
-
-                // Enforcing no deprecated classes (since v0.14.0).
-                // TODO(dafna): Remove once the state sync bug is fixed.
-                state_diff.deprecated_declared_classes = Vec::new();
+                    })?;
+                let components =
+                    components.expect("Missing partial block hash components for previous height.");
 
                 Ok(Some(ProposalCommitment {
-                    state_diff_commitment: calculate_state_diff_hash(&state_diff),
+                    partial_block_hash: PartialBlockHash::from_partial_block_hash_components(
+                        &components,
+                    )
+                    .map_err(|e| {
+                        error!("Failed to compute partial block hash: {}", e);
+                        BatcherError::InternalError
+                    })?,
                 }))
             }
         }
+    }
+
+    /// Reverts the commitment for the given height.
+    /// Adds a revert task to the commitment manager channel and waits for the result.
+    /// Writes commitment results to storage and handles the revert task result.
+    async fn revert_commitment(&mut self, height: BlockNumber) {
+        let reversed_state_diff = self
+            .storage_reader
+            .reversed_state_diff(height)
+            .expect("Failed to get reversed state diff from storage.");
+        self.commitment_manager
+            .add_revert_task(
+                height,
+                reversed_state_diff,
+                &self.config.static_config.first_block_with_partial_block_hash,
+                self.storage_reader.clone(),
+                &mut self.storage_writer,
+            )
+            .await
+            .expect("Failed to add revert task to commitment manager.");
+        let (commitment_results, revert_task_result) =
+            self.commitment_manager.wait_for_revert_result().await;
+        self.commitment_manager
+            .write_commitment_results_to_storage(
+                commitment_results,
+                &self.config.static_config.first_block_with_partial_block_hash,
+                self.storage_reader.clone(),
+                &mut self.storage_writer,
+            )
+            .expect("Failed to write commitment results to storage.");
+
+        info!("Revert task result: {revert_task_result:?}");
+        self.validate_revert_task_result(revert_task_result, height).await;
+        info!("Reverted commitment for height {height}.");
+    }
+
+    async fn validate_revert_task_result(
+        &self,
+        revert_task_output: RevertTaskOutput,
+        request_height_to_revert: BlockNumber,
+    ) {
+        assert_eq!(
+            revert_task_output.height, request_height_to_revert,
+            "The task output height does not match the request height."
+        );
+
+        match revert_task_output.response {
+            RevertBlockResponse::RevertedTo(global_root)
+            | RevertBlockResponse::AlreadyReverted(global_root) => {
+                // Verify the global root matches the stored global root.
+                let new_latest_height = revert_task_output
+                    .height
+                    .prev()
+                    .expect("Can't revert before the genesis block.");
+                let stored_global_root = self
+                    .storage_reader
+                    .global_root(new_latest_height)
+                    .expect("Failed to get global root from storage.")
+                    .expect("Global root is not set for height {new_latest_height}.");
+                assert_eq!(
+                    global_root, stored_global_root,
+                    "The given global root does not match the stored global root for height \
+                     {new_latest_height}."
+                );
+            }
+            RevertBlockResponse::Uncommitted => {}
+        }
+    }
+
+    pub fn get_block_hash(&mut self, block_number: BlockNumber) -> BatcherResult<BlockHash> {
+        self.get_commitment_results_and_write_to_storage()?;
+        let cache = &mut self.commitment_manager.recent_block_hashes_cache;
+
+        // Try to get the block hash from the cache.
+        if let Some(block_hash) = cache.get(&block_number) {
+            return Ok(*block_hash);
+        }
+
+        // If the block hash is not in the cache, fetch it from storage.
+        info!("Block hash of block {block_number} not found in cache, fetching from storage.");
+        // TODO(Nimrod): Consider adding block-hashes cache misses metric.
+        let block_hash = self
+            .storage_reader
+            .get_block_hash(block_number)
+            .map_err(|err| {
+                error!("Failed to get block hash from storage: {err}");
+                BatcherError::InternalError
+            })?
+            .ok_or(BatcherError::BlockHashNotFound(block_number))?;
+        cache.put(block_number, block_hash);
+        Ok(block_hash)
+    }
+
+    fn get_commitment_results_and_write_to_storage(&mut self) -> BatcherResult<()> {
+        self.commitment_manager
+            .get_commitment_results_and_write_to_storage(
+                &self.config.static_config.first_block_with_partial_block_hash,
+                self.storage_reader.clone(),
+                &mut self.storage_writer,
+            )
+            .map_err(|err| {
+                error!("Failed to get commitment results and write to storage: {err}");
+                BatcherError::InternalError
+            })?;
+        Ok(())
+    }
+
+    async fn write_commitment_results_and_add_new_task(
+        &mut self,
+        height: BlockNumber,
+        state_diff: ThinStateDiff,
+        optional_state_diff_commitment: Option<StateDiffCommitment>,
+    ) -> BatcherResult<()> {
+        self.get_commitment_results_and_write_to_storage()?;
+        self.commitment_manager
+            .add_commitment_task(
+                height,
+                state_diff,
+                optional_state_diff_commitment,
+                &self.config.static_config.first_block_with_partial_block_hash,
+                self.storage_reader.clone(),
+                &mut self.storage_writer,
+            )
+            .await
+            .expect("The commitment offset unexpectedly doesn't match the given block height.");
+        Ok(())
     }
 }
 
@@ -1070,37 +1374,57 @@ fn log_txs_execution_result(
     }
 }
 
-pub fn create_batcher(
+#[allow(clippy::too_many_arguments)]
+pub async fn create_batcher(
     config: BatcherConfig,
     committer_client: SharedCommitterClient,
     mempool_client: SharedMempoolClient,
     l1_provider_client: SharedL1ProviderClient,
     class_manager_client: SharedClassManagerClient,
     pre_confirmed_cende_client: Arc<dyn PreconfirmedCendeClientTrait>,
+    proof_manager_client: SharedProofManagerClient,
+    config_manager_client: SharedConfigManagerClient,
 ) -> Batcher {
-    let (storage_reader, storage_writer) =
-        open_storage_with_metric(config.storage.clone(), &BATCHER_STORAGE_OPEN_READ_TRANSACTIONS)
-            .expect("Failed to open batcher's storage");
+    let storage_reader_server_config = ServerConfig {
+        static_config: config.static_config.storage_reader_server_static_config.clone(),
+        dynamic_config: config.dynamic_config.storage_reader_server_dynamic_config.clone(),
+    };
+    let (storage_reader, storage_writer, storage_reader_server) =
+        open_storage_with_metric_and_server(
+            config.static_config.storage.clone(),
+            &BATCHER_STORAGE_OPEN_READ_TRANSACTIONS,
+            storage_reader_server_config,
+        )
+        .expect("Failed to open batcher's storage");
 
-    let execute_config = &config.block_builder_config.execute_config;
+    let storage_reader_server_handle =
+        GenericStorageReaderServer::spawn_if_enabled(storage_reader_server);
+
+    let execute_config = &config.static_config.block_builder_config.execute_config;
     let worker_pool = Arc::new(WorkerPool::start(execute_config));
     let pre_confirmed_block_writer_factory = Box::new(PreconfirmedBlockWriterFactory {
-        config: config.pre_confirmed_block_writer_config,
+        config: config.static_config.pre_confirmed_block_writer_config,
         cende_client: pre_confirmed_cende_client,
     });
     let block_builder_factory = Box::new(BlockBuilderFactory {
-        block_builder_config: config.block_builder_config.clone(),
+        block_builder_config: config.static_config.block_builder_config.clone(),
         storage_reader: storage_reader.clone(),
         contract_class_manager: ContractClassManager::start(
-            config.contract_class_manager_config.clone(),
+            config.static_config.contract_class_manager_config.clone(),
         ),
-        class_manager_client: class_manager_client.clone(),
+        class_manager_client,
+        proof_manager_client,
         worker_pool,
     });
     let storage_reader = Arc::new(storage_reader);
     let storage_writer = Box::new(storage_writer);
-    let transaction_converter =
-        TransactionConverter::new(class_manager_client, config.storage.db_config.chain_id.clone());
+
+    let commitment_manager = CommitmentManager::create_commitment_manager(
+        &config.static_config.commitment_manager_config,
+        storage_reader.clone(),
+        committer_client.clone(),
+    )
+    .await;
 
     Batcher::new(
         config,
@@ -1109,19 +1433,24 @@ pub fn create_batcher(
         committer_client,
         l1_provider_client,
         mempool_client,
-        transaction_converter,
+        config_manager_client,
         block_builder_factory,
         pre_confirmed_block_writer_factory,
+        commitment_manager,
+        storage_reader_server_handle,
     )
 }
 
 #[cfg_attr(test, automock)]
 pub trait BatcherStorageReader: Send + Sync {
-    /// Returns the next height that the batcher should work on.
-    fn height(&self) -> StorageResult<BlockNumber>;
+    /// Returns the next height for which the batcher stores state diff for.
+    /// This is the next height the batcher should work on (during validate/proposal).
+    fn state_diff_height(&self) -> StorageResult<BlockNumber>;
 
-    /// Returns the next height the batcher should store block hash for.
-    fn block_hash_height(&self) -> StorageResult<BlockNumber>;
+    /// Returns the first height the committer has finished calculating commitments for.
+    fn global_root_height(&self) -> StorageResult<BlockNumber>;
+
+    fn global_root(&self, height: BlockNumber) -> StorageResult<Option<GlobalRoot>>;
 
     fn get_state_diff(&self, height: BlockNumber) -> StorageResult<Option<ThinStateDiff>>;
 
@@ -1131,15 +1460,26 @@ pub trait BatcherStorageReader: Send + Sync {
         &self,
         height: BlockNumber,
     ) -> apollo_storage::StorageResult<ThinStateDiff>;
+
+    fn get_block_hash(&self, height: BlockNumber) -> StorageResult<Option<BlockHash>>;
+
+    fn get_parent_hash_and_partial_block_hash_components(
+        &self,
+        height: BlockNumber,
+    ) -> StorageResult<(Option<BlockHash>, Option<PartialBlockHashComponents>)>;
 }
 
 impl BatcherStorageReader for StorageReader {
-    fn height(&self) -> StorageResult<BlockNumber> {
+    fn state_diff_height(&self) -> StorageResult<BlockNumber> {
         self.begin_ro_txn()?.get_state_marker()
     }
 
-    fn block_hash_height(&self) -> StorageResult<BlockNumber> {
-        self.begin_ro_txn()?.get_block_hash_marker()
+    fn global_root_height(&self) -> StorageResult<BlockNumber> {
+        self.begin_ro_txn()?.get_global_root_marker()
+    }
+
+    fn global_root(&self, height: BlockNumber) -> StorageResult<Option<GlobalRoot>> {
+        self.begin_ro_txn()?.get_global_root(&height)
     }
 
     fn get_state_diff(&self, height: BlockNumber) -> StorageResult<Option<ThinStateDiff>> {
@@ -1207,6 +1547,23 @@ impl BatcherStorageReader for StorageReader {
             deprecated_declared_classes: Default::default(),
         })
     }
+
+    fn get_block_hash(&self, height: BlockNumber) -> StorageResult<Option<BlockHash>> {
+        self.begin_ro_txn()?.get_block_hash(&height)
+    }
+
+    fn get_parent_hash_and_partial_block_hash_components(
+        &self,
+        height: BlockNumber,
+    ) -> StorageResult<(Option<BlockHash>, Option<PartialBlockHashComponents>)> {
+        let txn = self.begin_ro_txn()?;
+        let parent_hash = match height.prev() {
+            None => Some(BlockHash::GENESIS_PARENT_HASH),
+            Some(parent_height) => txn.get_block_hash(&parent_height)?,
+        };
+        let partial_block_hash_components = txn.get_partial_block_hash_components(&height)?;
+        Ok((parent_hash, partial_block_hash_components))
+    }
 }
 
 #[cfg_attr(test, automock)]
@@ -1215,10 +1572,22 @@ pub trait BatcherStorageWriter: Send + Sync {
         &mut self,
         height: BlockNumber,
         state_diff: ThinStateDiff,
-        partial_block_hash_components: Option<PartialBlockHashComponents>,
+        storage_commitment_block_hash: StorageCommitmentBlockHash,
     ) -> StorageResult<()>;
 
     fn revert_block(&mut self, height: BlockNumber);
+
+    /// Sets the global root and block hash (unless it's None) for the given height.
+    /// Increments the block hash marker by 1.
+    /// Block hash is optional because for old blocks, the block hash was set separately.
+    fn set_global_root_and_block_hash(
+        &mut self,
+        height: BlockNumber,
+        global_root: GlobalRoot,
+        block_hash: Option<BlockHash>,
+    ) -> StorageResult<()>;
+
+    fn set_block_hash(&mut self, height: BlockNumber, block_hash: BlockHash) -> StorageResult<()>;
 }
 
 impl BatcherStorageWriter for StorageWriter {
@@ -1226,12 +1595,20 @@ impl BatcherStorageWriter for StorageWriter {
         &mut self,
         height: BlockNumber,
         state_diff: ThinStateDiff,
-        partial_block_hash_components: Option<PartialBlockHashComponents>,
+        storage_commitment_block_hash: StorageCommitmentBlockHash,
     ) -> StorageResult<()> {
         // TODO(AlonH): write casms.
         let mut txn = self.begin_rw_txn()?.append_state_diff(height, state_diff)?;
-        if let Some(ref components) = partial_block_hash_components {
-            txn = txn.set_partial_block_hash_components(&height, components)?;
+        match storage_commitment_block_hash {
+            StorageCommitmentBlockHash::ParentHash(parent_block_hash) => {
+                if let Some(parent_block_number) = height.prev() {
+                    txn = txn.set_block_hash(&parent_block_number, parent_block_hash)?
+                }
+            }
+            StorageCommitmentBlockHash::Partial(partial_block_hash_components) => {
+                txn =
+                    txn.set_partial_block_hash_components(&height, &partial_block_hash_components)?
+            }
         }
         txn.commit()
     }
@@ -1239,6 +1616,30 @@ impl BatcherStorageWriter for StorageWriter {
     // This function will panic if there is a storage failure to revert the block.
     fn revert_block(&mut self, height: BlockNumber) {
         revert_block(self, height);
+    }
+
+    fn set_global_root_and_block_hash(
+        &mut self,
+        height: BlockNumber,
+        global_root: GlobalRoot,
+        block_hash: Option<BlockHash>,
+    ) -> StorageResult<()> {
+        info!(
+            "Setting global root and block hash for height {height}. Root: {global_root:?}, Block \
+             hash: {block_hash:?}."
+        );
+        let mut txn = self
+            .begin_rw_txn()?
+            .set_global_root(&height, global_root)?
+            .checked_increment_global_root_marker(height)?;
+        if let Some(block_hash) = block_hash {
+            txn = txn.set_block_hash(&height, block_hash)?;
+        }
+        txn.commit()
+    }
+
+    fn set_block_hash(&mut self, height: BlockNumber, block_hash: BlockHash) -> StorageResult<()> {
+        self.begin_rw_txn()?.set_block_hash(&height, block_hash)?.commit()
     }
 }
 
@@ -1248,8 +1649,45 @@ impl ComponentStarter for Batcher {
         default_component_start_fn::<Self>().await;
         let storage_height = self
             .storage_reader
-            .height()
+            .state_diff_height()
             .expect("Failed to get height from storage during batcher creation.");
-        register_metrics(storage_height);
+
+        let global_root_height = self
+            .storage_reader
+            .global_root_height()
+            .expect("Failed to get global roots height from storage during batcher creation.");
+
+        register_metrics(storage_height, global_root_height);
+
+        self.commitment_manager
+            .add_missing_commitment_tasks(
+                storage_height,
+                &self.config,
+                self.storage_reader.clone(),
+                &mut self.storage_writer,
+            )
+            .await;
+    }
+}
+
+/// When committing a block into storage, in `commit_proposal_and_block`, we either set the
+/// parent hash for old blocks (pre 0.13.2) coming from sync, or the partial block hash components
+/// for new blocks.
+#[derive(Debug, PartialEq)]
+pub enum StorageCommitmentBlockHash {
+    ParentHash(BlockHash),
+    Partial(PartialBlockHashComponents),
+}
+
+/// Builds the artifact-derived part of [`FinishedProposalInfo`]. Pass the result to
+/// [`FinishedProposalInfo::new`] with the parent commitment.
+pub(crate) fn finished_proposal_info_from_artifacts(
+    artifacts: &BlockExecutionArtifacts,
+) -> FinishedProposalInfoWithoutParent {
+    FinishedProposalInfoWithoutParent {
+        proposal_commitment: artifacts.commitment(),
+        final_n_executed_txs: artifacts.final_n_executed_txs,
+        block_header_commitments: artifacts.partial_block_hash_components().header_commitments,
+        l2_gas_used: artifacts.l2_gas_used,
     }
 }

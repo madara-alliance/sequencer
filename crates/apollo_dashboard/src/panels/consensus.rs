@@ -7,6 +7,7 @@ use apollo_consensus::metrics::{
     CONSENSUS_DECISIONS_REACHED_AS_PROPOSER,
     CONSENSUS_DECISIONS_REACHED_BY_CONSENSUS,
     CONSENSUS_DECISIONS_REACHED_BY_SYNC,
+    CONSENSUS_PROPOSALS_ACCEPTED_FOR_VALIDATION,
     CONSENSUS_PROPOSALS_INVALID,
     CONSENSUS_PROPOSALS_RECEIVED,
     CONSENSUS_PROPOSALS_VALIDATED,
@@ -48,8 +49,10 @@ use apollo_consensus_orchestrator::metrics::{
 use apollo_metrics::metrics::MetricQueryName;
 use apollo_network::metrics::{LABEL_NAME_BROADCAST_DROP_REASON, LABEL_NAME_EVENT_TYPE};
 use apollo_state_sync_metrics::metrics::STATE_SYNC_CLASS_MANAGER_MARKER;
+use apollo_transaction_converter::metrics::CONSENSUS_PROOF_MANAGER_STORE_LATENCY;
 
-use crate::dashboard::{Panel, PanelType, Row, Unit};
+use crate::dashboard::Row;
+use crate::panel::{Panel, PanelType, Unit};
 use crate::query_builder::{
     increase,
     sum_by_label,
@@ -89,6 +92,7 @@ pub(crate) fn get_panel_consensus_block_number_diff_from_sync() -> Panel {
         ),
         PanelType::TimeSeries,
     )
+    .with_log_query("\"State sync is not ready\" OR \"to fetch retrospective block hash\"")
 }
 
 pub(crate) fn get_panel_consensus_round() -> Panel {
@@ -159,6 +163,22 @@ fn get_panel_consensus_proposals_received() -> Panel {
         increase(&CONSENSUS_PROPOSALS_RECEIVED, DEFAULT_DURATION),
         PanelType::TimeSeries,
     )
+}
+
+fn get_panel_consensus_proposals_acceptance_rate() -> Panel {
+    Panel::new(
+        "Proposal Validation: Acceptance Rate (%)",
+        format!(
+            "Percentage of received proposals accepted for validation ({DEFAULT_DURATION} window).",
+        ),
+        format!(
+            "{} / {}",
+            increase(&CONSENSUS_PROPOSALS_ACCEPTED_FOR_VALIDATION, DEFAULT_DURATION),
+            increase(&CONSENSUS_PROPOSALS_RECEIVED, DEFAULT_DURATION),
+        ),
+        PanelType::TimeSeries,
+    )
+    .with_unit(Unit::PercentUnit)
 }
 
 fn get_panel_consensus_proposals_validated() -> Panel {
@@ -261,6 +281,15 @@ fn get_panel_consensus_timeouts_by_type() -> Panel {
     .with_log_comment(CONSENSUS_KEY_EVENTS_LOG_QUERY)
 }
 
+fn get_panel_consensus_proof_manager_store_latency() -> Panel {
+    Panel::from_hist(
+        &CONSENSUS_PROOF_MANAGER_STORE_LATENCY,
+        "Consensus Proof Manager Store Latency",
+        "The time it takes to store a proof in the proof manager during proposal validation",
+    )
+    .with_unit(Unit::Seconds)
+}
+
 fn get_panel_consensus_l2_gas_price() -> Panel {
     Panel::new(
         "L2 Gas Price (GFri)",
@@ -341,6 +370,7 @@ fn get_panel_consensus_num_connected_peers() -> Panel {
         CONSENSUS_NUM_CONNECTED_PEERS.get_name_with_filter().to_string(),
         PanelType::Stat,
     )
+    .with_log_query("network_manager")
 }
 
 fn get_panel_consensus_votes_num_sent_messages() -> Panel {
@@ -541,9 +571,11 @@ pub(crate) fn get_consensus_row() -> Row {
             get_panel_consensus_build_proposal_failed(),
             get_panel_build_proposal_failure(),
             get_panel_consensus_proposals_received(),
+            get_panel_consensus_proposals_acceptance_rate(),
             get_panel_consensus_proposals_validated(),
             get_panel_consensus_proposals_invalid(),
             get_panel_validate_proposal_failure(),
+            get_panel_consensus_proof_manager_store_latency(),
             get_panel_consensus_timeouts_by_type(),
             get_panel_consensus_l2_gas_price(),
         ],

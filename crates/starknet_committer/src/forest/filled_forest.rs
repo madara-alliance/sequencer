@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
-use starknet_api::hash::HashOutput;
+use starknet_api::hash::{HashOutput, StateRoots};
 use starknet_patricia::patricia_merkle_tree::filled_tree::tree::FilledTree;
 use starknet_patricia::patricia_merkle_tree::node_data::leaf::LeafModifications;
 use starknet_patricia::patricia_merkle_tree::types::NodeIndex;
 use starknet_patricia::patricia_merkle_tree::updated_skeleton_tree::tree::UpdatedSkeletonTreeImpl;
-use tracing::info;
+use tracing::debug;
 
 use crate::block_committer::input::{
     contract_address_into_node_index,
@@ -39,6 +39,13 @@ impl FilledForest {
         self.classes_trie.get_root_hash()
     }
 
+    pub fn state_roots(&self) -> StateRoots {
+        StateRoots {
+            contracts_trie_root_hash: self.get_contract_root_hash(),
+            classes_trie_root_hash: self.get_compiled_class_root_hash(),
+        }
+    }
+
     /// Creates a filled forest. Assumes the storage updates and the updated skeletons of the
     /// storage tries include all modified contracts, including those with unmodified storage.
     pub(crate) async fn create<TH: ForestHashFunction + 'static>(
@@ -66,13 +73,13 @@ impl FilledForest {
         ));
 
         let classes_trie = classes_trie_task.await?.map_err(ForestError::ClassesTrie)?;
-        info!(
+        debug!(
             "Classes trie update complete; {:?} new facts computed.",
             classes_trie.tree_map.len()
         );
         let (contracts_trie, storage_tries) =
             contracts_trie_task.await?.map_err(ForestError::ContractsTrie)?;
-        info!(
+        debug!(
             "Contracts trie update complete; {:?} new facts computed.",
             contracts_trie.tree_map.len()
         );

@@ -5,7 +5,6 @@ use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use serde::{Deserialize, Serialize};
-use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::core::ClassHash;
 use starknet_api::execution_resources::GasAmount;
 
@@ -15,8 +14,13 @@ use crate::blockifier::transaction_executor::{
     TransactionExecutorResult,
 };
 use crate::blockifier_versioned_constants::{BuiltinGasCosts, VersionedConstants};
-use crate::execution::call_info::{BuiltinCounterMap, ExecutionSummary};
-use crate::execution::casm_hash_estimation::EstimatedExecutionResources;
+use crate::execution::call_info::{
+    cairo_primitive_counter_map,
+    BuiltinCounterMap,
+    CairoPrimitiveCounterMap,
+    ExecutionSummary,
+    ExtendedExecutionResources,
+};
 use crate::fee::gas_usage::get_onchain_data_segment_length;
 use crate::fee::resources::TransactionResources;
 use crate::state::cached_state::{StateChangesKeys, StorageEntry};
@@ -64,21 +68,10 @@ macro_rules! impl_field_wise_ops {
     };
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct BouncerConfig {
     pub block_max_capacity: BouncerWeights,
     pub builtin_weights: BuiltinWeights,
-    pub blake_weight: usize,
-}
-
-impl Default for BouncerConfig {
-    fn default() -> Self {
-        Self {
-            block_max_capacity: BouncerWeights::default(),
-            builtin_weights: BuiltinWeights::default(),
-            blake_weight: 3750,
-        }
-    }
 }
 
 impl BouncerConfig {
@@ -86,12 +79,14 @@ impl BouncerConfig {
         Self {
             block_max_capacity: BouncerWeights::empty(),
             builtin_weights: BuiltinWeights::empty(),
-            blake_weight: 0,
         }
     }
 
     pub fn max() -> Self {
-        Self { block_max_capacity: BouncerWeights::max(), ..Default::default() }
+        Self {
+            block_max_capacity: BouncerWeights::max(),
+            builtin_weights: BuiltinWeights::default(),
+        }
     }
 
     pub fn has_room(&self, weights: BouncerWeights) -> bool {
@@ -122,12 +117,6 @@ impl SerializeConfig for BouncerConfig {
         let mut dump =
             prepend_sub_config_name(self.block_max_capacity.dump(), "block_max_capacity");
         dump.append(&mut prepend_sub_config_name(self.builtin_weights.dump(), "builtin_weights"));
-        dump.append(&mut BTreeMap::from([ser_param(
-            "blake_weight",
-            &self.blake_weight,
-            "blake opcode gas weight.",
-            ParamPrivacyInput::Public,
-        )]));
         dump
     }
 }
@@ -140,10 +129,14 @@ pub struct BouncerWeights {
     pub message_segment_length: usize,
     pub n_events: usize,
     pub state_diff_size: usize,
-    // NOTE: Must stay in sync with orchestrator_versioned_constants' max_block_size.
     pub sierra_gas: GasAmount,
     pub n_txs: usize,
     pub proving_gas: GasAmount,
+    /// Receipt-based L2 gas, including execution gas + state allocation costs + DA costs.
+    /// Used to close blocks on the economic gas metric. Diverges from sierra_gas because
+    /// it includes allocation_cost for new storage keys and other non-execution costs.
+    // NOTE: Must stay in sync with orchestrator_versioned_constants' max_block_size.
+    pub receipt_l2_gas: GasAmount,
 }
 
 impl BouncerWeights {
@@ -154,7 +147,8 @@ impl BouncerWeights {
         n_txs,
         state_diff_size,
         sierra_gas,
-        proving_gas
+        proving_gas,
+        receipt_l2_gas
     );
 
     pub fn has_room(&self, other: Self) -> bool {
@@ -170,6 +164,7 @@ impl BouncerWeights {
             sierra_gas: GasAmount::MAX,
             n_txs: usize::MAX,
             proving_gas: GasAmount::MAX,
+            receipt_l2_gas: GasAmount::MAX,
         }
     }
 
@@ -182,6 +177,7 @@ impl BouncerWeights {
             sierra_gas: GasAmount::ZERO,
             n_txs: 0,
             proving_gas: GasAmount::ZERO,
+            receipt_l2_gas: GasAmount::ZERO,
         }
     }
 }
@@ -195,9 +191,10 @@ impl Default for BouncerWeights {
             n_events: 5000,
             n_txs: 600,
             state_diff_size: 4000,
+            sierra_gas: GasAmount(5000000000),
+            proving_gas: GasAmount(5000000000),
             // NOTE: Must stay in sync with orchestrator_versioned_constants' max_block_size.
-            sierra_gas: GasAmount(6000000000),
-            proving_gas: GasAmount(6000000000),
+            receipt_l2_gas: GasAmount(5800000000),
         }
     }
 }
@@ -246,6 +243,13 @@ impl SerializeConfig for BouncerWeights {
             "An upper bound on the total builtins and steps gas usage used in a block.",
             ParamPrivacyInput::Public,
         )]));
+        dump.append(&mut BTreeMap::from([ser_param(
+            "receipt_l2_gas",
+            &self.receipt_l2_gas,
+            "An upper bound on the total receipt-based L2 gas in a block. Includes execution gas \
+             plus state allocation costs. Should equal max_block_size.",
+            ParamPrivacyInput::Public,
+        )]));
         dump
     }
 }
@@ -255,7 +259,7 @@ impl std::fmt::Display for BouncerWeights {
         write!(
             f,
             "BouncerWeights {{ l1_gas: {}, message_segment_length: {}, n_events: {}, n_txs: {}, \
-             state_diff_size: {}, sierra_gas: {}, proving_gas: {} }}",
+             state_diff_size: {}, sierra_gas: {}, proving_gas: {}, receipt_l2_gas: {} }}",
             self.l1_gas,
             self.message_segment_length,
             self.n_events,
@@ -263,6 +267,7 @@ impl std::fmt::Display for BouncerWeights {
             self.state_diff_size,
             self.sierra_gas,
             self.proving_gas,
+            self.receipt_l2_gas,
         )
     }
 }
@@ -289,12 +294,12 @@ impl CasmHashComputationData {
     /// Creates CasmHashComputationData by mapping resources to gas using a provided function.
     /// This method encapsulates the pattern used for both Sierra gas and proving gas computation.
     pub fn from_resources<F>(
-        class_hash_to_resources: &HashMap<ClassHash, EstimatedExecutionResources>,
+        class_hash_to_resources: &HashMap<ClassHash, ExtendedExecutionResources>,
         gas_without_casm_hash_computation: GasAmount,
         resources_to_gas_fn: F,
     ) -> Self
     where
-        F: Fn(&EstimatedExecutionResources) -> GasAmount,
+        F: Fn(&ExtendedExecutionResources) -> GasAmount,
     {
         Self {
             class_hash_to_casm_hash_computation_gas: class_hash_to_resources
@@ -323,14 +328,14 @@ impl CasmHashComputationData {
 /// accumulates the estimated execution resources required to perform the migration.
 struct CasmHashMigrationData {
     pub(crate) class_hashes_to_migrate: HashMap<ClassHash, CompiledClassHashV2ToV1>,
-    resources: EstimatedExecutionResources,
+    resources: ExtendedExecutionResources,
 }
 
 impl CasmHashMigrationData {
     fn empty() -> Self {
         Self {
             class_hashes_to_migrate: HashMap::new(),
-            resources: EstimatedExecutionResources::new(HashVersion::V2),
+            resources: ExtendedExecutionResources::default(),
         }
     }
 
@@ -364,14 +369,13 @@ impl CasmHashMigrationData {
     }
 
     /// Converts the aggregated migration resources into gas amounts using the provided builtin gas
-    /// costs and `blake_opcode_gas`.
+    /// costs.
     fn to_gas(
         &self,
         builtin_gas_costs: &BuiltinGasCosts,
         versioned_constants: &VersionedConstants,
-        blake_opcode_gas: usize,
     ) -> GasAmount {
-        self.resources.to_gas(builtin_gas_costs, blake_opcode_gas, versioned_constants)
+        extended_execution_resources_to_gas(&self.resources, builtin_gas_costs, versioned_constants)
     }
 }
 
@@ -414,6 +418,7 @@ impl BuiltinWeights {
                 mul_mod: 0,
                 add_mod: 0,
                 range_check96: 0,
+                blake: 0,
             },
         }
     }
@@ -423,16 +428,17 @@ impl Default for BuiltinWeights {
     fn default() -> Self {
         Self {
             gas_costs: BuiltinGasCosts {
-                pedersen: 4000,
+                pedersen: 3000,
                 range_check: 90,
                 ecdsa: 2000000,
                 ecop: 857850,
                 bitwise: 583,
                 keccak: 600000,
-                poseidon: 11450,
+                poseidon: 10000,
                 add_mod: 2000,
                 mul_mod: 2000,
                 range_check96: 179,
+                blake: 3334,
             },
         }
     }
@@ -500,6 +506,12 @@ impl SerializeConfig for BuiltinWeights {
             "Bitwise gas weight.",
             ParamPrivacyInput::Public,
         )]));
+        dump.append(&mut BTreeMap::from([ser_param(
+            "gas_costs.blake",
+            &self.gas_costs.blake,
+            "Blake gas weight.",
+            ParamPrivacyInput::Public,
+        )]));
 
         dump
     }
@@ -562,14 +574,17 @@ impl Bouncer {
     }
 
     /// Updates the bouncer with a new transaction.
+    // TODO(Dan): refactor to reduce the number of arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_update<S: StateReader>(
         &mut self,
         state_reader: &S,
         tx_state_changes_keys: &StateChangesKeys,
         tx_execution_summary: &ExecutionSummary,
-        tx_builtin_counters: &BuiltinCounterMap,
+        tx_builtin_counters: &CairoPrimitiveCounterMap,
         tx_resources: &TransactionResources,
         versioned_constants: &VersionedConstants,
+        receipt_l2_gas: GasAmount,
     ) -> TransactionExecutorResult<()> {
         // The countings here should be linear in the transactional state changes and execution info
         // rather than the cumulative state attributes.
@@ -593,6 +608,7 @@ impl Bouncer {
             versioned_constants,
             tx_builtin_counters,
             &self.bouncer_config,
+            receipt_l2_gas,
         )?;
 
         let tx_bouncer_weights = tx_weights.bouncer_weights;
@@ -685,98 +701,111 @@ fn memory_holes_to_gas(
 }
 
 /// Calculates proving gas from builtin counters and Sierra gas.
-fn proving_gas_from_builtins_and_sierra_gas(
+fn proving_gas_from_cairo_primitives_and_sierra_gas(
     sierra_gas: GasAmount,
-    builtin_counters: &BuiltinCounterMap,
+    cairo_primitives_counters: &CairoPrimitiveCounterMap,
     proving_builtin_gas_costs: &BuiltinGasCosts,
     sierra_builtin_gas_costs: &BuiltinGasCosts,
 ) -> GasAmount {
-    let builtins_proving_gas = builtins_to_gas(builtin_counters, proving_builtin_gas_costs);
+    let cairo_primitives_proving_gas =
+        cairo_primitives_to_gas(cairo_primitives_counters, proving_builtin_gas_costs);
     let steps_proving_gas =
-        sierra_gas_to_steps_gas(sierra_gas, builtin_counters, sierra_builtin_gas_costs);
+        sierra_gas_to_steps_gas(sierra_gas, cairo_primitives_counters, sierra_builtin_gas_costs);
 
-    steps_proving_gas.checked_add_panic_on_overflow(builtins_proving_gas)
+    steps_proving_gas.checked_add_panic_on_overflow(cairo_primitives_proving_gas)
 }
 
-/// Generic function to convert VM resources to gas with configurable builtin gas calculation
-pub fn vm_resources_to_gas(
-    resources: &ExecutionResources,
-    builtin_gas_cost: &BuiltinGasCosts,
+/// Converts extended execution resources to gas with configurable builtin gas calculation.
+pub fn extended_execution_resources_to_gas(
+    resources: &ExtendedExecutionResources,
+    cairo_primitives_gas_costs: &BuiltinGasCosts,
     versioned_constants: &VersionedConstants,
 ) -> GasAmount {
-    let builtins_gas_cost = builtins_to_gas(&resources.prover_builtins(), builtin_gas_cost);
-    let n_steps_gas_cost = n_steps_to_gas(resources.total_n_steps(), versioned_constants);
+    let cairo_primitives_gas_cost =
+        cairo_primitives_to_gas(&resources.prover_cairo_primitives(), cairo_primitives_gas_costs);
+    let n_steps_gas_cost =
+        n_steps_to_gas(resources.vm_resources.total_n_steps(), versioned_constants);
     let n_memory_holes_gas_cost =
-        memory_holes_to_gas(resources.n_memory_holes, versioned_constants);
+        memory_holes_to_gas(resources.vm_resources.n_memory_holes, versioned_constants);
 
     n_steps_gas_cost
         .checked_add_panic_on_overflow(n_memory_holes_gas_cost)
-        .checked_add_panic_on_overflow(builtins_gas_cost)
+        .checked_add_panic_on_overflow(cairo_primitives_gas_cost)
 }
 
 /// Computes the steps gas by subtracting the builtins' contribution from the Sierra gas.
 pub fn sierra_gas_to_steps_gas(
     sierra_gas: GasAmount,
-    builtin_counters: &BuiltinCounterMap,
+    cairo_primitives_counters: &CairoPrimitiveCounterMap,
     sierra_builtin_gas_costs: &BuiltinGasCosts,
 ) -> GasAmount {
-    let builtins_gas_cost = builtins_to_gas(builtin_counters, sierra_builtin_gas_costs);
+    let cairo_primitives_gas =
+        cairo_primitives_to_gas(cairo_primitives_counters, sierra_builtin_gas_costs);
 
-    sierra_gas.checked_sub(builtins_gas_cost).unwrap_or_else(|| {
+    sierra_gas.checked_sub(cairo_primitives_gas).unwrap_or_else(|| {
         log::debug!(
-            "Sierra gas underflow: builtins gas exceeds total. Sierra gas: {sierra_gas:?}, \
-             Builtins gas: {builtins_gas_cost:?}, Builtins: {builtin_counters:?}"
+            "Sierra gas underflow: cairo primitives gas exceeds total. Sierra gas: \
+             {sierra_gas:?}, Cairo primitives gas: {cairo_primitives_gas:?}, Cairo primitives: \
+             {cairo_primitives_counters:?}"
         );
         GasAmount::ZERO
     })
 }
 
-pub fn builtins_to_gas(
-    builtin_counters: &BuiltinCounterMap,
-    builtin_gas_costs: &BuiltinGasCosts,
+pub fn cairo_primitives_to_gas(
+    cairo_primitives_counters: &CairoPrimitiveCounterMap,
+    // NOTE: 'blake' is currently the only supported opcode, by being included in the
+    // builtin_gas_costs.
+    cairo_primitives_gas_costs: &BuiltinGasCosts,
 ) -> GasAmount {
-    let builtin_gas = builtin_counters.iter().fold(0u64, |accumulated_gas, (name, &count)| {
-        let builtin_weight = builtin_gas_costs.get_builtin_gas_cost(name).unwrap();
-        builtin_weight
-            .checked_mul(u64_from_usize(count))
-            .and_then(|builtin_gas| accumulated_gas.checked_add(builtin_gas))
-            .unwrap_or_else(|| {
-                panic!(
-                    "Overflow while converting builtin counters to gas.\nBuiltin: {name}, Weight: \
-                     {builtin_weight}, Count: {count}, Accumulated gas: {accumulated_gas}"
-                )
-            })
-    });
+    let cairo_primitives_gas =
+        cairo_primitives_counters.iter().fold(0u64, |accumulated_gas, (name, &count)| {
+            let cairo_primitive_weight =
+                cairo_primitives_gas_costs.get_cairo_primitive_gas_cost(name).unwrap();
+            cairo_primitive_weight
+                .checked_mul(u64_from_usize(count))
+                .and_then(|builtin_gas| accumulated_gas.checked_add(builtin_gas))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Overflow while converting cairo primitives counters to gas.\nCairo \
+                         primitive: {name:?}, Weight: {cairo_primitive_weight}, Count: {count}, \
+                         Accumulated gas: {accumulated_gas}"
+                    )
+                })
+        });
 
-    GasAmount(builtin_gas)
+    GasAmount(cairo_primitives_gas)
 }
 
 fn add_casm_hash_computation_gas_cost(
-    class_hash_to_casm_hash_computation_resources: &HashMap<ClassHash, EstimatedExecutionResources>,
+    class_hash_to_casm_hash_computation_resources: &HashMap<ClassHash, ExtendedExecutionResources>,
     gas_without_casm_hash_computation: GasAmount,
     builtin_gas_cost: &BuiltinGasCosts,
     versioned_constants: &VersionedConstants,
-    blake_opcode_gas: usize,
 ) -> (GasAmount, CasmHashComputationData) {
     let casm_hash_computation_data_gas = CasmHashComputationData::from_resources(
         class_hash_to_casm_hash_computation_resources,
         gas_without_casm_hash_computation,
-        |resources| resources.to_gas(builtin_gas_cost, blake_opcode_gas, versioned_constants),
+        |resources| {
+            extended_execution_resources_to_gas(resources, builtin_gas_cost, versioned_constants)
+        },
     );
     (casm_hash_computation_data_gas.total_gas(), casm_hash_computation_data_gas)
 }
 
 fn compute_sierra_gas(
-    vm_resources: &ExecutionResources,
+    vm_resources: &ExtendedExecutionResources,
     sierra_builtin_gas_costs: &BuiltinGasCosts,
     versioned_constants: &VersionedConstants,
     tx_resources: &TransactionResources,
     migration_gas: GasAmount,
-    class_hash_to_casm_hash_computation_resources: &HashMap<ClassHash, EstimatedExecutionResources>,
-    blake_opcode_gas: usize,
+    class_hash_to_casm_hash_computation_resources: &HashMap<ClassHash, ExtendedExecutionResources>,
 ) -> (GasAmount, CasmHashComputationData, GasAmount) {
-    let mut vm_resources_sierra_gas =
-        vm_resources_to_gas(vm_resources, sierra_builtin_gas_costs, versioned_constants);
+    let mut vm_resources_sierra_gas = extended_execution_resources_to_gas(
+        vm_resources,
+        sierra_builtin_gas_costs,
+        versioned_constants,
+    );
     let sierra_gas = tx_resources.computation.sierra_gas;
 
     vm_resources_sierra_gas = vm_resources_sierra_gas.checked_add_panic_on_overflow(sierra_gas);
@@ -790,28 +819,22 @@ fn compute_sierra_gas(
             sierra_gas_without_casm_hash_computation,
             sierra_builtin_gas_costs,
             versioned_constants,
-            // Sierra gas represents `stone` proving costs. However, a Blake opcode cannot be
-            // executed in `stone`, (i.e. this version is not supported by `stone`). For
-            // simplicity, the Blake `stwo` cost is used for the sierra gas estimation.
-            blake_opcode_gas,
         );
     (total_sierra_gas, casm_hash_computation_data_sierra_gas, vm_resources_sierra_gas)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compute_proving_gas(
-    builtin_counters: &BuiltinCounterMap,
+    cairo_primitives_counters: &CairoPrimitiveCounterMap,
     vm_resources_sierra_gas: GasAmount,
     versioned_constants: &VersionedConstants,
     proving_builtin_gas_costs: &BuiltinGasCosts,
     sierra_builtin_gas_costs: &BuiltinGasCosts,
     migration_gas: GasAmount,
-    class_hash_to_casm_hash_computation_resources: &HashMap<ClassHash, EstimatedExecutionResources>,
-    blake_opcode_gas: usize,
+    class_hash_to_casm_hash_computation_resources: &HashMap<ClassHash, ExtendedExecutionResources>,
 ) -> (GasAmount, CasmHashComputationData) {
-    let vm_resources_proving_gas = proving_gas_from_builtins_and_sierra_gas(
+    let vm_resources_proving_gas = proving_gas_from_cairo_primitives_and_sierra_gas(
         vm_resources_sierra_gas,
-        builtin_counters,
+        cairo_primitives_counters,
         proving_builtin_gas_costs,
         sierra_builtin_gas_costs,
     );
@@ -824,7 +847,6 @@ fn compute_proving_gas(
         proving_gas_without_casm_hash_computation,
         proving_builtin_gas_costs,
         versioned_constants,
-        blake_opcode_gas,
     )
 }
 
@@ -836,8 +858,9 @@ pub fn get_tx_weights<S: StateReader>(
     tx_resources: &TransactionResources,
     state_changes_keys: &StateChangesKeys,
     versioned_constants: &VersionedConstants,
-    tx_builtin_counters: &BuiltinCounterMap,
+    tx_cairo_primitives_counters: &CairoPrimitiveCounterMap,
     bouncer_config: &BouncerConfig,
+    receipt_l2_gas: GasAmount,
 ) -> TransactionExecutionResult<TxWeights> {
     let message_resources = &tx_resources.starknet_resources.messages;
     let message_starknet_l1gas = usize_from_u64(message_resources.get_starknet_gas_cost().l1_gas.0)
@@ -848,12 +871,13 @@ pub fn get_tx_weights<S: StateReader>(
         map_class_hash_to_casm_hash_computation_resources(state_reader, executed_class_hashes)?;
 
     // Patricia update + transaction resources.
-    let patrticia_update_resources = get_patricia_update_resources(
+    let patricia_update_resources = get_patricia_update_resources(
         n_visited_storage_entries,
         // TODO(Yoni): consider counting here the global contract tree and the aliases as well.
         state_changes_keys.storage_keys.len(),
     );
-    let vm_resources = &patrticia_update_resources + &tx_resources.computation.total_vm_resources();
+    let vm_resources =
+        &tx_resources.computation.total_extended_vm_resources() + &patricia_update_resources;
 
     // Builtin gas costs for stone and for stwo.
     let sierra_builtin_gas_costs = &versioned_constants.os_constants.gas_costs.builtins;
@@ -873,14 +897,11 @@ pub fn get_tx_weights<S: StateReader>(
     };
     total_state_changes_keys.extend(state_changes_keys);
 
-    let blake_opcode_gas = bouncer_config.blake_weight;
-
     // Migration occurs once per contract and is not included in the CASM hash computation, which
     // is performed every time a contract is loaded.
-    let sierra_migration_gas =
-        migration_data.to_gas(sierra_builtin_gas_costs, versioned_constants, blake_opcode_gas);
+    let sierra_migration_gas = migration_data.to_gas(sierra_builtin_gas_costs, versioned_constants);
     let proving_migration_gas =
-        migration_data.to_gas(proving_builtin_gas_costs, versioned_constants, blake_opcode_gas);
+        migration_data.to_gas(proving_builtin_gas_costs, versioned_constants);
 
     // Sierra gas computation.
     let (total_sierra_gas, casm_hash_computation_data_sierra_gas, vm_resources_sierra_gas) =
@@ -891,25 +912,23 @@ pub fn get_tx_weights<S: StateReader>(
             tx_resources,
             sierra_migration_gas,
             &class_hash_to_casm_hash_computation_resources,
-            blake_opcode_gas,
         );
 
     // Proving gas computation.
-    // Exclude tx_vm_resources to prevent double-counting in tx_builtin_counters.
-    let mut vm_resources_builtins_for_proving_gas_computation =
-        (&patrticia_update_resources + &tx_resources.computation.os_vm_resources).prover_builtins();
-    // Use tx_builtin_counters to count the Sierra gas executed entry points as well.
-    add_maps(&mut vm_resources_builtins_for_proving_gas_computation, tx_builtin_counters);
+    let cairo_primitives_for_proving_gas = get_cairo_primitives_for_proving_gas_computation(
+        patricia_update_resources.prover_builtins(),
+        tx_resources.computation.os_vm_resources.prover_builtins(),
+        tx_cairo_primitives_counters,
+    );
 
     let (total_proving_gas, casm_hash_computation_data_proving_gas) = compute_proving_gas(
-        &vm_resources_builtins_for_proving_gas_computation,
+        &cairo_primitives_for_proving_gas,
         vm_resources_sierra_gas,
         versioned_constants,
         proving_builtin_gas_costs,
         sierra_builtin_gas_costs,
         proving_migration_gas,
         &class_hash_to_casm_hash_computation_resources,
-        blake_opcode_gas,
     );
 
     let bouncer_weights = BouncerWeights {
@@ -920,6 +939,7 @@ pub fn get_tx_weights<S: StateReader>(
         sierra_gas: total_sierra_gas,
         n_txs: 1,
         proving_gas: total_proving_gas,
+        receipt_l2_gas,
     };
 
     Ok(TxWeights {
@@ -930,12 +950,29 @@ pub fn get_tx_weights<S: StateReader>(
     })
 }
 
+/// Aggregates Cairo primitives (builtins and opcodes) for proving gas computation.
+///
+/// The Patricia tree updates and OS computation only track builtin usage- they do not
+/// consume opcodes. The transaction resources comes from VM execution and includes both builtin
+// and opcode counters.
+fn get_cairo_primitives_for_proving_gas_computation(
+    patricia_update_builtins: BuiltinCounterMap,
+    os_computation_builtins: BuiltinCounterMap,
+    tx_cairo_primitives: &CairoPrimitiveCounterMap,
+) -> CairoPrimitiveCounterMap {
+    let mut cairo_primitives = cairo_primitive_counter_map(patricia_update_builtins);
+    add_maps(&mut cairo_primitives, &cairo_primitive_counter_map(os_computation_builtins));
+    add_maps(&mut cairo_primitives, tx_cairo_primitives);
+
+    cairo_primitives
+}
+
 /// Returns a mapping from each class hash to its estimated Cairo resources for Casm hash
 /// computation (done by the OS).
 pub fn map_class_hash_to_casm_hash_computation_resources<S: StateReader>(
     state_reader: &S,
     executed_class_hashes: &HashSet<ClassHash>,
-) -> TransactionExecutionResult<HashMap<ClassHash, EstimatedExecutionResources>> {
+) -> TransactionExecutionResult<HashMap<ClassHash, ExtendedExecutionResources>> {
     executed_class_hashes
         .iter()
         .map(|class_hash| {
@@ -969,7 +1006,7 @@ pub fn get_patricia_update_resources(
 
     let resources_per_tree_access = ExecutionResources {
         n_steps: TREE_HEIGHT_UPPER_BOUND * STEPS_IN_TREE_PER_HEIGHT,
-        builtin_instance_counter: HashMap::from([(
+        builtin_instance_counter: BTreeMap::from([(
             BuiltinName::pedersen,
             TREE_HEIGHT_UPPER_BOUND * PEDERSENS_PER_HEIGHT,
         )]),
@@ -980,14 +1017,17 @@ pub fn get_patricia_update_resources(
     &resources_per_tree_access * (n_visited_storage_entries + n_first_time_modified_storage_entries)
 }
 
+// TODO(Dan): refactor to reduce the number of arguments.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_tx_weights_within_max_capacity<S: StateReader>(
     state_reader: &S,
     tx_execution_summary: &ExecutionSummary,
-    tx_builtin_counters: &BuiltinCounterMap,
+    tx_builtin_counters: &CairoPrimitiveCounterMap,
     tx_resources: &TransactionResources,
     tx_state_changes_keys: &StateChangesKeys,
     bouncer_config: &BouncerConfig,
     versioned_constants: &VersionedConstants,
+    receipt_l2_gas: GasAmount,
 ) -> TransactionExecutionResult<()> {
     let tx_weights = get_tx_weights(
         state_reader,
@@ -998,6 +1038,7 @@ pub fn verify_tx_weights_within_max_capacity<S: StateReader>(
         versioned_constants,
         tx_builtin_counters,
         bouncer_config,
+        receipt_l2_gas,
     )?
     .bouncer_weights;
 

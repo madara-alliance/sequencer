@@ -1,4 +1,3 @@
-use std::fmt::Debug;
 use std::sync::OnceLock;
 
 use crate::metric_definitions::METRIC_LABEL_FILTER;
@@ -13,18 +12,21 @@ mod histograms;
 
 // re exports
 pub use crate::metrics::counters::{LabeledMetricCounter, MetricCounter};
-pub use crate::metrics::gauges::{LabeledMetricGauge, MetricGauge};
+pub use crate::metrics::gauges::{set_unix_now_seconds, LabeledMetricGauge, MetricGauge};
 pub use crate::metrics::histograms::{HistogramValue, LabeledMetricHistogram, MetricHistogram};
 
 /// Global variable set by the main config to enable collecting profiling metrics.
 pub static COLLECT_SEQUENCER_PROFILING_METRICS: OnceLock<bool> = OnceLock::new();
 
 /// Relevant components for which metrics can be defined.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, strum::Display)]
 pub enum MetricScope {
     Batcher,
     Blockifier,
     ClassManager,
+    Committer,
+    CompileToCasm,
+    ConfigManager,
     Consensus,
     ConsensusManager,
     ConsensusOrchestrator,
@@ -35,7 +37,8 @@ pub enum MetricScope {
     L1Provider,
     Mempool,
     MempoolP2p,
-    CompileToCasm,
+    Pod,
+    Staking,
     StateSync,
     Storage,
     Tokio,

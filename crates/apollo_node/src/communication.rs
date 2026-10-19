@@ -5,13 +5,13 @@ use apollo_compile_to_casm_types::SierraCompilerRequestWrapper;
 use apollo_config_manager_types::communication::ConfigManagerRequestWrapper;
 use apollo_gateway_types::communication::GatewayRequestWrapper;
 use apollo_infra::component_definitions::ComponentCommunication;
-use apollo_l1_endpoint_monitor::communication::L1EndpointMonitorRequestWrapper;
 use apollo_l1_gas_price::communication::L1GasPriceRequestWrapper;
 use apollo_l1_provider::communication::L1ProviderRequestWrapper;
 use apollo_mempool_p2p_types::communication::MempoolP2pPropagatorRequestWrapper;
 use apollo_mempool_types::communication::MempoolRequestWrapper;
 use apollo_node_config::component_execution_config::ExpectedComponentConfig;
 use apollo_node_config::node_config::SequencerNodeConfig;
+use apollo_proof_manager_types::ProofManagerRequestWrapper;
 use apollo_signature_manager_types::SignatureManagerRequestWrapper;
 use apollo_state_sync_types::communication::StateSyncRequestWrapper;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -23,11 +23,11 @@ pub struct SequencerNodeCommunication {
     committer_channel: ComponentCommunication<CommitterRequestWrapper>,
     config_manager_channel: ComponentCommunication<ConfigManagerRequestWrapper>,
     gateway_channel: ComponentCommunication<GatewayRequestWrapper>,
-    l1_endpoint_monitor_channel: ComponentCommunication<L1EndpointMonitorRequestWrapper>,
     l1_provider_channel: ComponentCommunication<L1ProviderRequestWrapper>,
     l1_gas_price_channel: ComponentCommunication<L1GasPriceRequestWrapper>,
     mempool_channel: ComponentCommunication<MempoolRequestWrapper>,
     mempool_p2p_propagator_channel: ComponentCommunication<MempoolP2pPropagatorRequestWrapper>,
+    proof_manager_channel: ComponentCommunication<ProofManagerRequestWrapper>,
     sierra_compiler_channel: ComponentCommunication<SierraCompilerRequestWrapper>,
     signature_manager_channel: ComponentCommunication<SignatureManagerRequestWrapper>,
     state_sync_channel: ComponentCommunication<StateSyncRequestWrapper>,
@@ -74,14 +74,6 @@ impl SequencerNodeCommunication {
         self.gateway_channel.take_rx()
     }
 
-    pub fn take_l1_endpoint_monitor_tx(&mut self) -> Sender<L1EndpointMonitorRequestWrapper> {
-        self.l1_endpoint_monitor_channel.take_tx()
-    }
-
-    pub fn take_l1_endpoint_monitor_rx(&mut self) -> Receiver<L1EndpointMonitorRequestWrapper> {
-        self.l1_endpoint_monitor_channel.take_rx()
-    }
-
     pub fn take_l1_provider_tx(&mut self) -> Sender<L1ProviderRequestWrapper> {
         self.l1_provider_channel.take_tx()
     }
@@ -112,6 +104,14 @@ impl SequencerNodeCommunication {
 
     pub fn take_mempool_rx(&mut self) -> Receiver<MempoolRequestWrapper> {
         self.mempool_channel.take_rx()
+    }
+
+    pub fn take_proof_manager_tx(&mut self) -> Sender<ProofManagerRequestWrapper> {
+        self.proof_manager_channel.take_tx()
+    }
+
+    pub fn take_proof_manager_rx(&mut self) -> Receiver<ProofManagerRequestWrapper> {
+        self.proof_manager_channel.take_rx()
     }
 
     pub fn take_sierra_compiler_tx(&mut self) -> Sender<SierraCompilerRequestWrapper> {
@@ -226,24 +226,6 @@ pub fn create_node_channels(config: &SequencerNodeConfig) -> SequencerNodeCommun
             false => (None, None),
         };
 
-    let (tx_l1_endpoint_monitor, rx_l1_endpoint_monitor) =
-        match config.components.l1_endpoint_monitor.execution_mode.is_running_locally() {
-            true => {
-                let (tx_l1_endpoint_monitor, rx_l1_endpoint_monitor) =
-                    channel::<L1EndpointMonitorRequestWrapper>(
-                        config
-                            .components
-                            .l1_endpoint_monitor
-                            .local_server_config
-                            .as_ref()
-                            .expect("L1 endpoint monitor local server config should be available.")
-                            .inbound_requests_channel_capacity,
-                    );
-                (Some(tx_l1_endpoint_monitor), Some(rx_l1_endpoint_monitor))
-            }
-            false => (None, None),
-        };
-
     let (tx_l1_provider, rx_l1_provider) =
         match config.components.l1_provider.execution_mode.is_running_locally() {
             true => {
@@ -313,6 +295,23 @@ pub fn create_node_channels(config: &SequencerNodeConfig) -> SequencerNodeCommun
             false => (None, None),
         };
 
+    let (tx_proof_manager, rx_proof_manager) =
+        match config.components.proof_manager.execution_mode.is_running_locally() {
+            true => {
+                let (tx_proof_manager, rx_proof_manager) = channel::<ProofManagerRequestWrapper>(
+                    config
+                        .components
+                        .proof_manager
+                        .local_server_config
+                        .as_ref()
+                        .expect("Proof manager local server config should be available.")
+                        .inbound_requests_channel_capacity,
+                );
+                (Some(tx_proof_manager), Some(rx_proof_manager))
+            }
+            false => (None, None),
+        };
+
     let (tx_sierra_compiler, rx_sierra_compiler) =
         match config.components.sierra_compiler.execution_mode.is_running_locally() {
             true => {
@@ -372,10 +371,6 @@ pub fn create_node_channels(config: &SequencerNodeConfig) -> SequencerNodeCommun
         committer_channel: ComponentCommunication::new(tx_committer, rx_committer),
         config_manager_channel: ComponentCommunication::new(tx_config_manager, rx_config_manager),
         gateway_channel: ComponentCommunication::new(tx_gateway, rx_gateway),
-        l1_endpoint_monitor_channel: ComponentCommunication::new(
-            tx_l1_endpoint_monitor,
-            rx_l1_endpoint_monitor,
-        ),
         l1_provider_channel: ComponentCommunication::new(tx_l1_provider, rx_l1_provider),
         l1_gas_price_channel: ComponentCommunication::new(tx_l1_gas_price, rx_l1_gas_price),
         mempool_channel: ComponentCommunication::new(tx_mempool, rx_mempool),
@@ -383,6 +378,7 @@ pub fn create_node_channels(config: &SequencerNodeConfig) -> SequencerNodeCommun
             tx_mempool_p2p_propagator,
             rx_mempool_p2p_propagator,
         ),
+        proof_manager_channel: ComponentCommunication::new(tx_proof_manager, rx_proof_manager),
         sierra_compiler_channel: ComponentCommunication::new(
             tx_sierra_compiler,
             rx_sierra_compiler,

@@ -9,11 +9,18 @@ use apollo_config::converters::{
     deserialize_float_seconds_to_duration,
     deserialize_seconds_to_duration,
 };
-use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
+use apollo_config::dumping::{
+    prepend_sub_config_name,
+    ser_optional_param,
+    ser_param,
+    SerializeConfig,
+};
 use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use apollo_protobuf::consensus::DEFAULT_VALIDATOR_ID;
-use apollo_storage::StorageConfig;
+use apollo_storage::db::DbConfig;
+use apollo_storage::{StorageConfig, StorageScope};
 use serde::{Deserialize, Serialize};
+use starknet_api::block::BlockNumber;
 use validator::Validate;
 
 use crate::ValidatorId;
@@ -30,6 +37,10 @@ pub struct ConsensusDynamicConfig {
     pub sync_retry_interval: Duration,
     /// Future message limits configuration.
     pub future_msg_limit: FutureMsgLimitsConfig,
+    /// When true, require the virtual proposer to have voted in favor before reaching a decision.
+    pub require_virtual_proposer_vote: bool,
+    /// If set, the node participates in consensus up to and including this height, then stops.
+    pub stop_at_height: Option<BlockNumber>,
 }
 
 /// Static configuration for consensus that doesn't change during runtime.
@@ -40,6 +51,8 @@ pub struct ConsensusStaticConfig {
     pub startup_delay: Duration,
     /// Config for the storage used to write/read consensus state.
     pub storage_config: StorageConfig,
+    /// If true, skips check that we didn't vote on this height.
+    pub skip_last_voted_height_check: bool,
 }
 
 /// Configuration for consensus containing both static and dynamic configs.
@@ -66,21 +79,43 @@ impl SerializeConfig for ConsensusDynamicConfig {
                 "The duration (seconds) between sync attempts.",
                 ParamPrivacyInput::Public,
             ),
+            ser_param(
+                "require_virtual_proposer_vote",
+                &self.require_virtual_proposer_vote,
+                "When true, require the virtual proposer to have voted in favor before reaching a \
+                 decision.",
+                ParamPrivacyInput::Public,
+            ),
         ]);
         config.extend(prepend_sub_config_name(self.timeouts.dump(), "timeouts"));
         config.extend(prepend_sub_config_name(self.future_msg_limit.dump(), "future_msg_limit"));
+        config.extend(ser_optional_param(
+            &self.stop_at_height,
+            BlockNumber::default(),
+            "stop_at_height",
+            "If set, the node will stop participating in consensus after this height.",
+            ParamPrivacyInput::Public,
+        ));
         config
     }
 }
 
 impl SerializeConfig for ConsensusStaticConfig {
     fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
-        let mut config = BTreeMap::from_iter([ser_param(
-            "startup_delay",
-            &self.startup_delay.as_secs(),
-            "Delay (seconds) before starting consensus to give time for network peering.",
-            ParamPrivacyInput::Public,
-        )]);
+        let mut config = BTreeMap::from_iter([
+            ser_param(
+                "startup_delay",
+                &self.startup_delay.as_secs(),
+                "Delay (seconds) before starting consensus to give time for network peering.",
+                ParamPrivacyInput::Public,
+            ),
+            ser_param(
+                "skip_last_voted_height_check",
+                &self.skip_last_voted_height_check,
+                "If true, skips check that we didn't vote on this height.",
+                ParamPrivacyInput::Public,
+            ),
+        ]);
         config.extend(prepend_sub_config_name(self.storage_config.dump(), "storage_config"));
         config
     }
@@ -102,6 +137,8 @@ impl Default for ConsensusDynamicConfig {
             timeouts: TimeoutsConfig::default(),
             sync_retry_interval: Duration::from_secs_f64(1.0),
             future_msg_limit: FutureMsgLimitsConfig::default(),
+            require_virtual_proposer_vote: false,
+            stop_at_height: None,
         }
     }
 }
@@ -111,14 +148,15 @@ impl Default for ConsensusStaticConfig {
         Self {
             startup_delay: Duration::from_secs(5),
             storage_config: StorageConfig {
-                db_config: apollo_storage::db::DbConfig {
+                db_config: DbConfig {
                     path_prefix: "/data/consensus".into(),
                     enforce_file_exists: false,
                     ..Default::default()
                 },
-                scope: apollo_storage::StorageScope::StateOnly,
+                scope: StorageScope::StateOnly,
                 ..Default::default()
             },
+            skip_last_voted_height_check: false,
         }
     }
 }
@@ -166,7 +204,7 @@ impl Timeout {
 
     /// Compute the timeout for the given round: min(base + round * delta, max).
     fn get_timeout(&self, round: u32) -> Duration {
-        (self.base + round * self.delta).min(self.max)
+        (self.base + self.delta.saturating_mul(round)).min(self.max)
     }
 }
 
@@ -306,13 +344,15 @@ impl SerializeConfig for FutureMsgLimitsConfig {
 pub struct StreamHandlerConfig {
     /// The capacity of the channel buffer for stream messages.
     pub channel_buffer_capacity: usize,
-    /// The maximum number of streams that can be open at the same time.
+    /// The maximum number of peers that can send inbound messages.
+    pub max_peers: usize,
+    /// The maximum number of streams that can be open at the same time, per peer.
     pub max_streams: usize,
 }
 
 impl Default for StreamHandlerConfig {
     fn default() -> Self {
-        Self { channel_buffer_capacity: 1000, max_streams: 100 }
+        Self { channel_buffer_capacity: 1000, max_peers: 100, max_streams: 100 }
     }
 }
 
@@ -323,6 +363,12 @@ impl SerializeConfig for StreamHandlerConfig {
                 "channel_buffer_capacity",
                 &self.channel_buffer_capacity,
                 "The capacity of the channel buffer for stream messages.",
+                ParamPrivacyInput::Public,
+            ),
+            ser_param(
+                "max_peers",
+                &self.max_peers,
+                "The maximum number of peers that can send inbound messages.",
                 ParamPrivacyInput::Public,
             ),
             ser_param(

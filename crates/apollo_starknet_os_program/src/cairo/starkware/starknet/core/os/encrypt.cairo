@@ -1,5 +1,4 @@
 from starkware.cairo.common.alloc import alloc
-from starkware.cairo.common.cairo_blake2s.blake2s import blake_with_opcode
 from starkware.cairo.common.cairo_builtins import EcOpBuiltin
 from starkware.cairo.common.ec import StarkCurve, ec_mul, recover_y
 from starkware.cairo.common.ec_point import EcPoint
@@ -51,16 +50,10 @@ func encrypt_state_diff{range_check_ptr, ec_op_ptr: EcOpBuiltin*}(
     // Generate random symmetric key and random starknet private keys.
     local symmetric_key: felt;
     local sn_private_keys: felt*;
-    %{ generate_keys_from_hash(ids.compressed_start, ids.compressed_end, ids.n_keys) %}
+    %{ GenerateKeysUsingSha256Hash %}
 
     local encrypted_start: felt*;
-    %{
-        if use_kzg_da:
-            ids.encrypted_start = segments.add()
-        else:
-            # Assign a temporary segment, to be relocated into the output segment.
-            ids.encrypted_start = segments.add_temp_segment()
-    %}
+    %{ SetEncryptedStart %}
 
     let output_pointer = encrypted_start;
     assert output_pointer[0] = n_keys;

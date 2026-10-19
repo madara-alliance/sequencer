@@ -6,44 +6,49 @@ use rand::Rng;
 use starknet_api::hash::HashOutput;
 use starknet_patricia_storage::db_object::{
     DBObject,
-    Deserializable,
+    EmptyDeserializationContext,
     EmptyKeyContext,
     HasStaticPrefix,
 };
-use starknet_patricia_storage::errors::DeserializationError;
+use starknet_patricia_storage::errors::{DeserializationError, SerializationResult};
 use starknet_patricia_storage::storage_trait::{create_db_key, DbKey, DbKeyPrefix, DbValue};
 use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::StarkHash;
 
-use super::filled_tree::node_serde::PatriciaPrefix;
 use super::node_data::inner_node::{EdgePathLength, PathToBottom};
 use super::node_data::leaf::Leaf;
 use super::original_skeleton_tree::node::OriginalSkeletonNode;
 use super::types::{NodeIndex, SubTreeHeight};
 use crate::felt::u256_from_felt;
-use crate::generate_trie_config;
 use crate::patricia_merkle_tree::errors::TypesError;
 use crate::patricia_merkle_tree::node_data::errors::{LeafError, LeafResult};
-use crate::patricia_merkle_tree::original_skeleton_tree::config::OriginalSkeletonTreeConfig;
+use crate::patricia_merkle_tree::node_data::leaf::LeafWithEmptyKeyContext;
+use crate::patricia_merkle_tree::{DEFAULT_DB_KEY_SEPARATOR, DEFAULT_PATRICIA_NODE_PREFIX};
 
+const TEST_PREFIX: &[u8] = &[0];
 #[derive(Debug, PartialEq, Clone, Copy, Default, Eq)]
 pub struct MockLeaf(pub Felt);
 
 impl HasStaticPrefix for MockLeaf {
     type KeyContext = EmptyKeyContext;
     fn get_static_prefix(_key_context: &Self::KeyContext) -> DbKeyPrefix {
-        DbKeyPrefix::new(&[0])
+        DbKeyPrefix::new(TEST_PREFIX.into())
     }
 }
 
 impl DBObject for MockLeaf {
-    fn serialize(&self) -> DbValue {
-        DbValue(self.0.to_bytes_be().to_vec())
-    }
-}
+    const DB_KEY_SEPARATOR: &[u8] = DEFAULT_DB_KEY_SEPARATOR;
 
-impl Deserializable for MockLeaf {
-    fn deserialize(value: &DbValue) -> Result<Self, DeserializationError> {
+    type DeserializeContext = EmptyDeserializationContext;
+
+    fn serialize(&self) -> SerializationResult<DbValue> {
+        Ok(DbValue(self.0.to_bytes_be().to_vec()))
+    }
+
+    fn deserialize(
+        value: &DbValue,
+        _deserialize_context: &Self::DeserializeContext,
+    ) -> Result<Self, DeserializationError> {
         Ok(Self(Felt::from_bytes_be_slice(&value.0)))
     }
 }
@@ -64,8 +69,6 @@ impl Leaf for MockLeaf {
         Ok((Self(input), input.to_hex_string()))
     }
 }
-
-generate_trie_config!(OriginalSkeletonMockTrieConfig, MockLeaf);
 
 pub fn u256_try_into_felt(value: &U256) -> Result<Felt, TypesError<U256>> {
     if *value > u256_from_felt(&Felt::MAX) {
@@ -115,13 +118,19 @@ pub fn create_32_bytes_entry(simple_val: u128) -> [u8; 32] {
 }
 
 fn create_inner_node_patricia_key(val: Felt) -> DbKey {
-    create_db_key(PatriciaPrefix::InnerNode.into(), &val.to_bytes_be())
+    create_db_key(
+        DbKeyPrefix::new(DEFAULT_PATRICIA_NODE_PREFIX.into()),
+        DEFAULT_DB_KEY_SEPARATOR,
+        &val.to_bytes_be(),
+    )
 }
 
-pub fn create_leaf_patricia_key<L: Leaf + HasStaticPrefix<KeyContext = EmptyKeyContext>>(
-    val: u128,
-) -> DbKey {
-    create_db_key(L::get_static_prefix(&EmptyKeyContext), &U256::from(val).to_be_bytes())
+pub fn create_leaf_patricia_key<L: LeafWithEmptyKeyContext>(val: u128) -> DbKey {
+    create_db_key(
+        L::get_static_prefix(&EmptyKeyContext),
+        DEFAULT_DB_KEY_SEPARATOR,
+        &U256::from(val).to_be_bytes(),
+    )
 }
 
 fn create_binary_val(left: Felt, right: Felt) -> DbValue {
@@ -161,9 +170,7 @@ pub fn create_edge_entry_from_u128<SH: StarkHash>(
     create_edge_entry::<SH>(Felt::from(hash), path, length)
 }
 
-pub fn create_leaf_entry<L: Leaf + HasStaticPrefix<KeyContext = EmptyKeyContext>>(
-    hash: u128,
-) -> (DbKey, DbValue) {
+pub fn create_leaf_entry<L: LeafWithEmptyKeyContext>(hash: u128) -> (DbKey, DbValue) {
     (create_leaf_patricia_key::<L>(hash), DbValue(create_32_bytes_entry(hash).to_vec()))
 }
 
@@ -198,7 +205,11 @@ pub fn create_root_edge_entry(old_root: u128, subtree_height: SubTreeHeight) -> 
     // Assumes path is 0.
     let length = SubTreeHeight::ACTUAL_HEIGHT.0 - subtree_height.0;
     let new_root = old_root + u128::from(length);
-    let key = create_db_key(PatriciaPrefix::InnerNode.into(), &Felt::from(new_root).to_bytes_be());
+    let key = create_db_key(
+        DbKeyPrefix::new(DEFAULT_PATRICIA_NODE_PREFIX.into()),
+        DEFAULT_DB_KEY_SEPARATOR,
+        &Felt::from(new_root).to_bytes_be(),
+    );
     let value = DbValue(
         Felt::from(old_root)
             .to_bytes_be()

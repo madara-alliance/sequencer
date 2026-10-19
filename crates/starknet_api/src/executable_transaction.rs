@@ -7,7 +7,7 @@ use std::str::FromStr;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
-use strum_macros::EnumIter;
+use strum::EnumIter;
 use thiserror::Error;
 
 use crate::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
@@ -20,6 +20,7 @@ use crate::transaction::fields::{
     ContractAddressSalt,
     Fee,
     PaymasterData,
+    ProofFacts,
     Tip,
     TransactionSignature,
     ValidResourceBounds,
@@ -103,6 +104,7 @@ impl TransactionType {
 
 /// Represents a paid Starknet transaction.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum AccountTransaction {
     Declare(DeclareTransaction),
     DeployAccount(DeployAccountTransaction),
@@ -327,7 +329,8 @@ impl InvokeTransaction {
         (nonce_data_availability_mode, DataAvailabilityMode),
         (fee_data_availability_mode, DataAvailabilityMode),
         (paymaster_data, PaymasterData),
-        (account_deployment_data, AccountDeploymentData)
+        (account_deployment_data, AccountDeploymentData),
+        (proof_facts, ProofFacts)
     );
     implement_getter_calls!((tx_hash, TransactionHash));
 
@@ -341,6 +344,16 @@ impl InvokeTransaction {
     ) -> Result<Self, StarknetApiError> {
         let tx_hash = invoke_tx.calculate_transaction_hash(chain_id, &invoke_tx.version())?;
         Ok(Self { tx: invoke_tx, tx_hash })
+    }
+
+    /// Returns the length of proof facts for client-side proving.
+    pub fn proof_facts_length(&self) -> usize {
+        match &self.tx {
+            crate::transaction::InvokeTransaction::V3(tx) => tx.proof_facts.0.len(),
+            // Client-side proving is only supported starting from V3.
+            crate::transaction::InvokeTransaction::V0(_)
+            | crate::transaction::InvokeTransaction::V1(_) => 0,
+        }
     }
 }
 

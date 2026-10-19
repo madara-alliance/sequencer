@@ -7,11 +7,11 @@ use apollo_http_server::metrics::{
 use apollo_mempool::metrics::{MEMPOOL_TRANSACTIONS_DROPPED, MEMPOOL_TRANSACTIONS_RECEIVED};
 use apollo_metrics::metrics::MetricQueryName;
 
+use crate::alert_placeholders::SeverityValueOrPlaceholder;
 use crate::alerts::{
     Alert,
     AlertComparisonOp,
     AlertCondition,
-    AlertEnvFiltering,
     AlertGroup,
     AlertLogicalOp,
     AlertSeverity,
@@ -32,16 +32,11 @@ pub(crate) fn get_http_server_high_deprecated_transaction_failure_ratio() -> Ale
             ADDED_TRANSACTIONS_DEPRECATED_ERROR.get_name_with_filter(),
             ADDED_TRANSACTIONS_TOTAL.get_name_with_filter()
         ),
-        vec![AlertCondition {
-            comparison_op: AlertComparisonOp::GreaterThan,
-            comparison_value: 0.1,
-            logical_op: AlertLogicalOp::And,
-        }],
+        vec![AlertCondition::new(AlertComparisonOp::GreaterThan, 0.1, AlertLogicalOp::And)],
         PENDING_DURATION_DEFAULT,
         EVALUATION_INTERVAL_SEC_DEFAULT,
         AlertSeverity::Informational,
         ObserverApplicability::NotApplicable,
-        AlertEnvFiltering::All,
     )
 }
 
@@ -56,25 +51,18 @@ pub(crate) fn get_http_server_high_transaction_failure_ratio() -> Alert {
             ADDED_TRANSACTIONS_DEPRECATED_ERROR.get_name_with_filter(),
             ADDED_TRANSACTIONS_TOTAL.get_name_with_filter()
         ),
-        vec![AlertCondition {
-            comparison_op: AlertComparisonOp::GreaterThan,
-            comparison_value: 0.5,
-            logical_op: AlertLogicalOp::And,
-        }],
+        vec![AlertCondition::new(AlertComparisonOp::GreaterThan, 0.5, AlertLogicalOp::And)],
         PENDING_DURATION_DEFAULT,
         EVALUATION_INTERVAL_SEC_DEFAULT,
-        AlertSeverity::WorkingHours,
+        AlertSeverity::Informational,
         ObserverApplicability::NotApplicable,
-        AlertEnvFiltering::All,
     )
 }
 
-fn get_http_server_internal_error_ratio(
-    alert_env_filtering: AlertEnvFiltering,
-    alert_severity: AlertSeverity,
-) -> Alert {
+pub(crate) fn get_http_server_internal_error_ratio() -> Alert {
+    const ALERT_NAME: &str = "http_server_internal_error_ratio";
     Alert::new(
-        "http_server_internal_error_ratio",
+        ALERT_NAME,
         "http server internal error ratio",
         AlertGroup::HttpServer,
         format!(
@@ -82,38 +70,18 @@ fn get_http_server_internal_error_ratio(
             ADDED_TRANSACTIONS_INTERNAL_ERROR.get_name_with_filter(),
             ADDED_TRANSACTIONS_TOTAL.get_name_with_filter()
         ),
-        vec![AlertCondition {
-            comparison_op: AlertComparisonOp::GreaterThan,
-            comparison_value: 0.01,
-            logical_op: AlertLogicalOp::And,
-        }],
+        vec![AlertCondition::new(AlertComparisonOp::GreaterThan, 0.01, AlertLogicalOp::And)],
         PENDING_DURATION_DEFAULT,
         EVALUATION_INTERVAL_SEC_DEFAULT,
-        alert_severity,
+        SeverityValueOrPlaceholder::Placeholder(ALERT_NAME.to_string()),
         ObserverApplicability::NotApplicable,
-        alert_env_filtering,
     )
 }
 
-pub(crate) fn get_http_server_internal_error_ratio_vec() -> Vec<Alert> {
-    vec![
-        get_http_server_internal_error_ratio(
-            AlertEnvFiltering::MainnetStyleAlerts,
-            AlertSeverity::Regular,
-        ),
-        get_http_server_internal_error_ratio(
-            AlertEnvFiltering::TestnetStyleAlerts,
-            AlertSeverity::WorkingHours,
-        ),
-    ]
-}
-
-fn get_mempool_transaction_drop_ratio(
-    alert_env_filtering: AlertEnvFiltering,
-    alert_severity: AlertSeverity,
-) -> Alert {
+pub(crate) fn get_mempool_transaction_drop_ratio() -> Alert {
+    const ALERT_NAME: &str = "mempool_transaction_drop_ratio";
     Alert::new(
-        "mempool_transaction_drop_ratio",
+        ALERT_NAME,
         "Mempool transaction drop ratio",
         AlertGroup::Mempool,
         format!(
@@ -121,31 +89,17 @@ fn get_mempool_transaction_drop_ratio(
             MEMPOOL_TRANSACTIONS_DROPPED.get_name_with_filter(),
             MEMPOOL_TRANSACTIONS_RECEIVED.get_name_with_filter(),
         ),
-        vec![AlertCondition {
-            comparison_op: AlertComparisonOp::GreaterThan,
+        vec![AlertCondition::new(
+            AlertComparisonOp::GreaterThan,
             // TODO(leo): Decide on the final ratio and who should be alerted.
-            comparison_value: 0.2,
-            logical_op: AlertLogicalOp::And,
-        }],
+            0.2,
+            AlertLogicalOp::And,
+        )],
         PENDING_DURATION_DEFAULT,
         EVALUATION_INTERVAL_SEC_DEFAULT,
-        alert_severity,
+        SeverityValueOrPlaceholder::Placeholder(ALERT_NAME.to_string()),
         ObserverApplicability::NotApplicable,
-        alert_env_filtering,
     )
-}
-
-pub(crate) fn get_mempool_transaction_drop_ratio_vec() -> Vec<Alert> {
-    vec![
-        get_mempool_transaction_drop_ratio(
-            AlertEnvFiltering::MainnetStyleAlerts,
-            AlertSeverity::DayOnly,
-        ),
-        get_mempool_transaction_drop_ratio(
-            AlertEnvFiltering::TestnetStyleAlerts,
-            AlertSeverity::WorkingHours,
-        ),
-    ]
 }
 
 pub(crate) fn get_http_server_internal_error_once() -> Alert {
@@ -157,15 +111,10 @@ pub(crate) fn get_http_server_internal_error_once() -> Alert {
             "increase({}[20m]) or vector(0)",
             ADDED_TRANSACTIONS_INTERNAL_ERROR.get_name_with_filter()
         ),
-        vec![AlertCondition {
-            comparison_op: AlertComparisonOp::GreaterThan,
-            comparison_value: 0.0,
-            logical_op: AlertLogicalOp::And,
-        }],
+        vec![AlertCondition::new(AlertComparisonOp::GreaterThan, 0.0, AlertLogicalOp::And)],
         PENDING_DURATION_DEFAULT,
         EVALUATION_INTERVAL_SEC_DEFAULT,
         AlertSeverity::WorkingHours,
         ObserverApplicability::NotApplicable,
-        AlertEnvFiltering::All,
     )
 }

@@ -18,11 +18,13 @@ use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
 use starknet_api::define_versioned_constants;
 use starknet_api::executable_transaction::TransactionType;
 use starknet_api::execution_resources::{GasAmount, GasVector};
+use starknet_api::hash::StarkHash;
 use starknet_api::transaction::fields::{hex_to_tip, GasVectorComputationMode, Tip};
 use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use strum::IntoEnumIterator;
 use thiserror::Error;
 
+use crate::execution::call_info::{CairoPrimitiveName, OpcodeName};
 use crate::execution::common_hints::ExecutionMode;
 use crate::execution::execution_utils::poseidon_hash_many_cost;
 use crate::execution::syscalls::vm_syscall_utils::{SyscallSelector, SyscallUsageMap};
@@ -51,7 +53,7 @@ define_versioned_constants!(
     (V0_13_6, "../resources/blockifier_versioned_constants_0_13_6.json"),
     (V0_14_0, "../resources/blockifier_versioned_constants_0_14_0.json"),
     (V0_14_1, "../resources/blockifier_versioned_constants_0_14_1.json"),
-    (V0_15_0, "../resources/blockifier_versioned_constants_0_15_0.json"),
+    (V0_14_2, "../resources/blockifier_versioned_constants_0_14_2.json"),
 );
 
 pub type SyscallGasCostsMap = HashMap<SyscallSelector, RawSyscallGasCost>;
@@ -97,6 +99,9 @@ pub struct RawVersionedConstants {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RawOsConstants {
+    // Allowed virtual OS program hashes for client-side proving.
+    pub allowed_virtual_os_program_hashes: Vec<StarkHash>,
+
     // Selectors.
     pub constructor_entry_point_selector: EntryPointSelector,
     pub default_entry_point_selector: EntryPointSelector,
@@ -116,6 +121,8 @@ pub struct RawOsConstants {
     pub validated: String,
 
     // Execution limits.
+    // Maximum gas for a single execute entry point call. The full transaction gas budget also
+    // includes validation and fee transfer, but this is the dominant component.
     pub execute_max_sierra_gas: GasAmount,
     pub validate_max_sierra_gas: GasAmount,
 
@@ -240,6 +247,7 @@ pub struct VersionedConstants {
     pub max_recursion_depth: usize,
     pub validate_max_n_steps: u32,
     pub min_sierra_version_for_sierra_gas: SierraVersion,
+
     // BACKWARD COMPATIBILITY: If true, the segment_arena builtin instance counter will be
     // multiplied by 3. This offsets a bug in the old vm where the counter counted the number of
     // cells used by instances of the builtin, instead of the number of instances.
@@ -254,6 +262,8 @@ pub struct VersionedConstants {
     pub block_direct_execute_call: bool,
     pub ignore_inner_event_resources: bool,
     pub disable_deploy_in_validation_mode: bool,
+    #[cfg(feature = "reexecution")]
+    pub ignore_user_l2_gas_bound: bool,
 
     // Compiler settings.
     pub enable_reverts: bool,
@@ -270,7 +280,7 @@ pub struct VersionedConstants {
     pub allocation_cost: AllocationCost,
 
     // Resources.
-    os_resources: Arc<OsResources>,
+    pub os_resources: Arc<OsResources>,
 
     // Just to make sure the value exists, but don't use the actual values.
     #[allow(dead_code)]
@@ -296,6 +306,8 @@ impl From<RawVersionedConstants> for VersionedConstants {
             block_direct_execute_call: raw_vc.block_direct_execute_call,
             ignore_inner_event_resources: raw_vc.ignore_inner_event_resources,
             disable_deploy_in_validation_mode: raw_vc.disable_deploy_in_validation_mode,
+            #[cfg(feature = "reexecution")]
+            ignore_user_l2_gas_bound: false,
             enable_reverts: raw_vc.enable_reverts,
             enable_casm_hash_migration: raw_vc.enable_casm_hash_migration,
             block_casm_hash_v1_declares: raw_vc.block_casm_hash_v1_declares,
@@ -371,9 +383,9 @@ impl VersionedConstants {
     pub fn os_resources_for_tx_type(
         &self,
         tx_type: &TransactionType,
-        calldata_length: usize,
+        extended_calldata_length: usize,
     ) -> ExecutionResources {
-        self.os_resources.resources_for_tx_type(tx_type, calldata_length)
+        self.os_resources.resources_for_tx_type(tx_type, extended_calldata_length)
     }
 
     pub fn os_kzg_da_resources(&self, data_segment_length: usize) -> ExecutionResources {
@@ -388,7 +400,7 @@ impl VersionedConstants {
     ) -> ExecutionResources {
         self.os_resources.get_additional_os_tx_resources(
             tx_type,
-            starknet_resources.archival_data.calldata_length,
+            starknet_resources.archival_data.extended_calldata_length,
             starknet_resources.state.get_onchain_data_segment_length(),
             use_kzg_da,
         )
@@ -488,6 +500,10 @@ pub struct ArchivalDataGasCosts {
     // actual number we wanted is 1/32 gas per byte. Change the value to 1/32 in the next version
     // where rational numbers are supported.
     pub gas_per_code_byte: ResourceCost,
+    // Note: This field is only present in archival_data_gas_costs (for V3+ transactions with
+    // proof facts). It's not present in deprecated_l2_resource_gas_costs (for V0-V2 transactions).
+    #[serde(default)]
+    pub gas_per_proof: ResourceCost,
 }
 
 pub struct CairoNativeStackConfig {
@@ -526,6 +542,7 @@ impl CairoNativeStackConfig {
 pub struct VersionedConstantsGatewayLimits {
     pub max_calldata_length: usize,
     pub max_contract_bytecode_size: usize,
+    pub max_proof_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -561,7 +578,7 @@ pub struct OsResources {
 
     // Resources needed for the OS to compute the KZG commitment info, as a factor of the data
     // segment length. Does not include poseidon_hash_many cost.
-    compute_os_kzg_commitment_info: ExecutionResources,
+    pub compute_os_kzg_commitment_info: ExecutionResources,
 }
 
 fn validate_all_tx_types<V>(
@@ -636,11 +653,12 @@ impl OsResources {
     fn get_additional_os_tx_resources(
         &self,
         tx_type: TransactionType,
-        calldata_length: usize,
+        extended_calldata_length: usize,
         data_segment_length: usize,
         use_kzg_da: bool,
     ) -> ExecutionResources {
-        let mut os_additional_vm_resources = self.resources_for_tx_type(&tx_type, calldata_length);
+        let mut os_additional_vm_resources =
+            self.resources_for_tx_type(&tx_type, extended_calldata_length);
 
         if use_kzg_da {
             os_additional_vm_resources += &self.os_kzg_da_resources(data_segment_length);
@@ -690,12 +708,12 @@ impl OsResources {
     fn resources_for_tx_type(
         &self,
         tx_type: &TransactionType,
-        calldata_length: usize,
+        extended_calldata_length: usize,
     ) -> ExecutionResources {
         let resources_vector = self.resources_params_for_tx_type(tx_type);
         &resources_vector.constant
             + &CallDataFactor::from(&resources_vector.calldata_factor)
-                .calculate_resources(calldata_length)
+                .calculate_resources(extended_calldata_length)
     }
 
     fn os_kzg_da_resources(&self, data_segment_length: usize) -> ExecutionResources {
@@ -822,7 +840,7 @@ impl SyscallGasCost {
     }
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(Clone))]
+#[cfg_attr(any(test, feature = "testing", feature = "reexecution"), derive(Clone))]
 #[derive(Debug, Default, PartialEq)]
 pub struct SyscallGasCosts {
     pub call_contract: SyscallGasCost,
@@ -901,7 +919,7 @@ impl SyscallGasCosts {
     }
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(Clone, Copy))]
+#[cfg_attr(any(test, feature = "testing", feature = "reexecution"), derive(Clone, Copy))]
 #[derive(Debug, Default, PartialEq)]
 pub struct BaseGasCosts {
     pub step_gas_cost: u64,
@@ -915,6 +933,7 @@ pub struct BaseGasCosts {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+// TODO(AvivG): Consider renaming to CairoPrimitiveGasCosts to match with its usage in the bouncer.
 pub struct BuiltinGasCosts {
     // Range check has a hard-coded cost higher than its proof percentage to avoid the overhead of
     // retrieving its price from the table.
@@ -929,10 +948,12 @@ pub struct BuiltinGasCosts {
     pub add_mod: u64,
     pub mul_mod: u64,
     pub ecdsa: u64,
+    // Blake opcode gas cost.
+    pub blake: u64,
 }
 
 impl BuiltinGasCosts {
-    pub fn get_builtin_gas_cost(&self, builtin: &BuiltinName) -> Result<u64, GasCostsError> {
+    fn get_builtin_gas_cost(&self, builtin: &BuiltinName) -> Result<u64, GasCostsError> {
         let gas_cost = match *builtin {
             BuiltinName::range_check => self.range_check,
             BuiltinName::pedersen => self.pedersen,
@@ -952,10 +973,27 @@ impl BuiltinGasCosts {
 
         Ok(gas_cost)
     }
+
+    fn get_opcode_gas_cost(&self, opcode: &OpcodeName) -> u64 {
+        match opcode {
+            OpcodeName::blake => self.blake,
+        }
+    }
+
+    /// Returns the gas cost for any Cairo primitive (builtin or opcode).
+    pub fn get_cairo_primitive_gas_cost(
+        &self,
+        primitive: &CairoPrimitiveName,
+    ) -> Result<u64, GasCostsError> {
+        match primitive {
+            CairoPrimitiveName::Builtin(builtin) => self.get_builtin_gas_cost(builtin),
+            CairoPrimitiveName::Opcode(opcode) => Ok(self.get_opcode_gas_cost(opcode)),
+        }
+    }
 }
 
 /// Gas cost constants. For more documentation see in core/os/constants.cairo.
-#[cfg_attr(any(test, feature = "testing"), derive(Clone))]
+#[cfg_attr(any(test, feature = "testing", feature = "reexecution"), derive(Clone))]
 #[derive(Debug, Default, PartialEq)]
 pub struct GasCosts {
     pub base: BaseGasCosts,
@@ -1055,47 +1093,54 @@ impl GasCosts {
         })
     }
 
+    // The n_steps values in os_resources.execute_syscalls are a cost model, not literal
+    // execution step counts. For StorageRead/Write, they include the averaged cost of Patricia
+    // Merkle tree path verification during block proving. The actual syscall handler executes
+    // fewer steps, but the proving overhead is amortized into the step count.
+    // Syscall resource definitions currently include only VM resources, with no opcode accounting.
     fn new_syscall_gas_cost_summary(
         base_costs: &BaseGasCosts,
         selector: SyscallSelector,
         builtin_costs: &BuiltinGasCosts,
         os_resources: &RawOsResources,
     ) -> SyscallGasCost {
-        let vm_resources: ResourcesParams = os_resources
+        let ResourcesParams { constant, calldata_factor } = os_resources
             .execute_syscalls
             .get(&selector)
             .expect("Fetching the execution resources of a syscall should not fail.")
             .into();
 
-        let mut base_gas =
-            get_gas_cost_from_vm_resources(&vm_resources.constant, base_costs, builtin_costs);
+        let mut base_gas = get_gas_cost_from_vm_resources(&constant, base_costs, builtin_costs);
 
         // The minimum total cost is `syscall_base_gas_cost`, which is pre-charged by the compiler.
         base_gas = std::cmp::max(base_costs.syscall_base_gas_cost, base_gas);
-        let linear_gas_cost = get_gas_cost_from_vm_resources(
-            &match vm_resources.calldata_factor {
-                VariableCallDataFactor::Scaled(CallDataFactor { resources, scaling_factor }) => {
-                    assert!(
-                        scaling_factor == 1,
-                        "The scaling factor of the syscall should be 1, but it is {scaling_factor}"
-                    );
-                    resources
-                }
-                VariableCallDataFactor::Unscaled(resources) => resources,
-            },
-            base_costs,
-            builtin_costs,
-        );
+
+        let calldata_resources = match calldata_factor {
+            VariableCallDataFactor::Scaled(CallDataFactor { resources, scaling_factor }) => {
+                assert!(
+                    scaling_factor == 1,
+                    "The scaling factor of the syscall should be 1, but it is {scaling_factor}"
+                );
+                resources
+            }
+            VariableCallDataFactor::Unscaled(resources) => resources,
+        };
+
+        let linear_gas_cost =
+            get_gas_cost_from_vm_resources(&calldata_resources, base_costs, builtin_costs);
 
         // Sum up the two methods to get the final cost.
         SyscallGasCost { base: base_gas, linear_factor: linear_gas_cost }
     }
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(Clone))]
+#[cfg_attr(any(test, feature = "testing", feature = "reexecution"), derive(Clone))]
 #[derive(Debug, Default, PartialEq)]
 pub struct OsConstants {
     pub gas_costs: GasCosts,
+
+    // Allowed virtual OS program hashes for client-side proving.
+    pub allowed_virtual_os_program_hashes: Vec<StarkHash>,
 
     // Selectors.
     pub constructor_entry_point_selector: EntryPointSelector,
@@ -1177,6 +1222,9 @@ impl OsConstants {
 
         Self {
             gas_costs,
+            allowed_virtual_os_program_hashes: raw_constants
+                .allowed_virtual_os_program_hashes
+                .clone(),
             constructor_entry_point_selector: raw_constants.constructor_entry_point_selector,
             default_entry_point_selector: raw_constants.default_entry_point_selector,
             execute_entry_point_selector: raw_constants.execute_entry_point_selector,

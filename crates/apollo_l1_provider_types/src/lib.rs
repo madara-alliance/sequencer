@@ -3,28 +3,26 @@ pub mod errors;
 use std::fmt::Display;
 use std::sync::Arc;
 
-use apollo_infra::component_client::ClientError;
 use apollo_infra::component_definitions::{ComponentClient, PrioritizedRequest};
 use apollo_infra::requests::LABEL_NAME_REQUEST_VARIANT;
-use apollo_infra::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
+use apollo_infra::{
+    handle_all_response_variants,
+    impl_debug_for_infra_requests_and_responses,
+    impl_labeled_request,
+};
 use apollo_metrics::generate_permutation_labels;
-use apollo_proc_macros::handle_all_response_variants;
 use async_trait::async_trait;
 use indexmap::IndexSet;
 #[cfg(any(feature = "testing", test))]
 use mockall::automock;
-use papyrus_base_layer::{EventData, L1Event};
+use papyrus_base_layer::L1Event;
 use serde::{Deserialize, Serialize};
 use starknet_api::block::{BlockNumber, BlockTimestamp, UnixTimestamp};
 use starknet_api::core::ChainId;
-use starknet_api::executable_transaction::{
-    L1HandlerTransaction as ExecutableL1HandlerTransaction,
-    L1HandlerTransaction,
-};
+use starknet_api::executable_transaction::L1HandlerTransaction;
 use starknet_api::transaction::{TransactionHash, TransactionHasher};
 use starknet_api::StarknetApiError;
-use strum::{EnumVariantNames, VariantNames};
-use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
+use strum::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr, VariantNames};
 use tracing::instrument;
 
 use crate::errors::{L1ProviderClientError, L1ProviderError};
@@ -60,7 +58,7 @@ pub enum InvalidValidationStatus {
 #[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
 #[strum_discriminants(
     name(L1ProviderRequestLabelValue),
-    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    derive(IntoStaticStr, EnumIter, VariantNames),
     strum(serialize_all = "snake_case")
 )]
 pub enum L1ProviderRequest {
@@ -159,6 +157,8 @@ where
     ) -> L1ProviderClientResult<()> {
         let request = L1ProviderRequest::StartBlock { state, height };
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             StartBlock,
             L1ProviderClientError,
@@ -175,6 +175,8 @@ where
     ) -> L1ProviderClientResult<Vec<L1HandlerTransaction>> {
         let request = L1ProviderRequest::GetTransactions { n_txs, height };
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             GetTransactions,
             L1ProviderClientError,
@@ -190,6 +192,8 @@ where
     ) -> L1ProviderClientResult<ValidationStatus> {
         let request = L1ProviderRequest::Validate { tx_hash, height };
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             Validate,
             L1ProviderClientError,
@@ -207,6 +211,8 @@ where
         let request =
             L1ProviderRequest::CommitBlock { l1_handler_tx_hashes, rejected_tx_hashes, height };
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             CommitBlock,
             L1ProviderClientError,
@@ -219,6 +225,8 @@ where
     async fn add_events(&self, events: Vec<Event>) -> L1ProviderClientResult<()> {
         let request = L1ProviderRequest::AddEvents(events);
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             AddEvents,
             L1ProviderClientError,
@@ -234,6 +242,8 @@ where
     ) -> L1ProviderClientResult<()> {
         let request = L1ProviderRequest::Initialize { historic_l2_height, events };
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             Initialize,
             L1ProviderClientError,
@@ -245,6 +255,8 @@ where
     async fn get_l1_provider_snapshot(&self) -> L1ProviderClientResult<L1ProviderSnapshot> {
         let request = L1ProviderRequest::GetL1ProviderSnapshot;
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             GetL1ProviderSnapshot,
             L1ProviderClientError,
@@ -256,6 +268,8 @@ where
     async fn get_provider_state(&self) -> L1ProviderClientResult<ProviderState> {
         let request = L1ProviderRequest::GetProviderState;
         handle_all_response_variants!(
+            self,
+            request,
             L1ProviderResponse,
             GetProviderState,
             L1ProviderClientError,
@@ -272,7 +286,9 @@ pub enum Event {
         block_timestamp: BlockTimestamp,
         scrape_timestamp: UnixTimestamp,
     },
-    TransactionCanceled(EventData),
+    TransactionCanceled {
+        tx_hash: TransactionHash,
+    },
     TransactionCancellationStarted {
         tx_hash: TransactionHash,
         cancellation_request_timestamp: BlockTimestamp,
@@ -291,7 +307,7 @@ impl Event {
     ) -> Result<Self, StarknetApiError> {
         Ok(match l1_event {
             L1Event::LogMessageToL2 { tx, fee, block_timestamp, .. } => {
-                let tx = ExecutableL1HandlerTransaction::create(tx, chain_id, fee)?;
+                let tx = L1HandlerTransaction::create(tx, chain_id, fee)?;
                 Self::L1HandlerTransaction { l1_handler_tx: tx, block_timestamp, scrape_timestamp }
             }
             L1Event::MessageToL2CancellationStarted {
@@ -303,7 +319,12 @@ impl Event {
 
                 Self::TransactionCancellationStarted { tx_hash, cancellation_request_timestamp }
             }
-            L1Event::MessageToL2Canceled(event_data) => Self::TransactionCanceled(event_data),
+            L1Event::MessageToL2Canceled { cancelled_tx } => {
+                let tx_hash =
+                    cancelled_tx.calculate_transaction_hash(chain_id, &cancelled_tx.version)?;
+                Self::TransactionCanceled { tx_hash }
+            }
+
             L1Event::ConsumedMessageToL2 { tx, timestamp } => {
                 let tx_hash = tx.calculate_transaction_hash(
                     chain_id,
@@ -315,32 +336,36 @@ impl Event {
     }
 
     #[cfg(any(feature = "testing", test))]
+    /// Checks if two events are almost equal, allowing for a small margin in scrape time.
+    pub fn almost_eq(&self, other: &Event) -> bool {
+        match (self, other) {
+            (
+                Event::L1HandlerTransaction {
+                    l1_handler_tx: self_l1_handler_tx,
+                    block_timestamp: self_block_timestamp,
+                    scrape_timestamp: self_scrape_timestamp,
+                },
+                Event::L1HandlerTransaction {
+                    l1_handler_tx: other_l1_handler_tx,
+                    block_timestamp: other_block_timestamp,
+                    scrape_timestamp: other_scrape_timestamp,
+                },
+            ) => {
+                const SCRAPE_TIMESTAMP_MARGIN: u64 = 5;
+
+                self_l1_handler_tx == other_l1_handler_tx
+                    && self_block_timestamp == other_block_timestamp
+                    && self_scrape_timestamp.abs_diff(*other_scrape_timestamp)
+                        <= SCRAPE_TIMESTAMP_MARGIN
+            }
+            _ => self == other,
+        }
+    }
+
+    #[cfg(any(feature = "testing", test))]
     /// Asserts event matches other, allowing for a small margin in scrape time.
     pub fn assert_event_almost_eq(&self, other: &Event) {
-        if let (
-            Event::L1HandlerTransaction {
-                l1_handler_tx: self_l1_handler_tx,
-                block_timestamp: self_block_timestamp,
-                scrape_timestamp: self_scrape_timestamp,
-            },
-            Event::L1HandlerTransaction {
-                l1_handler_tx: other_l1_handler_tx,
-                block_timestamp: other_block_timestamp,
-                scrape_timestamp: other_scrape_timestamp,
-            },
-        ) = (self, other)
-        {
-            assert_eq!(self_l1_handler_tx, other_l1_handler_tx);
-            assert_eq!(self_block_timestamp, other_block_timestamp);
-
-            const SCRAPE_TIMESTAMP_MARGIN: u64 = 5;
-            assert!(
-                self_scrape_timestamp.abs_diff(*other_scrape_timestamp) <= SCRAPE_TIMESTAMP_MARGIN
-            );
-        // Other types of Event are compared using regular equality.
-        } else {
-            assert_eq!(self, other);
-        }
+        assert!(self.almost_eq(other), "Event mismatch: {self:?} != {other:?}");
     }
 }
 
@@ -358,7 +383,7 @@ impl Display for Event {
                     tx.tx_hash, block_timestamp, scrape_timestamp
                 )
             }
-            Event::TransactionCanceled(data) => write!(f, "TransactionCanceled({data})"),
+            Event::TransactionCanceled { tx_hash } => write!(f, "TransactionCanceled({tx_hash})"),
             Event::TransactionCancellationStarted { tx_hash, cancellation_request_timestamp } => {
                 write!(
                     f,
@@ -376,11 +401,11 @@ impl Display for Event {
 /// Current state of the provider, where pending means: idle, between proposal/validation cycles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProviderState {
-    /// Provider has not been initialized yet, needs to do bootstrapping at least once.
+    /// Provider has not been initialized yet, needs to get start_height and probably also catch
+    /// up.
     Uninitialized,
-    // TODO(guyn): in a upcoming PR, bootstrap will be available not only on startup.
-    /// Provider is catching up using sync. Only happens on startup.
-    Bootstrap,
+    /// Provider is catching up using sync.
+    CatchingUp,
     /// Provider is not ready for proposing or validating. Use start_block to transition to Propose
     /// or Validate.
     Pending,
@@ -397,14 +422,14 @@ impl ProviderState {
         *self == ProviderState::Uninitialized
     }
 
-    pub fn is_bootstrapping(&self) -> bool {
-        *self == ProviderState::Bootstrap
+    pub fn is_catching_up(&self) -> bool {
+        *self == ProviderState::CatchingUp
     }
 
     pub fn transition_to_pending(&self) -> ProviderState {
         assert!(
-            !self.is_bootstrapping(),
-            "Transitioning from bootstrapping should be done manually by the L1Provider."
+            !self.is_catching_up(),
+            "Transitioning from catching up should be done manually by the L1Provider."
         );
         ProviderState::Pending
     }

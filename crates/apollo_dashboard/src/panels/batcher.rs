@@ -1,11 +1,25 @@
 use apollo_batcher::metrics::{
     BATCHED_TRANSACTIONS,
     BLOCK_CLOSE_REASON,
+    BLOCK_COMMITMENT_MEASUREMENTS_COUNT,
+    BUILDING_HEIGHT,
+    COMMITMENT_MANAGER_COMMIT_BLOCK_COUNT,
+    COMMITMENT_MANAGER_COMMIT_BLOCK_LATENCY,
+    COMMITMENT_MANAGER_NUM_COMMIT_RESULTS,
+    COMMITMENT_MANAGER_REVERT_BLOCK_COUNT,
+    COMMITMENT_MANAGER_REVERT_BLOCK_LATENCY,
+    EVENT_COMMITMENT_COUNT,
+    EVENT_COMMITMENT_LATENCY,
+    GLOBAL_ROOT_HEIGHT,
     LABEL_NAME_BLOCK_CLOSE_REASON,
     PROPOSER_DEFERRED_TXS,
+    RECEIPT_COMMITMENT_LATENCY,
     REJECTED_TRANSACTIONS,
     REVERTED_TRANSACTIONS,
-    STORAGE_HEIGHT,
+    STATE_DIFF_COMMITMENT_LATENCY,
+    STATE_DIFF_LENGTH,
+    TX_COMMITMENT_COUNT,
+    TX_COMMITMENT_LATENCY,
     VALIDATOR_WASTED_TXS,
 };
 use apollo_consensus::metrics::CONSENSUS_BLOCK_NUMBER;
@@ -15,8 +29,29 @@ use apollo_consensus_orchestrator::metrics::{
 };
 use apollo_metrics::metrics::MetricQueryName;
 
-use crate::dashboard::{Panel, PanelType, Row, Unit};
+use crate::dashboard::Row;
+use crate::panel::{Panel, PanelType, Unit};
 use crate::query_builder::{increase, sum_by_label, DisplayMethod, DEFAULT_DURATION};
+
+/// Returns a panel that shows the average latency over a 1m window, in seconds.
+fn get_panel_commitment_manager_average_latency(
+    name: impl ToString,
+    description: impl ToString,
+    numerator: &dyn MetricQueryName,
+    count: &dyn MetricQueryName,
+    divisor: Option<u64>,
+) -> Panel {
+    let numerator = format!("({})", increase(numerator, "1m"));
+    let count = format!("clamp_min({}, 1)", increase(count, "1m"));
+    let divisor = match divisor {
+        Some(n) => format!("({n} * {count})"),
+        None => count,
+    };
+    let expr = format!("{numerator} / {divisor}");
+    Panel::new(name, description, expr, PanelType::TimeSeries)
+        .with_unit(Unit::Seconds)
+        .with_log_query("\"Block\" AND \"commitment latencies\"")
+}
 
 pub(crate) fn get_panel_consensus_block_time_avg() -> Panel {
     Panel::new(
@@ -54,11 +89,21 @@ fn get_panel_proposer_deferred_txs() -> Panel {
     .with_log_query("Finished building block as proposer. Started executing")
 }
 
-fn get_panel_storage_height() -> Panel {
+fn get_panel_building_height() -> Panel {
     Panel::new(
-        "Storage Height",
-        "The height of the batcher's storage",
-        STORAGE_HEIGHT.get_name_with_filter().to_string(),
+        "Building Height",
+        "The height of the block that should be built next.",
+        BUILDING_HEIGHT.get_name_with_filter().to_string(),
+        PanelType::Stat,
+    )
+    .with_log_query("Building block at height")
+}
+
+fn get_panel_global_root_height() -> Panel {
+    Panel::new(
+        "Global Root Height",
+        "The height of the first block without global root stored.",
+        GLOBAL_ROOT_HEIGHT.get_name_with_filter().to_string(),
         PanelType::Stat,
     )
     .with_log_query("Committing block at height")
@@ -67,17 +112,14 @@ fn get_panel_storage_height() -> Panel {
 fn get_panel_rejection_reverted_ratio() -> Panel {
     let rejected_txs_expr = increase(&REJECTED_TRANSACTIONS, DEFAULT_DURATION);
     let reverted_txs_expr = increase(&REVERTED_TRANSACTIONS, DEFAULT_DURATION);
+    let batched_txs_expr = increase(&BATCHED_TRANSACTIONS, DEFAULT_DURATION);
 
-    let denominator_expr = format!(
-        "({} + {} + {})",
-        rejected_txs_expr,
-        reverted_txs_expr,
-        increase(&BATCHED_TRANSACTIONS, DEFAULT_DURATION),
-    );
+    let denominator_expr =
+        format!("({} + {} + {})", rejected_txs_expr, reverted_txs_expr, batched_txs_expr,);
     Panel::new(
-        "Rejected / Reverted TXs Ratio",
+        "Rate of Rejected and Reverted TXs Ratio",
         format!(
-            "Ratio of rejected / reverted transactions out of all processed txs \
+            "Rates of the rejected and reverted transactions ratios of all processed txs \
              ({DEFAULT_DURATION} window)"
         ),
         vec![
@@ -112,7 +154,10 @@ fn get_panel_block_close_reasons() -> Panel {
         ),
         PanelType::Stat,
     )
-    .with_log_query("\"Block builder deadline reached.\" OR \"Block is full.\"")
+    .with_log_query(
+        "\"Block builder deadline reached.\" OR \"Block is full.\" OR \"No transactions are being \
+         executed and\"",
+    )
 }
 
 fn get_panel_num_batches_in_proposal() -> Panel {
@@ -134,11 +179,111 @@ fn get_panel_num_txs_in_proposal() -> Panel {
     .with_log_query("BATCHER_FIN_PROPOSER")
 }
 
+fn get_panel_commitment_manager_commit_block_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "Commit Block Latency",
+        "Average latency of commit tasks in the commitment manager over a 1m window",
+        &COMMITMENT_MANAGER_COMMIT_BLOCK_LATENCY,
+        &COMMITMENT_MANAGER_COMMIT_BLOCK_COUNT,
+        Some(1000),
+    )
+}
+
+fn get_panel_commitment_manager_revert_block_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "Revert Block Latency",
+        "Average latency of revert tasks in the commitment manager over a 1m window",
+        &COMMITMENT_MANAGER_REVERT_BLOCK_LATENCY,
+        &COMMITMENT_MANAGER_REVERT_BLOCK_COUNT,
+        Some(1000),
+    )
+}
+
+fn get_panel_commitment_manager_results_count() -> Panel {
+    Panel::new(
+        "Commitment Manager Results Count",
+        "The number of commit results received from the commitment manager (1m window)",
+        increase(&COMMITMENT_MANAGER_NUM_COMMIT_RESULTS, "1m"),
+        PanelType::TimeSeries,
+    )
+}
+
+fn get_panel_txs_commitment_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "Transaction Commitment Latency",
+        "Average duration of transaction commitment computation per block over a 1m window",
+        &TX_COMMITMENT_LATENCY,
+        &BLOCK_COMMITMENT_MEASUREMENTS_COUNT,
+        Some(1_000_000),
+    )
+}
+
+fn get_panel_txs_commitment_per_tx_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "Transaction Commitment Per Transaction Latency",
+        "Average duration of transaction commitment per transaction over a 1m window",
+        &TX_COMMITMENT_LATENCY,
+        &TX_COMMITMENT_COUNT,
+        Some(1_000_000),
+    )
+}
+
+fn get_panel_events_commitment_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "Event Commitment Latency",
+        "Average duration of event commitment computation per block over a 1m window",
+        &EVENT_COMMITMENT_LATENCY,
+        &BLOCK_COMMITMENT_MEASUREMENTS_COUNT,
+        Some(1_000_000),
+    )
+}
+
+fn get_panel_events_commitment_per_event_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "Event Commitment Per Event Latency",
+        "Average duration of event commitment per event over a 1m window",
+        &EVENT_COMMITMENT_LATENCY,
+        &EVENT_COMMITMENT_COUNT,
+        Some(1_000_000),
+    )
+}
+
+fn get_panel_receipts_commitment_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "Receipt Commitment Latency",
+        "Average duration of receipt commitment computation per block over a 1m window",
+        &RECEIPT_COMMITMENT_LATENCY,
+        &BLOCK_COMMITMENT_MEASUREMENTS_COUNT,
+        Some(1_000_000),
+    )
+}
+
+fn get_panel_state_diff_commitment_latency() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "State Diff Commitment Latency",
+        "Average duration of state diff commitment computation per block over a 1m window",
+        &STATE_DIFF_COMMITMENT_LATENCY,
+        &BLOCK_COMMITMENT_MEASUREMENTS_COUNT,
+        Some(1_000_000),
+    )
+}
+
+fn get_panel_state_diff_commitment_per_state_diff_length() -> Panel {
+    get_panel_commitment_manager_average_latency(
+        "State Diff Commitment Per State Diff Length",
+        "Average duration of state diff commitment per state diff length over a 1m window",
+        &STATE_DIFF_COMMITMENT_LATENCY,
+        &STATE_DIFF_LENGTH,
+        Some(1_000_000),
+    )
+}
+
 pub(crate) fn get_batcher_row() -> Row {
     Row::new(
         "Batcher",
         vec![
-            get_panel_storage_height(),
+            get_panel_building_height(),
+            get_panel_global_root_height(),
             get_panel_consensus_block_time_avg(),
             get_panel_batched_transactions_rate(),
             get_panel_proposer_deferred_txs(),
@@ -147,6 +292,16 @@ pub(crate) fn get_batcher_row() -> Row {
             get_panel_block_close_reasons(),
             get_panel_num_batches_in_proposal(),
             get_panel_num_txs_in_proposal(),
+            get_panel_commitment_manager_commit_block_latency(),
+            get_panel_commitment_manager_results_count(),
+            get_panel_commitment_manager_revert_block_latency(),
+            get_panel_txs_commitment_latency(),
+            get_panel_txs_commitment_per_tx_latency(),
+            get_panel_events_commitment_latency(),
+            get_panel_events_commitment_per_event_latency(),
+            get_panel_receipts_commitment_latency(),
+            get_panel_state_diff_commitment_latency(),
+            get_panel_state_diff_commitment_per_state_diff_length(),
         ],
     )
 }

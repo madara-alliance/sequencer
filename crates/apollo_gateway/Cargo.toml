@@ -4,15 +4,19 @@ license.workspace = true
 name = "apollo_gateway"
 repository.workspace = true
 version.workspace = true
+description = "Gateway component for receiving and validating transactions submitted to the Starknet sequencer."
 
 [lints]
 workspace = true
 
 [features]
+cairo_native = ["blockifier/cairo_native"]
 testing = [
   "apollo_class_manager_types/testing",
   "apollo_gateway_config/testing",
   "apollo_mempool_types/testing",
+  "apollo_proof_manager_types/testing",
+  "apollo_transaction_converter/testing",
   "blockifier/testing",
   "blockifier_test_utils",
 ]
@@ -27,23 +31,21 @@ apollo_mempool_types.workspace = true
 apollo_metrics.workspace = true
 apollo_network_types.workspace = true
 apollo_proc_macros.workspace = true
-apollo_rpc.workspace = true
+apollo_proof_manager_types.workspace = true
 apollo_state_sync_types.workspace = true
+apollo_transaction_converter.workspace = true
 async-trait.workspace = true
-axum.workspace = true
 blockifier.workspace = true
 blockifier_test_utils = { workspace = true, optional = true }
-cairo-lang-starknet-classes.workspace = true
 clap.workspace = true
+google-cloud-storage.workspace = true
 mempool_test_utils.workspace = true
+mockall.workspace = true
 num-rational.workspace = true
-reqwest.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 starknet-types-core.workspace = true
 starknet_api.workspace = true
-strum.workspace = true
-strum_macros.workspace = true
+strum = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -56,8 +58,10 @@ apollo_mempool.workspace = true
 apollo_mempool_types = { workspace = true, features = ["testing"] }
 apollo_metrics = { workspace = true, features = ["testing"] }
 apollo_network_types = { workspace = true, features = ["testing"] }
+apollo_proof_manager_types = { workspace = true, features = ["testing"] }
 apollo_state_sync_types = { workspace = true, features = ["testing"] }
 apollo_test_utils.workspace = true
+apollo_transaction_converter = { workspace = true, features = ["testing"] }
 assert_matches.workspace = true
 blockifier = { workspace = true, features = ["mocks", "testing"] }
 blockifier_test_utils.workspace = true
@@ -71,6 +75,7 @@ num-bigint.workspace = true
 pretty_assertions.workspace = true
 rstest.workspace = true
 starknet_api = { workspace = true, features = ["testing"] }
+starknet_proof_verifier.workspace = true
 tracing-test.workspace = true
 
 [[bench]]

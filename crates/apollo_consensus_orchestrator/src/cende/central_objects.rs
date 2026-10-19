@@ -23,13 +23,14 @@ use starknet_api::core::{
 };
 use starknet_api::data_availability::DataAvailabilityMode;
 use starknet_api::executable_transaction::L1HandlerTransaction;
+use starknet_api::execution_resources::GasAmount;
 use starknet_api::rpc_transaction::{
     InternalRpcDeclareTransactionV3,
     InternalRpcDeployAccountTransaction,
+    InternalRpcInvokeTransactionV3,
     InternalRpcTransaction,
     InternalRpcTransactionWithoutTxHash,
     RpcDeployAccountTransaction,
-    RpcInvokeTransaction,
 };
 use starknet_api::state::{SierraContractClass, StorageKey, ThinStateDiff};
 use starknet_api::transaction::fields::{
@@ -39,6 +40,7 @@ use starknet_api::transaction::fields::{
     ContractAddressSalt,
     Fee,
     PaymasterData,
+    ProofFacts,
     ResourceBounds,
     Tip,
     TransactionSignature,
@@ -56,7 +58,32 @@ use crate::fee_market::FeeMarketInfo;
 #[path = "central_objects_test.rs"]
 mod central_objects_test;
 
-pub(crate) type CentralBouncerWeights = BouncerWeights;
+/// Subset of BouncerWeights sent to the centralized pipeline.
+/// Excludes `receipt_l2_gas` which is only used internally by the decentralized sequencer.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct CentralBouncerWeights {
+    pub l1_gas: usize,
+    pub message_segment_length: usize,
+    pub n_events: usize,
+    pub state_diff_size: usize,
+    pub sierra_gas: GasAmount,
+    pub n_txs: usize,
+    pub proving_gas: GasAmount,
+}
+
+impl From<BouncerWeights> for CentralBouncerWeights {
+    fn from(weights: BouncerWeights) -> Self {
+        Self {
+            l1_gas: weights.l1_gas,
+            message_segment_length: weights.message_segment_length,
+            n_events: weights.n_events,
+            state_diff_size: weights.state_diff_size,
+            sierra_gas: weights.sierra_gas,
+            n_txs: weights.n_txs,
+            proving_gas: weights.proving_gas,
+        }
+    }
+}
 pub(crate) type CentralFeeMarketInfo = FeeMarketInfo;
 pub(crate) type CentralCompressedStateDiff = CentralStateDiff;
 pub(crate) type CentralSierraContractClassEntry = (ClassHash, CentralSierraContractClass);
@@ -183,14 +210,15 @@ struct CentralInvokeTransactionV3 {
     fee_data_availability_mode: u32,
     paymaster_data: PaymasterData,
     account_deployment_data: AccountDeploymentData,
+    #[serde(default, skip_serializing_if = "ProofFacts::is_empty")]
+    proof_facts: ProofFacts,
     hash_value: TransactionHash,
 }
 
-impl From<(RpcInvokeTransaction, TransactionHash)> for CentralInvokeTransactionV3 {
+impl From<(InternalRpcInvokeTransactionV3, TransactionHash)> for CentralInvokeTransactionV3 {
     fn from(
-        (tx, hash_value): (RpcInvokeTransaction, TransactionHash),
+        (tx, hash_value): (InternalRpcInvokeTransactionV3, TransactionHash),
     ) -> CentralInvokeTransactionV3 {
-        let RpcInvokeTransaction::V3(tx) = tx;
         CentralInvokeTransactionV3 {
             sender_address: tx.sender_address,
             calldata: tx.calldata,
@@ -202,6 +230,7 @@ impl From<(RpcInvokeTransaction, TransactionHash)> for CentralInvokeTransactionV
             account_deployment_data: tx.account_deployment_data,
             nonce_data_availability_mode: tx.nonce_data_availability_mode.into(),
             fee_data_availability_mode: tx.fee_data_availability_mode.into(),
+            proof_facts: tx.proof_facts,
             hash_value,
         }
     }

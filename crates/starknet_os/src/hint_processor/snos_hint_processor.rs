@@ -28,6 +28,7 @@ use starknet_api::deprecated_contract_class::ContractClass;
 use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::{Poseidon, StarkHash};
 
+use crate::commitment_infos::CommitmentInfo;
 use crate::errors::StarknetOsError;
 use crate::hint_processor::common_hint_processor::{
     CommonHintProcessor,
@@ -45,15 +46,9 @@ use crate::hint_processor::test_hint::test_hint;
 use crate::hints::enum_definition::AllHints;
 use crate::hints::error::{OsHintError, OsHintResult};
 use crate::hints::hint_implementation::state::CommitmentType;
-use crate::hints::types::{HintArgs, HintEnum};
+use crate::hints::types::{HintContext, HintEnum};
 use crate::hints::vars::CairoStruct;
-use crate::io::os_input::{
-    CachedStateInput,
-    CommitmentInfo,
-    OsBlockInput,
-    OsHintsConfig,
-    OsInputError,
-};
+use crate::io::os_input::{OsBlockInput, OsHintsConfig, OsInputError};
 use crate::vm_utils::get_address_of_nested_fields_from_base_address;
 use crate::{impl_common_hint_processor_getters, impl_common_hint_processor_logic};
 
@@ -152,7 +147,6 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
         os_program: &'a Program,
         os_hints_config: OsHintsConfig,
         os_block_inputs: Vec<&'a OsBlockInput>,
-        cached_state_inputs: Vec<CachedStateInput>,
         deprecated_compiled_classes: BTreeMap<ClassHash, ContractClass>,
         compiled_classes: BTreeMap<CompiledClassHash, CasmContractClass>,
         state_readers: Vec<S>,
@@ -167,13 +161,12 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
         let rng_seed = Self::rng_seed(&os_block_inputs, &os_hints_config.rng_seed_salt);
         let execution_helpers = os_block_inputs
             .into_iter()
-            .zip(cached_state_inputs.into_iter())
             .zip(state_readers.into_iter())
-            .map(|((os_block_input, cached_state_input), state_reader)| {
+            .map(|(os_block_input, state_reader)| {
                 OsExecutionHelper::new(
                     os_block_input,
                     state_reader,
-                    cached_state_input,
+                    &os_block_input.initial_reads,
                     os_hints_config.debug_mode,
                 )
             })
@@ -198,7 +191,7 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
 
     /// Hashes the block hashes of the given block inputs to get a seed for the random number
     /// generator.
-    fn rng_seed(os_block_inputs: &Vec<&'a OsBlockInput>, rng_seed_salt: &Option<Felt>) -> Felt {
+    fn rng_seed(os_block_inputs: &[&'a OsBlockInput], rng_seed_salt: &Option<Felt>) -> Felt {
         Poseidon::hash_array(
             &os_block_inputs
                 .iter()
@@ -299,8 +292,12 @@ impl<S: StateReader> HintProcessorLogic for SnosHintProcessor<'_, S> {
     impl_common_hint_processor_logic!();
 }
 
-impl<'program, S: StateReader> CommonHintProcessor<'program> for SnosHintProcessor<'program, S> {
+impl<S: StateReader> CommonHintProcessor for SnosHintProcessor<'_, S> {
     impl_common_hint_processor_getters!();
+
+    fn get_public_keys(&self) -> Option<&[Felt]> {
+        self.os_hints_config.public_keys.as_deref()
+    }
 
     fn get_rng(&mut self) -> &mut rand::rngs::StdRng {
         &mut self.rng
@@ -309,7 +306,7 @@ impl<'program, S: StateReader> CommonHintProcessor<'program> for SnosHintProcess
     fn execute_cairo0_unique_hint(
         &mut self,
         hint: &AllHints,
-        hint_args: HintArgs<'_>,
+        ctx: HintContext<'_>,
         _hint_str: &str,
     ) -> VmHintExtensionResult {
         match hint {
@@ -320,20 +317,20 @@ impl<'program, S: StateReader> CommonHintProcessor<'program> for SnosHintProcess
                 );
             }
             AllHints::OsHint(os_hint) => {
-                os_hint.execute_hint(self, hint_args)?;
+                os_hint.execute_hint(self, ctx)?;
             }
             AllHints::AggregatorHint(aggregator_hint) => {
                 panic!("Aggregator hints should not be used in the OS. Hint: {aggregator_hint:?}");
             }
             AllHints::DeprecatedSyscallHint(deprecated_syscall_hint) => {
-                deprecated_syscall_hint.execute_hint(self, hint_args)?;
+                deprecated_syscall_hint.execute_hint(self, ctx)?;
             }
             AllHints::HintExtension(hint_extension) => {
-                return Ok(hint_extension.execute_hint_extensive(self, hint_args)?);
+                return Ok(hint_extension.execute_hint_extensive(self, ctx)?);
             }
             #[cfg(any(test, feature = "testing"))]
             AllHints::TestHint => {
-                test_hint(_hint_str, self, hint_args)?;
+                test_hint(_hint_str, self, ctx)?;
             }
         }
         Ok(HintExtension::default())
@@ -356,18 +353,15 @@ impl<'a> SnosHintProcessor<'a, DictStateReader> {
         os_program: &'a Program,
         os_hints_config: Option<OsHintsConfig>,
         os_block_input: &'a OsBlockInput,
-        os_state_input: Option<CachedStateInput>,
     ) -> Result<Self, StarknetOsError> {
         let state_reader = state_reader.unwrap_or_default();
         let block_inputs = vec![os_block_input];
-        let state_inputs = vec![os_state_input.unwrap_or_default()];
         let os_hints_config = os_hints_config.unwrap_or_default();
 
         let mut hint_processor = SnosHintProcessor::new(
             os_program,
             os_hints_config,
             block_inputs,
-            state_inputs,
             BTreeMap::new(),
             BTreeMap::new(),
             vec![state_reader],

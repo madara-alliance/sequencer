@@ -1,0 +1,368 @@
+[
+  {
+    "StatelessHint": "GetBlockHashMapping"
+  },
+  {
+    "StatelessHint": "IsLeaf"
+  },
+  {
+    "StatelessHint": "SelectedBuiltins"
+  },
+  {
+    "StatelessHint": "SelectBuiltin"
+  },
+  {
+    "StatelessHint": "AssignBytecodeSegments"
+  },
+  {
+    "StatelessHint": "AssertEndOfBytecodeSegments"
+  },
+  {
+    "StatelessHint": "DeleteMemoryData"
+  },
+  {
+    "StatelessHint": "IterCurrentSegmentInfo"
+  },
+  {
+    "StatelessHint": "SetApToSegmentHashBlake"
+  },
+  {
+    "StatelessHint": "EnterScopeWithAliases"
+  },
+  {
+    "StatelessHint": "KeyLtMinAliasAllocValue"
+  },
+  {
+    "StatelessHint": "AssertKeyBigEnoughForAlias"
+  },
+  {
+    "StatelessHint": "ContractAddressLeMaxForCompression"
+  },
+  {
+    "StatelessHint": "ComputeCommitmentsOnFinalizedStateWithAliases"
+  },
+  {
+    "StatelessHint": "SegmentsAddTempInitialTxsRangeCheckPtr"
+  },
+  {
+    "StatelessHint": "SegmentsAdd"
+  },
+  {
+    "StatelessHint": "LogRemainingTxs"
+  },
+  {
+    "StatelessHint": "FillHolesInRc96Segment"
+  },
+  {
+    "StatelessHint": "EnterScopeDeprecatedSyscallHandler"
+  },
+  {
+    "StatelessHint": "EnterScopeSyscallHandler"
+  },
+  {
+    "StatelessHint": "GetContractAddressStateEntry"
+  },
+  {
+    "StatelessHint": "EnterScopeExecuteTransactionsInner"
+  },
+  {
+    "StatelessHint": "IsRemainingGasLtInitialBudget"
+  },
+  {
+    "StatelessHint": "InitialGeRequiredGas"
+  },
+  {
+    "StatelessHint": "EnterScopeNode"
+  },
+  {
+    "StatelessHint": "EnterScopeNextNodeBit0"
+  },
+  {
+    "StatelessHint": "EnterScopeNextNodeBit1"
+  },
+  {
+    "StatelessHint": "EnterScopeLeftChild"
+  },
+  {
+    "StatelessHint": "EnterScopeRightChild"
+  },
+  {
+    "StatelessHint": "EnterScopeDescendEdge"
+  },
+  {
+    "StatelessHint": "CheckRetdataForDebug"
+  },
+  {
+    "StatelessHint": "SearchSortedOptimistic"
+  },
+  {
+    "StatelessHint": "SetStateUpdatesStart"
+  },
+  {
+    "StatelessHint": "SetSiblings"
+  },
+  {
+    "StatelessHint": "IsCaseRight"
+  },
+  {
+    "StatelessHint": "SetApToDescend"
+  },
+  {
+    "StatelessHint": "AssertCaseIsRight"
+  },
+  {
+    "StatelessHint": "WriteCaseNotLeftToAp"
+  },
+  {
+    "StatelessHint": "SplitDescend"
+  },
+  {
+    "StatelessHint": "RemainingGasGtMax"
+  },
+  {
+    "StatelessHint": "DecodeNode"
+  },
+  {
+    "StatelessHint": "DecodeNode2"
+  },
+  {
+    "StatelessHint": "StarknetOsInput"
+  },
+  {
+    "StatelessHint": "AllocateSegmentsForMessages"
+  },
+  {
+    "CommonHint": "SetProofFactTopology"
+  },
+  {
+    "CommonHint": "LoadStoragePtrAndPrevState"
+  },
+  {
+    "CommonHint": "UpdateClassesPtr"
+  },
+  {
+    "CommonHint": "GuessClassesPtr"
+  },
+  {
+    "CommonHint": "UpdateContractAddrToStoragePtr"
+  },
+  {
+    "CommonHint": "SetStateUpdatePointersToNone"
+  },
+  {
+    "CommonHint": "GetPublicKeys"
+  },
+  {
+    "DeprecatedSyscallHint": "StorageRead"
+  },
+  {
+    "DeprecatedSyscallHint": "StorageWrite"
+  },
+  {
+    "OsHint": "LoadClass"
+  },
+  {
+    "OsHint": "EnterScopeWithBytecodeSegmentStructure"
+  },
+  {
+    "OsHint": "GuessBlockInfo"
+  },
+  {
+    "OsHint": "ChainIdAndFeeTokenAddress"
+  },
+  {
+    "OsHint": "WriteUseKzgDaAndFullOutputToMemory"
+  },
+  {
+    "OsHint": "UpdateBuiltinPtrs"
+  },
+  {
+    "OsHint": "ReadAliasFromKey"
+  },
+  {
+    "OsHint": "ReadAliasCounter"
+  },
+  {
+    "OsHint": "UpdateAliasCounter"
+  },
+  {
+    "OsHint": "GuessAliasesContractStoragePtr"
+  },
+  {
+    "OsHint": "UpdateAliasesContractToStoragePtr"
+  },
+  {
+    "OsHint": "GuessStatePtr"
+  },
+  {
+    "OsHint": "UpdateStatePtr"
+  },
+  {
+    "OsHint": "LoadDeprecatedClassFacts"
+  },
+  {
+    "OsHint": "LoadDeprecatedClassInner"
+  },
+  {
+    "OsHint": "StartTx"
+  },
+  {
+    "OsHint": "OsInputTransactions"
+  },
+  {
+    "OsHint": "LoadActualFee"
+  },
+  {
+    "OsHint": "LoadNextTx"
+  },
+  {
+    "OsHint": "LoadCommonTxFields"
+  },
+  {
+    "OsHint": "ExitTx"
+  },
+  {
+    "OsHint": "AssertTransactionHash"
+  },
+  {
+    "OsHint": "SetStateEntryToAccountContractAddress"
+  },
+  {
+    "OsHint": "CheckIsDeprecated"
+  },
+  {
+    "OsHint": "EndTx"
+  },
+  {
+    "OsHint": "EnterCall"
+  },
+  {
+    "OsHint": "ExitCall"
+  },
+  {
+    "OsHint": "ContractAddress"
+  },
+  {
+    "OsHint": "TxCalldata"
+  },
+  {
+    "OsHint": "TxAccountDeploymentData"
+  },
+  {
+    "OsHint": "TxProofFacts"
+  },
+  {
+    "OsHint": "GenSignatureArg"
+  },
+  {
+    "OsHint": "IsReverted"
+  },
+  {
+    "OsHint": "CheckExecutionAndExitCall"
+  },
+  {
+    "OsHint": "CheckNewCallContractResponse"
+  },
+  {
+    "OsHint": "LogEnterSyscall"
+  },
+  {
+    "OsHint": "LoadTxNonceAccount"
+  },
+  {
+    "OsHint": "WriteSyscallResultDeprecated"
+  },
+  {
+    "OsHint": "WriteSyscallResult"
+  },
+  {
+    "OsHint": "WriteOldBlockToStorage"
+  },
+  {
+    "OsHint": "CacheContractStorageRequestKey"
+  },
+  {
+    "OsHint": "CacheContractStorageSyscallRequestAddress"
+  },
+  {
+    "OsHint": "GetOldBlockNumberAndHash"
+  },
+  {
+    "OsHint": "GetBlocksNumber"
+  },
+  {
+    "OsHint": "GetNClassHashesToMigrate"
+  },
+  {
+    "OsHint": "ConfigureKzgManager"
+  },
+  {
+    "OsHint": "CheckBlockHashConsistency"
+  },
+  {
+    "OsHint": "SetBit"
+  },
+  {
+    "OsHint": "PreparePreimageValidationNonDeterministicHashes"
+  },
+  {
+    "OsHint": "BuildDescentMap"
+  },
+  {
+    "OsHint": "DebugExpectedInitialGas"
+  },
+  {
+    "OsHint": "IsSierraGasMode"
+  },
+  {
+    "OsHint": "SetPreimageForStateCommitments"
+  },
+  {
+    "OsHint": "SetPreimageForClassCommitments"
+  },
+  {
+    "OsHint": "SetPreimageForCurrentCommitmentInfo"
+  },
+  {
+    "OsHint": "ShouldUseReadOptimizedPatriciaUpdate"
+  },
+  {
+    "OsHint": "LoadEdge"
+  },
+  {
+    "OsHint": "HeightIsZeroOrLenNodePreimageIsTwo"
+  },
+  {
+    "OsHint": "SetSyscallPtr"
+  },
+  {
+    "OsHint": "OsLoggerEnterSyscallPrepareExitSyscall"
+  },
+  {
+    "OsHint": "OsLoggerExitSyscall"
+  },
+  {
+    "OsHint": "InitStateUpdatePointers"
+  },
+  {
+    "OsHint": "InitializeStateChanges"
+  },
+  {
+    "OsHint": "InitializeClassHashes"
+  },
+  {
+    "OsHint": "CreateBlockAdditionalHints"
+  },
+  {
+    "OsHint": "LogRemainingBlocks"
+  },
+  {
+    "OsHint": "GetBlockHashes"
+  },
+  {
+    "HintExtension": "LoadDeprecatedClass"
+  },
+  {
+    "HintExtension": "LoadClassesAndBuildBytecodeSegmentStructures"
+  }
+]

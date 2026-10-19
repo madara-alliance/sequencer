@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 use starknet_api::abi::abi_utils::get_fee_token_var_address;
 use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
-use starknet_api::state::StorageKey;
+use starknet_api::state::{StorageKey, ThinStateDiff};
 use starknet_types_core::felt::Felt;
 
 use crate::context::TransactionContext;
@@ -317,13 +317,54 @@ impl From<StorageView> for IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>
     }
 }
 
+#[cfg_attr(feature = "transaction_serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateMaps {
     pub nonces: HashMap<ContractAddress, Nonce>,
     pub class_hashes: HashMap<ContractAddress, ClassHash>,
+    // TODO(Yoni): consider changing type to HashMap<ContractAddress, HashMap<StorageKey, Felt>>.
+    #[cfg_attr(feature = "transaction_serde", serde(with = "storage_map_serializer"))]
     pub storage: HashMap<StorageEntry, Felt>,
     pub compiled_class_hashes: HashMap<ClassHash, CompiledClassHash>,
     pub declared_contracts: HashMap<ClassHash, bool>,
+}
+
+/// Custom serde implementation for a flat storage map that serializes to and deserializes from a
+/// nested map storage.
+#[cfg(feature = "transaction_serde")]
+mod storage_map_serializer {
+    use std::collections::HashMap;
+
+    use serde::{Deserializer, Serializer};
+    use starknet_api::core::ContractAddress;
+    use starknet_api::state::StorageKey;
+    use starknet_types_core::felt::Felt;
+
+    use super::StorageEntry;
+
+    type StorageMap = HashMap<ContractAddress, HashMap<StorageKey, Felt>>;
+
+    pub fn serialize<S>(map: &HashMap<StorageEntry, Felt>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut nested_map: StorageMap = HashMap::new();
+        for ((addr, key), val) in map {
+            nested_map.entry(*addr).or_default().insert(*key, *val);
+        }
+        serde::Serialize::serialize(&nested_map, serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<StorageEntry, Felt>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let nested_map: StorageMap = serde::Deserialize::deserialize(deserializer)?;
+        Ok(nested_map
+            .into_iter()
+            .flat_map(|(addr, inner)| inner.into_iter().map(move |(key, val)| ((addr, key), val)))
+            .collect())
+    }
 }
 
 impl StateMaps {
@@ -620,7 +661,7 @@ impl<U: UpdatableState> TransactionalState<'_, U> {
     }
 }
 
-type StorageDiff = IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>;
+pub type StorageDiff = IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>;
 
 /// Holds uncommitted changes induced on Starknet contracts.
 #[cfg_attr(feature = "transaction_serde", derive(serde::Serialize, serde::Deserialize))]
@@ -646,6 +687,20 @@ impl From<StateMaps> for CommitmentStateDiff {
     }
 }
 
+impl From<CommitmentStateDiff> for ThinStateDiff {
+    fn from(commitment_state_diff: CommitmentStateDiff) -> Self {
+        Self {
+            deployed_contracts: commitment_state_diff.address_to_class_hash,
+            storage_diffs: commitment_state_diff.storage_updates,
+            class_hash_to_compiled_class_hash: commitment_state_diff
+                .class_hash_to_compiled_class_hash,
+            nonces: commitment_state_diff.address_to_nonce,
+            // TODO(AlonH): Remove this when the structure of storage diffs changes.
+            deprecated_declared_classes: Vec::new(),
+        }
+    }
+}
+
 /// Used to track the state diff size, which is determined by the number of new keys.
 /// Also, can be used to accuratly measure the contribution of a single (say, transactional)
 /// state to a cumulative state diff - provides set-like functionallities for this porpuse.
@@ -654,13 +709,13 @@ impl From<StateMaps> for CommitmentStateDiff {
 #[cfg_attr(any(feature = "testing", test), derive(Clone))]
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct StateChangesKeys {
-    pub(crate) nonce_keys: HashSet<ContractAddress>,
-    pub(crate) class_hash_keys: HashSet<ContractAddress>,
-    pub(crate) storage_keys: HashSet<StorageEntry>,
-    pub(crate) compiled_class_hash_keys: HashSet<ClassHash>,
+    pub nonce_keys: HashSet<ContractAddress>,
+    pub class_hash_keys: HashSet<ContractAddress>,
+    pub storage_keys: HashSet<StorageEntry>,
+    pub compiled_class_hash_keys: HashSet<ClassHash>,
     // Note: this field may not be consistent with the above keys; specifically, it may be
     // strictlly contained in them. For example, as a result of a `difference` operation.
-    pub(crate) modified_contracts: HashSet<ContractAddress>,
+    pub modified_contracts: HashSet<ContractAddress>,
 }
 
 impl StateChangesKeys {

@@ -67,11 +67,6 @@ use crate::sources::base_layer::{BaseLayerSourceTrait, EthereumBaseLayerSource};
 use crate::sources::central::{CentralError, CentralSource, CentralSourceTrait};
 use crate::sources::pending::{PendingError, PendingSource, PendingSourceTrait};
 
-// TODO(shahak): Consider adding genesis hash to the config to support chains that have
-// different genesis hash.
-// TODO(Shahak): Consider moving to a more general place.
-pub const GENESIS_HASH: &str = "0x0";
-
 // TODO(dvir): add to config.
 // Sleep duration between polling for pending data.
 const PENDING_SLEEP_DURATION: Duration = Duration::from_millis(500);
@@ -167,6 +162,7 @@ pub enum SyncEvent {
         deployed_contract_class_definitions: IndexMap<ClassHash, DeprecatedContractClass>,
     },
     CompiledClassAvailable {
+        block_number: BlockNumber,
         class_hash: ClassHash,
         compiled_class_hash: CompiledClassHash,
         compiled_class: CasmContractClass,
@@ -217,12 +213,12 @@ impl<
                 | StateSyncError::CentralSourceError(_)
                 | StateSyncError::PendingSourceError(_)
                 | StateSyncError::BaseLayerSourceError(_)
-                | StateSyncError::ParentBlockHashMismatch { .. }
                 | StateSyncError::BaseLayerHashMismatch { .. }
                 | StateSyncError::ClassManagerClientError(_)
                 | StateSyncError::BaseLayerBlockWithoutMatchingHeader { .. }
                 | StateSyncError::JoinError(_) => true,
-                StateSyncError::SequencerPubKeyChanged { .. } => false,
+                StateSyncError::SequencerPubKeyChanged { .. }
+                | StateSyncError::ParentBlockHashMismatch { .. } => false,
             }
         }
     }
@@ -253,14 +249,12 @@ impl<
     }
 
     // Sync until encountering an error:
-    //  1. If needed, revert blocks from the end of the chain.
-    //  2. Create infinite block and state diff streams to fetch data from the central source.
-    //  3. Fetch data from the streams with unblocking wait while there is no new data.
+    //  1. Create infinite block and state diff streams to fetch data from the central source.
+    //  2. Fetch data from the streams with unblocking wait while there is no new data.
     async fn sync_while_ok(&mut self) -> StateSyncResult {
         if self.config.verify_blocks {
             self.track_sequencer_public_key_changes().await?;
         }
-        self.handle_block_reverts().await?;
         let block_stream = stream_new_blocks(
             self.reader.clone(),
             self.central_source.clone(),
@@ -268,7 +262,7 @@ impl<
             self.shared_highest_block.clone(),
             self.pending_data.clone(),
             self.pending_classes.clone(),
-            self.config.block_propagation_sleep_duration,
+            self.config.latest_block_poll_interval_millis,
             self.config.collect_pending_data,
             PENDING_SLEEP_DURATION,
             self.config.blocks_max_stream_size,
@@ -277,17 +271,17 @@ impl<
         let state_diff_stream = stream_new_state_diffs(
             self.reader.clone(),
             self.central_source.clone(),
-            self.config.block_propagation_sleep_duration,
+            self.config.latest_block_poll_interval_millis,
             self.config.state_updates_max_stream_size,
         )
         .fuse();
         let compiled_class_stream = stream_new_compiled_classes(
             self.reader.clone(),
             self.central_source.clone(),
-            self.config.block_propagation_sleep_duration,
+            self.config.latest_block_poll_interval_millis,
             // TODO(yair): separate config param.
             self.config.state_updates_max_stream_size,
-            self.config.store_sierras_and_casms,
+            self.config.store_sierras_and_casms_block_threshold,
         )
         .fuse();
         let base_layer_block_stream = match &self.base_layer_source {
@@ -302,8 +296,11 @@ impl<
         };
         // TODO(dvir): try use interval instead of stream.
         // TODO(DvirYo): fix the bug and remove this check.
-        let check_sync_progress =
-            check_sync_progress(self.reader.clone(), self.config.store_sierras_and_casms).fuse();
+        let check_sync_progress = check_sync_progress(
+            self.reader.clone(),
+            self.config.store_sierras_and_casms_block_threshold,
+        )
+        .fuse();
         pin_mut!(
             block_stream,
             state_diff_stream,
@@ -350,12 +347,14 @@ impl<
                 .await
             }
             SyncEvent::CompiledClassAvailable {
+                block_number,
                 class_hash,
                 compiled_class_hash,
                 compiled_class,
                 is_compiler_backward_compatible,
             } => {
                 self.store_compiled_class(
+                    block_number,
                     class_hash,
                     compiled_class_hash,
                     compiled_class,
@@ -384,8 +383,8 @@ impl<
         block: Block,
         signature: BlockSignature,
     ) -> StateSyncResult {
-        // Assuming the central source is trusted, detect reverts by comparing the incoming block's
-        // parent hash to the current hash.
+        // To prevent cases where central has forked under our feet, check incoming block's parent
+        // hash against the parent hash stored in the storage.
         self.verify_parent_block_hash(block_number, &block)?;
 
         debug!("Storing block number: {block_number}, block header: {:?}", block.header);
@@ -447,7 +446,28 @@ impl<
              {deployed_contract_class_definitions:#?}"
         );
 
-        // TODO(noamsp): describe why we do this.
+        // Filter out classes that are already declared in the storage. Only the first deployment of
+        // a class declares it.
+        let deployed_contract_class_definitions = {
+            let txn = self.reader.begin_ro_txn()?;
+            let state_reader = txn.get_state_reader()?;
+            deployed_contract_class_definitions
+                .into_iter()
+                .filter_map(|(class_hash, deprecated_class)| {
+                    match state_reader
+                        .get_deprecated_class_definition_block_number(&class_hash)
+                    {
+                        Ok(Some(_)) => None, // Class already exists, filter it out
+                        Ok(None) => Some(Ok((class_hash, deprecated_class))), // Class doesn't exist, keep it
+                        Err(e) => Some(Err(e)), // Propagate error
+                    }
+                })
+                .collect::<Result<IndexMap<ClassHash, DeprecatedContractClass>, StorageError>>()?
+        };
+
+        // Feeder's state diff contains only classes declared by declare transaction. The old Deploy
+        // transaction is also capable of declaring classes, only if the deployed class wasn't
+        // declared yet. We modify the state diff to include those classes
         state_diff.deprecated_declared_classes.extend(
             deployed_contract_class_definitions
                 .iter()
@@ -513,7 +533,10 @@ impl<
             }
         }
         let has_class_manager = self.class_manager_client.is_some();
-        let store_sierras_and_casms = self.config.store_sierras_and_casms;
+
+        let store_sierras_and_casms_block_threshold =
+            self.config.store_sierras_and_casms_block_threshold;
+        let store_sierras_and_casms = block_number.0 < store_sierras_and_casms_block_threshold;
         self.perform_storage_writes(move |writer| {
             if has_class_manager {
                 writer
@@ -531,9 +554,13 @@ impl<
             // TODO(guy.f): Properly fix handling non backwards compatible classes.
             if store_sierras_and_casms || block_contains_non_backwards_compatible_classes {
                 let store_reason = if store_sierras_and_casms {
-                    "store_sierras_and_casms is true"
+                    format!(
+                        "block {} is below store_sierras_and_casms_block_threshold: \
+                         {store_sierras_and_casms_block_threshold}",
+                        block_number.0
+                    )
                 } else {
-                    "block_contains_non_backwards_compatible_classes is true"
+                    format!("block {} contains non backwards compatible classes", block_number.0)
                 };
                 debug!(
                     "Appending classes {:?} to storage since {store_reason}",
@@ -552,8 +579,9 @@ impl<
                 )?;
             } else {
                 trace!(
-                    "Skipping appending classes {:?} to storage since store_sierras_and_casms is \
-                     false and block_contains_non_backwards_compatible_classes is false",
+                    "Skipping appending classes {:?} to storage since block is at or above \
+                     store_sierras_and_casms_block_threshold and \
+                     block_contains_non_backwards_compatible_classes is false",
                     classes.keys().collect::<Vec<_>>()
                 );
             }
@@ -576,6 +604,7 @@ impl<
     #[instrument(skip(self, compiled_class), level = "debug", err)]
     async fn store_compiled_class(
         &mut self,
+        block_number: BlockNumber,
         class_hash: ClassHash,
         _compiled_class_hash_v1: CompiledClassHash,
         compiled_class: CasmContractClass,
@@ -603,7 +632,7 @@ impl<
                     .expect("Failed adding class and compiled class to class manager.");
             }
         }
-        if !self.config.store_sierras_and_casms {
+        if block_number.0 >= self.config.store_sierras_and_casms_block_threshold {
             return Ok(());
         }
         let result = self
@@ -636,9 +665,6 @@ impl<
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    // In case of a mismatch between the base layer and l2, an error will be returned, then the
-    // sync will revert blocks if needed based on the l2 central source. This approach works as long
-    // as l2 is trusted so all the reverts can be detect by using it.
     async fn store_base_layer_block(
         &mut self,
         block_number: BlockNumber,
@@ -646,8 +672,6 @@ impl<
     ) -> StateSyncResult {
         self.perform_storage_writes(move |writer| {
             let txn = writer.begin_rw_txn()?;
-            // Missing header can be because of a base layer reorg, the matching header may be
-            // reverted.
             let expected_hash = txn
                 .get_block_header(block_number)?
                 .ok_or(StateSyncError::BaseLayerBlockWithoutMatchingHeader { block_number })?
@@ -693,11 +717,11 @@ impl<
             .block_hash;
 
         if prev_hash != block.header.block_header_without_hash.parent_hash {
-            // A revert detected, log and restart sync loop.
+            // Block parent hash mismatch, log and restart sync loop.
             warn!(
-                "Detected revert while processing block {}. Parent hash of the incoming block is \
-                 {}, current block hash is {}.",
-                block_number, block.header.block_header_without_hash.parent_hash, prev_hash
+                "Detected reorg in central. block number {block_number} had hash {prev_hash} but \
+                 the next block's parent hash is {}.",
+                block.header.block_header_without_hash.parent_hash
             );
             CENTRAL_SYNC_FORKS_FROM_FEEDER.increment(1);
             return Err(StateSyncError::ParentBlockHashMismatch {
@@ -708,73 +732,6 @@ impl<
         }
 
         Ok(())
-    }
-
-    // Reverts data if needed.
-    async fn handle_block_reverts(&mut self) -> Result<(), StateSyncError> {
-        debug!("Handling block reverts.");
-        let header_marker = self.reader.begin_ro_txn()?.get_header_marker()?;
-
-        // Revert last blocks if needed.
-        let mut last_block_in_storage = header_marker.prev();
-        while let Some(block_number) = last_block_in_storage {
-            if self.should_revert_block(block_number).await? {
-                self.revert_block(block_number).await?;
-                last_block_in_storage = block_number.prev();
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    // TODO(dan): update necessary metrics.
-    // Deletes the block data from the storage.
-    #[allow(clippy::expect_fun_call)]
-    #[instrument(skip(self), level = "debug", err)]
-    async fn revert_block(&mut self, block_number: BlockNumber) -> StateSyncResult {
-        debug!("Reverting block.");
-
-        self.perform_storage_writes(move |writer| {
-            let mut txn = writer.begin_rw_txn()?;
-            txn = txn.try_revert_base_layer_marker(block_number)?;
-            let res = txn.revert_header(block_number)?;
-            txn = res.0;
-            let mut reverted_block_hash: Option<BlockHash> = None;
-            if let Some(header) = res.1 {
-                reverted_block_hash = Some(header.block_hash);
-
-                let res = txn.revert_body(block_number)?;
-                txn = res.0;
-
-                let res = txn.revert_state_diff(block_number)?;
-                txn = res.0;
-            }
-
-            txn.commit()?;
-            if let Some(hash) = reverted_block_hash {
-                info!(%hash, %block_number, "Reverted block.");
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Checks if centrals block hash at the block number is different from ours (or doesn't exist).
-    /// If so, a revert is required.
-    async fn should_revert_block(&self, block_number: BlockNumber) -> Result<bool, StateSyncError> {
-        if let Some(central_block_hash) = self.central_source.get_block_hash(block_number).await? {
-            let storage_block_header =
-                self.reader.begin_ro_txn()?.get_block_header(block_number)?;
-
-            match storage_block_header {
-                Some(block_header) => Ok(block_header.block_hash != central_block_hash),
-                None => Ok(false),
-            }
-        } else {
-            // Block number doesn't exist in central, revert.
-            Ok(true)
-        }
     }
 
     async fn perform_storage_writes<
@@ -799,7 +756,7 @@ fn stream_new_blocks<
     shared_highest_block: Arc<RwLock<Option<BlockHashAndNumber>>>,
     pending_data: Arc<RwLock<PendingData>>,
     pending_classes: Arc<RwLock<PendingClasses>>,
-    block_propagation_sleep_duration: Duration,
+    latest_block_poll_interval_millis: Duration,
     collect_pending_data: bool,
     pending_sleep_duration: Duration,
     max_stream_size: u32,
@@ -829,7 +786,7 @@ fn stream_new_blocks<
                 }
                 else{
                     trace!("Blocks syncing reached the last known block {:?}, waiting for blockchain to advance.", header_marker.prev());
-                    tokio::time::sleep(block_propagation_sleep_duration).await;
+                    tokio::time::sleep(latest_block_poll_interval_millis).await;
                 };
                 continue;
             }
@@ -849,7 +806,7 @@ fn stream_new_blocks<
 fn stream_new_state_diffs<TCentralSource: CentralSourceTrait + Sync + Send>(
     reader: StorageReader,
     central_source: Arc<TCentralSource>,
-    block_propagation_sleep_duration: Duration,
+    latest_block_poll_interval_millis: Duration,
     max_stream_size: u32,
 ) -> impl Stream<Item = Result<SyncEvent, StateSyncError>> {
     try_stream! {
@@ -860,7 +817,7 @@ fn stream_new_state_diffs<TCentralSource: CentralSourceTrait + Sync + Send>(
             drop(txn);
             if state_marker == last_block_number {
                 trace!("State updates syncing reached the last downloaded block {:?}, waiting for more blocks.", state_marker.prev());
-                tokio::time::sleep(block_propagation_sleep_duration).await;
+                tokio::time::sleep(latest_block_poll_interval_millis).await;
                 continue;
             }
             let up_to = min(last_block_number, BlockNumber(state_marker.0 + u64::from(max_stream_size)));
@@ -936,9 +893,9 @@ impl StateSync {
 fn stream_new_compiled_classes<TCentralSource: CentralSourceTrait + Sync + Send>(
     reader: StorageReader,
     central_source: Arc<TCentralSource>,
-    block_propagation_sleep_duration: Duration,
+    latest_block_poll_interval_millis: Duration,
     max_stream_size: u32,
-    store_sierras_and_casms: bool,
+    store_sierras_and_casms_block_threshold: u64,
 ) -> impl Stream<Item = Result<SyncEvent, StateSyncError>> {
     try_stream! {
         loop {
@@ -963,7 +920,7 @@ fn stream_new_compiled_classes<TCentralSource: CentralSourceTrait + Sync + Send>
                     "Compiled classes syncing reached the last downloaded state update{:?}, waiting \
                      for more state updates.", state_marker.prev()
                 );
-                tokio::time::sleep(block_propagation_sleep_duration).await;
+                tokio::time::sleep(latest_block_poll_interval_millis).await;
                 continue;
             }
             let mut up_to = min(state_marker, BlockNumber(from.0 + u64::from(max_stream_size)));
@@ -976,9 +933,9 @@ fn stream_new_compiled_classes<TCentralSource: CentralSourceTrait + Sync + Send>
 
             // No point in downloading casms if we don't store them and don't send them to the
             // class manager
-            if are_casms_backward_compatible && !store_sierras_and_casms {
+            if are_casms_backward_compatible && from.0 >= store_sierras_and_casms_block_threshold {
                 info!("Compiled classes stream reached a block that has backward compatibility for \
-                      the compiler, and store_sierras_and_casms is set to false. \
+                      the compiler, and block is at or above store_sierras_and_casms_block_threshold. \
                       Finishing the compiled class stream");
                 pending::<()>().await;
                 continue;
@@ -990,8 +947,10 @@ fn stream_new_compiled_classes<TCentralSource: CentralSourceTrait + Sync + Send>
             pin_mut!(compiled_classes_stream);
 
             while let Some(maybe_compiled_class) = compiled_classes_stream.next().await {
-                let (class_hash, compiled_class_hash, compiled_class) = maybe_compiled_class?;
+                let (block_number, class_hash, compiled_class_hash, compiled_class) =
+                    maybe_compiled_class?;
                 yield SyncEvent::CompiledClassAvailable {
+                    block_number,
                     class_hash,
                     compiled_class_hash,
                     compiled_class,
@@ -1040,7 +999,7 @@ fn stream_new_base_layer_block<TBaseLayerSource: BaseLayerSourceTrait + Sync>(
 // TODO(dvir): add a test for this scenario.
 fn check_sync_progress(
     reader: StorageReader,
-    store_sierras_and_casms: bool,
+    store_sierras_and_casms_block_threshold: u64,
 ) -> impl Stream<Item = Result<SyncEvent, StateSyncError>> {
     try_stream! {
         let (mut header_marker, mut state_marker, mut casm_marker) = {
@@ -1062,7 +1021,11 @@ fn check_sync_progress(
                 let compiler_backward_compatibility_marker = txn.get_compiler_backward_compatibility_marker()?;
                 (new_header_marker, new_state_marker, new_casm_marker, compiler_backward_compatibility_marker)
             };
-            let is_casm_stuck = casm_marker == new_casm_marker && (new_casm_marker < compiler_backward_compatibility_marker || store_sierras_and_casms);
+            let store_sierras_and_casms =
+                new_casm_marker.0 < store_sierras_and_casms_block_threshold;
+            let is_casm_stuck = casm_marker == new_casm_marker
+                && (new_casm_marker < compiler_backward_compatibility_marker
+                    || store_sierras_and_casms);
             if header_marker==new_header_marker || state_marker==new_state_marker || is_casm_stuck {
                 debug!("No progress in the sync. Return NoProgress event. Header marker: {header_marker}, \
                        State marker: {state_marker}, Casm marker: {casm_marker}.");

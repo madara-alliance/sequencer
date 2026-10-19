@@ -2,12 +2,6 @@ use std::collections::HashMap;
 
 use blockifier::state::state_api::{State, StateReader};
 use cairo_vm::any_box;
-use cairo_vm::hint_processor::builtin_hint_processor::hint_utils::{
-    get_integer_from_var_name,
-    get_ptr_from_var_name,
-    insert_value_from_var_name,
-    insert_value_into_ap,
-};
 use starknet_api::core::ContractAddress;
 use starknet_types_core::felt::Felt;
 
@@ -18,34 +12,42 @@ use crate::hint_processor::state_update_pointers::{
     StateEntryPtr,
     StoragePtr,
 };
-use crate::hints::enum_definition::{AllHints, OsHint};
 use crate::hints::error::{OsHintError, OsHintResult};
 use crate::hints::hint_implementation::compiled_class::utils::CompiledClassFact;
-use crate::hints::nondet_offsets::insert_nondet_hint_value;
-use crate::hints::types::HintArgs;
+use crate::hints::types::HintContext;
 use crate::hints::vars::{CairoStruct, Const, Ids, Scope};
-use crate::vm_utils::{get_address_of_nested_fields, LoadCairoObject};
+use crate::vm_utils::LoadCairoObject;
 
-pub(crate) fn enter_scope_with_aliases(HintArgs { exec_scopes, .. }: HintArgs<'_>) -> OsHintResult {
+pub(crate) fn enter_scope_with_aliases(ctx: HintContext<'_>) -> OsHintResult {
     // Note that aliases, execution_helper, state_update_pointers and block_input do not enter the
     // new scope as they are not needed.
-    let dict_manager = exec_scopes.get_dict_manager()?;
+    let dict_manager = ctx.get_dict_manager()?;
     let new_scope = HashMap::from([(Scope::DictManager.into(), any_box!(dict_manager))]);
-    exec_scopes.enter_scope(new_scope);
+    ctx.exec_scopes.enter_scope(new_scope);
     Ok(())
 }
 
 pub(crate) fn get_class_hash_and_compiled_class_fact<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { ids_data, constants, vm, ap_tracking, .. }: HintArgs<'_>,
+    mut ctx: HintContext<'_>,
 ) -> OsHintResult {
-    // Fetch class hash and compiled class hash v2 from the classes to be migrate
-    let (class_hash, casm_hash_v2) = hint_processor
-        .get_mut_current_execution_helper()?
-        .class_hashes_to_migrate_iterator
-        .next()
-        .expect("Class hashes iterator should not be empty");
-    insert_value_from_var_name(Ids::ClassHash.into(), class_hash.0, vm, ids_data, ap_tracking)?;
+    // Read n_classes from cairo memory (number of remaining classes to process).
+    let n_classes: usize =
+        ctx.get_integer(Ids::NClasses)?.try_into().expect("n_classes should fit into usize");
+
+    // Get the class at the appropriate index from block input.
+    // Classes are processed from index 0 onwards, and n_classes counts down from total.
+    let class_hashes_to_migrate =
+        &hint_processor.get_current_execution_helper()?.os_block_input.class_hashes_to_migrate;
+    let total_classes = class_hashes_to_migrate.len();
+    let index = total_classes - n_classes;
+
+    let (class_hash, casm_hash_v2) = class_hashes_to_migrate
+        .get(index)
+        .copied()
+        .expect("Index should be valid for class_hashes_to_migrate");
+
+    ctx.insert_value(Ids::ClassHash, class_hash.0)?;
 
     // Use compiled class hash v2 to fetch the casm contract.
     let casm_contract = hint_processor
@@ -56,38 +58,29 @@ pub(crate) fn get_class_hash_and_compiled_class_fact<S: StateReader>(
     // Load the CompiledClassFact into memory and return its pointer.
     let compiled_class_fact =
         CompiledClassFact { compiled_class_hash: &casm_hash_v2, compiled_class: casm_contract };
-    let compiled_class_fact_ptr = vm.add_memory_segment();
+    let compiled_class_fact_ptr = ctx.vm.add_memory_segment();
     compiled_class_fact.load_into(
-        vm,
-        hint_processor.program,
+        ctx.vm,
+        ctx.program,
         compiled_class_fact_ptr,
-        constants,
+        &ctx.program.constants,
     )?;
 
-    insert_value_from_var_name(
-        Ids::CompiledClassFact.into(),
-        compiled_class_fact_ptr,
-        vm,
-        ids_data,
-        ap_tracking,
-    )?;
+    ctx.insert_value(Ids::CompiledClassFact, compiled_class_fact_ptr)?;
 
     Ok(())
 }
 
-pub(crate) fn key_lt_min_alias_alloc_value(
-    HintArgs { ids_data, ap_tracking, vm, constants, .. }: HintArgs<'_>,
-) -> OsHintResult {
-    let key = get_integer_from_var_name(Ids::Key.into(), vm, ids_data, ap_tracking)?;
-    let min_value_for_alias_alloc = *Const::MinValueForAliasAlloc.fetch(constants)?;
-    Ok(insert_value_into_ap(vm, Felt::from(key < min_value_for_alias_alloc))?)
+pub(crate) fn key_lt_min_alias_alloc_value(mut ctx: HintContext<'_>) -> OsHintResult {
+    let key = ctx.get_integer(Ids::Key)?;
+    let min_value_for_alias_alloc = *ctx.fetch_const(Const::MinValueForAliasAlloc)?;
+    Ok(ctx
+        .insert_value(Ids::KeyLtMinAliasAllocValue, Felt::from(key < min_value_for_alias_alloc))?)
 }
 
-pub(crate) fn assert_key_big_enough_for_alias(
-    HintArgs { ids_data, ap_tracking, vm, constants, .. }: HintArgs<'_>,
-) -> OsHintResult {
-    let key = get_integer_from_var_name(Ids::Key.into(), vm, ids_data, ap_tracking)?;
-    let min_value_for_alias_alloc = *Const::MinValueForAliasAlloc.fetch(constants)?;
+pub(crate) fn assert_key_big_enough_for_alias(ctx: HintContext<'_>) -> OsHintResult {
+    let key = ctx.get_integer(Ids::Key)?;
+    let min_value_for_alias_alloc = *ctx.fetch_const(Const::MinValueForAliasAlloc)?;
     if key < min_value_for_alias_alloc {
         Err(OsHintError::AssertionFailed {
             message: format!("Key {key} is too small for alias allocation."),
@@ -99,25 +92,24 @@ pub(crate) fn assert_key_big_enough_for_alias(
 
 pub(crate) fn read_alias_from_key<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { ids_data, ap_tracking, vm, constants, .. }: HintArgs<'_>,
+    mut ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let key = get_integer_from_var_name(Ids::Key.into(), vm, ids_data, ap_tracking)?;
+    let key = ctx.get_integer(Ids::Key)?;
     let execution_helper = hint_processor.get_current_execution_helper()?;
-    let aliases_contract_address = Const::get_alias_contract_address(constants)?;
+    let aliases_contract_address = Const::get_alias_contract_address(ctx.constants())?;
     let alias =
         execution_helper.cached_state.get_storage_at(aliases_contract_address, key.try_into()?)?;
-    insert_nondet_hint_value(vm, AllHints::OsHint(OsHint::ReadAliasFromKey), alias)
+    Ok(ctx.insert_value(Ids::PrevValue, alias)?)
 }
 
 pub(crate) fn write_next_alias_from_key<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { ids_data, ap_tracking, vm, constants, .. }: HintArgs<'_>,
+    ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let key = get_integer_from_var_name(Ids::Key.into(), vm, ids_data, ap_tracking)?;
-    let next_available_alias =
-        get_integer_from_var_name(Ids::NextAvailableAlias.into(), vm, ids_data, ap_tracking)?;
+    let key = ctx.get_integer(Ids::Key)?;
+    let next_available_alias = ctx.get_integer(Ids::NextAvailableAlias)?;
     let execution_helper = hint_processor.get_mut_current_execution_helper()?;
-    let aliases_contract_address = Const::get_alias_contract_address(constants)?;
+    let aliases_contract_address = Const::get_alias_contract_address(ctx.constants())?;
     Ok(execution_helper.cached_state.set_storage_at(
         aliases_contract_address,
         key.try_into()?,
@@ -127,24 +119,24 @@ pub(crate) fn write_next_alias_from_key<S: StateReader>(
 
 pub(crate) fn read_alias_counter<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { vm, constants, .. }: HintArgs<'_>,
+    mut ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let aliases_contract_address = Const::get_alias_contract_address(constants)?;
-    let alias_counter_storage_key = Const::get_alias_counter_storage_key(constants)?;
+    let aliases_contract_address = Const::get_alias_contract_address(ctx.constants())?;
+    let alias_counter_storage_key = Const::get_alias_counter_storage_key(ctx.constants())?;
     let alias_counter = hint_processor
         .get_current_execution_helper()?
         .cached_state
         .get_storage_at(aliases_contract_address, alias_counter_storage_key)?;
-    Ok(insert_value_into_ap(vm, alias_counter)?)
+    Ok(ctx.insert_value(Ids::NextAvailableAlias, alias_counter)?)
 }
 
 pub(crate) fn initialize_alias_counter<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { constants, .. }: HintArgs<'_>,
+    ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let aliases_contract_address = Const::get_alias_contract_address(constants)?;
-    let alias_counter_storage_key = Const::get_alias_counter_storage_key(constants)?;
-    let initial_available_alias = *Const::InitialAvailableAlias.fetch(constants)?;
+    let aliases_contract_address = Const::get_alias_contract_address(ctx.constants())?;
+    let alias_counter_storage_key = Const::get_alias_counter_storage_key(ctx.constants())?;
+    let initial_available_alias = *ctx.fetch_const(Const::InitialAvailableAlias)?;
     Ok(hint_processor.get_mut_current_execution_helper()?.cached_state.set_storage_at(
         aliases_contract_address,
         alias_counter_storage_key,
@@ -154,12 +146,11 @@ pub(crate) fn initialize_alias_counter<S: StateReader>(
 
 pub(crate) fn update_alias_counter<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { constants, ids_data, ap_tracking, vm, .. }: HintArgs<'_>,
+    ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let aliases_contract_address = Const::get_alias_contract_address(constants)?;
-    let alias_counter_storage_key = Const::get_alias_counter_storage_key(constants)?;
-    let next_available_alias =
-        get_integer_from_var_name(Ids::NextAvailableAlias.into(), vm, ids_data, ap_tracking)?;
+    let aliases_contract_address = Const::get_alias_contract_address(ctx.constants())?;
+    let alias_counter_storage_key = Const::get_alias_counter_storage_key(ctx.constants())?;
+    let next_available_alias = ctx.get_integer(Ids::NextAvailableAlias)?;
     Ok(hint_processor.get_mut_current_execution_helper()?.cached_state.set_storage_at(
         aliases_contract_address,
         alias_counter_storage_key,
@@ -167,73 +158,43 @@ pub(crate) fn update_alias_counter<S: StateReader>(
     )?)
 }
 
-pub(crate) fn contract_address_le_max_for_compression(
-    HintArgs { constants, vm, ids_data, ap_tracking, .. }: HintArgs<'_>,
-) -> OsHintResult {
-    let contract_address =
-        get_integer_from_var_name(Ids::ContractAddress.into(), vm, ids_data, ap_tracking)?;
-    let max_contract_address = *Const::MaxNonCompressedContractAddress.fetch(constants)?;
-    Ok(insert_value_into_ap(vm, Felt::from(contract_address <= max_contract_address))?)
+pub(crate) fn contract_address_le_max_for_compression(mut ctx: HintContext<'_>) -> OsHintResult {
+    let contract_address = ctx.get_integer(Ids::ContractAddress)?;
+    let max_contract_address = *ctx.fetch_const(Const::MaxNonCompressedContractAddress)?;
+    Ok(ctx.insert_value(
+        Ids::ContractAddressLeMaxForCompression,
+        Felt::from(contract_address <= max_contract_address),
+    )?)
 }
 
-pub(crate) fn guess_contract_addr_storage_ptr<'program, CHP: CommonHintProcessor<'program>>(
+pub(crate) fn load_storage_ptr_and_prev_state<CHP: CommonHintProcessor>(
     hint_processor: &mut CHP,
-    HintArgs { vm, ids_data, ap_tracking, .. }: HintArgs<'_>,
+    mut ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let key_address = get_address_of_nested_fields(
-        ids_data,
-        Ids::StateChanges,
-        CairoStruct::DictAccessPtr,
-        vm,
-        ap_tracking,
-        &["key"],
-        hint_processor.get_program(),
-    )?;
-    let contract_address = ContractAddress(vm.get_integer(key_address)?.into_owned().try_into()?);
+    let key_felt =
+        ctx.get_nested_field_felt(Ids::StateChanges, CairoStruct::DictAccessPtr, &["key"])?;
+    let contract_address = ContractAddress(key_felt.try_into()?);
     let (state_entry, storage_ptr) = get_contract_state_entry_and_storage_ptr(
         hint_processor.get_mut_state_update_pointers(),
-        vm,
+        ctx.vm,
         contract_address,
     );
-    insert_value_from_var_name(
-        Ids::SquashedPrevState.into(),
-        state_entry.0,
-        vm,
-        ids_data,
-        ap_tracking,
-    )?;
-    insert_value_from_var_name(
-        Ids::SquashedStoragePtr.into(),
-        storage_ptr.0,
-        vm,
-        ids_data,
-        ap_tracking,
-    )?;
+    ctx.insert_value(Ids::SquashedPrevState, state_entry.0)?;
+    ctx.insert_value(Ids::SquashedStoragePtr, storage_ptr.0)?;
 
     Ok(())
 }
 
-pub(crate) fn update_contract_addr_to_storage_ptr<'program, CHP: CommonHintProcessor<'program>>(
+pub(crate) fn update_contract_addr_to_storage_ptr<CHP: CommonHintProcessor>(
     hint_processor: &mut CHP,
-    HintArgs { vm, ids_data, ap_tracking, .. }: HintArgs<'_>,
+    ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let program = hint_processor.get_program();
     if let Some(state_update_pointers) = hint_processor.get_mut_state_update_pointers() {
-        let key_address = get_address_of_nested_fields(
-            ids_data,
-            Ids::StateChanges,
-            CairoStruct::DictAccessPtr,
-            vm,
-            ap_tracking,
-            &["key"],
-            program,
-        )?;
-        let contract_address =
-            ContractAddress(vm.get_integer(key_address)?.into_owned().try_into()?);
-        let squashed_new_state =
-            get_ptr_from_var_name(Ids::SquashedNewState.into(), vm, ids_data, ap_tracking)?;
-        let squashed_storage_ptr_end =
-            get_ptr_from_var_name(Ids::SquashedStoragePtrEnd.into(), vm, ids_data, ap_tracking)?;
+        let key_felt =
+            ctx.get_nested_field_felt(Ids::StateChanges, CairoStruct::DictAccessPtr, &["key"])?;
+        let contract_address = ContractAddress(key_felt.try_into()?);
+        let squashed_new_state = ctx.get_ptr(Ids::SquashedNewState)?;
+        let squashed_storage_ptr_end = ctx.get_ptr(Ids::SquashedStoragePtrEnd)?;
 
         state_update_pointers.set_contract_state_entry_and_storage_ptr(
             contract_address,
@@ -247,45 +208,27 @@ pub(crate) fn update_contract_addr_to_storage_ptr<'program, CHP: CommonHintProce
 
 pub(crate) fn guess_aliases_contract_storage_ptr<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { vm, constants, ids_data, ap_tracking, .. }: HintArgs<'_>,
+    mut ctx: HintContext<'_>,
 ) -> OsHintResult {
-    let aliases_contract_address = Const::get_alias_contract_address(constants)?;
+    let aliases_contract_address = Const::get_alias_contract_address(ctx.constants())?;
     let (state_entry_ptr, storage_ptr) = get_contract_state_entry_and_storage_ptr(
         &mut hint_processor.state_update_pointers,
-        vm,
+        ctx.vm,
         aliases_contract_address,
     );
-    insert_value_from_var_name(
-        Ids::PrevAliasesStateEntry.into(),
-        state_entry_ptr.0,
-        vm,
-        ids_data,
-        ap_tracking,
-    )?;
-    insert_value_from_var_name(
-        Ids::SquashedAliasesStorageStart.into(),
-        storage_ptr.0,
-        vm,
-        ids_data,
-        ap_tracking,
-    )?;
+    ctx.insert_value(Ids::PrevAliasesStateEntry, state_entry_ptr.0)?;
+    ctx.insert_value(Ids::SquashedAliasesStorageStart, storage_ptr.0)?;
     Ok(())
 }
 
 pub(crate) fn update_aliases_contract_to_storage_ptr<S: StateReader>(
     hint_processor: &mut SnosHintProcessor<'_, S>,
-    HintArgs { vm, constants, ids_data, ap_tracking, .. }: HintArgs<'_>,
+    ctx: HintContext<'_>,
 ) -> OsHintResult {
     if let Some(state_update_pointers) = &mut hint_processor.state_update_pointers {
-        let aliases_contract_address = Const::get_alias_contract_address(constants)?;
-        let aliases_state_entry_ptr =
-            get_ptr_from_var_name(Ids::NewAliasesStateEntry.into(), vm, ids_data, ap_tracking)?;
-        let aliases_storage_ptr = get_ptr_from_var_name(
-            Ids::SquashedAliasesStorageEnd.into(),
-            vm,
-            ids_data,
-            ap_tracking,
-        )?;
+        let aliases_contract_address = Const::get_alias_contract_address(ctx.constants())?;
+        let aliases_state_entry_ptr = ctx.get_ptr(Ids::NewAliasesStateEntry)?;
+        let aliases_storage_ptr = ctx.get_ptr(Ids::SquashedAliasesStorageEnd)?;
         state_update_pointers.set_contract_state_entry_and_storage_ptr(
             aliases_contract_address,
             StateEntryPtr(aliases_state_entry_ptr),

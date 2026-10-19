@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::types::errors::math_errors::MathError;
 use cairo_vm::types::relocatable::{MaybeRelocatable, Relocatable};
@@ -16,7 +14,6 @@ use starknet_api::transaction::{L1ToL2Payload, L2ToL1Payload, MessageToL1};
 use starknet_types_core::felt::Felt;
 
 use crate::errors::StarknetOsError;
-use crate::hints::vars::Const;
 use crate::io::os_output_types::{
     FullCommitmentOsStateDiff,
     FullOsStateDiff,
@@ -30,12 +27,6 @@ use crate::metrics::{AggregatorMetrics, OsMetrics};
 pub(crate) const MESSAGE_TO_L1_CONST_FIELD_SIZE: usize = 3;
 // from_address, to_address, nonce, selector, payload_size.
 pub(crate) const MESSAGE_TO_L2_CONST_FIELD_SIZE: usize = 5;
-// Hex of 'StarknetOsConfig3'.
-pub static STARKNET_OS_CONFIG_HASH_VERSION: LazyLock<Felt> = LazyLock::new(|| {
-    Const::StarknetOsConfigVersion
-        .fetch_from_os_program()
-        .expect("Starknet OS config version not found in the program.")
-});
 
 #[derive(Debug, thiserror::Error)]
 pub enum OsOutputError {
@@ -47,6 +38,8 @@ pub enum OsOutputError {
     InvalidOsOutputField { value_name: String, val: Felt, message: String },
     #[error("Failed to convert to FullOsOutput. State diff variant is of a different type")]
     ConvertToFullOutput,
+    #[error("Output iterator not exhausted.")]
+    OutputNotExhausted,
 }
 
 pub(crate) fn wrap_missing<T>(val: Option<T>, val_name: &str) -> Result<T, OsOutputError> {
@@ -105,6 +98,31 @@ pub fn message_l1_from_output_iter<It: Iterator<Item = Felt>>(
     let payload = L2ToL1Payload(iter.take(payload_size).collect());
 
     Ok(MessageToL1 { from_address, to_address, payload })
+}
+
+/// Parses messages to L1 from an output iterator.
+/// Reads the segment size, parses all messages, and verifies the segment is fully consumed.
+pub fn parse_messages_to_l1<It: Iterator<Item = Felt>>(
+    iter: &mut It,
+) -> Result<Vec<MessageToL1>, OsOutputError> {
+    let mut messages_to_l1_segment_size: usize =
+        wrap_missing_as(iter.next(), "messages_to_l1_segment_size")?;
+    let mut messages_to_l1_iter = iter.take(messages_to_l1_segment_size).peekable();
+    let mut messages_to_l1 = Vec::new();
+
+    while messages_to_l1_iter.peek().is_some() {
+        let message = message_l1_from_output_iter(&mut messages_to_l1_iter)?;
+        messages_to_l1_segment_size -= message.payload.0.len() + MESSAGE_TO_L1_CONST_FIELD_SIZE;
+        messages_to_l1.push(message);
+    }
+
+    assert_eq!(
+        messages_to_l1_segment_size, 0,
+        "Expected messages to L1 segment to be consumed, but {messages_to_l1_segment_size} felts \
+         were left."
+    );
+
+    Ok(messages_to_l1)
 }
 
 // TODO(Tzahi): Replace with starknet_api struct after it is updated.
@@ -225,21 +243,7 @@ impl TryFromOutputIter for OutputIterParsedData {
         };
 
         // Messages to L1 and L2.
-        let mut messages_to_l1_segment_size =
-            wrap_missing_as(output_iter.next(), "messages_to_l1_segment_size")?;
-        let mut messages_to_l1_iter = output_iter.take(messages_to_l1_segment_size).peekable();
-        let mut messages_to_l1 = Vec::<MessageToL1>::new();
-
-        while messages_to_l1_iter.peek().is_some() {
-            let message = message_l1_from_output_iter(&mut messages_to_l1_iter)?;
-            messages_to_l1_segment_size -= message.payload.0.len() + MESSAGE_TO_L1_CONST_FIELD_SIZE;
-            messages_to_l1.push(message);
-        }
-        assert_eq!(
-            messages_to_l1_segment_size, 0,
-            "Expected messages to L1 segment to be consumed, but {messages_to_l1_segment_size} \
-             felts were left.",
-        );
+        let messages_to_l1 = parse_messages_to_l1(output_iter)?;
 
         let mut messages_to_l2_segment_size =
             wrap_missing_as(output_iter.next(), "messages_to_l2_segment_size")?;
@@ -252,6 +256,11 @@ impl TryFromOutputIter for OutputIterParsedData {
             messages_to_l2_segment_size -= message.payload.0.len() + MESSAGE_TO_L2_CONST_FIELD_SIZE;
             messages_to_l2.push(message);
         }
+        assert_eq!(
+            messages_to_l2_segment_size, 0,
+            "Expected messages to L2 segment to be consumed, but {messages_to_l2_segment_size} \
+             felts were left.",
+        );
         Ok(Self {
             common_os_output: CommonOsOutput {
                 initial_root,
@@ -385,6 +394,8 @@ pub struct StarknetOsRunnerOutput {
     pub cairo_pie: CairoPie,
     pub da_segment: Option<Vec<Felt>>,
     pub metrics: OsMetrics,
+    #[cfg(any(test, feature = "testing"))]
+    pub txs_trace: Vec<crate::hint_processor::os_logger::OsTransactionTrace>,
     #[cfg(any(test, feature = "testing"))]
     pub unused_hints: std::collections::HashSet<crate::hints::enum_definition::AllHints>,
 }

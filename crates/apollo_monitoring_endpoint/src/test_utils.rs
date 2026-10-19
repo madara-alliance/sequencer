@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
@@ -7,9 +8,10 @@ use apollo_infra_utils::tracing::{CustomLogger, TraceLevel};
 use apollo_metrics::test_utils::parse_numeric_metric;
 use axum::body::Body;
 use axum::http::Request;
-use hyper::body::to_bytes;
-use hyper::client::HttpConnector;
-use hyper::Client;
+use http_body_util::BodyExt;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use num_traits::Num;
 use thiserror::Error;
 use tracing::info;
@@ -29,12 +31,12 @@ pub enum MonitoringClientError {
 /// Client for querying 'alive' status of an http server.
 pub struct MonitoringClient {
     socket: SocketAddr,
-    client: Client<HttpConnector>,
+    client: Client<HttpConnector, Body>,
 }
 
 impl MonitoringClient {
     pub fn new(socket: SocketAddr) -> Self {
-        let client = Client::new();
+        let client = Client::builder(TokioExecutor::new()).build_http();
         Self { socket, client }
     }
 
@@ -78,9 +80,7 @@ impl MonitoringClient {
                     .request(build_request(&self.socket.ip(), self.socket.port(), METRICS))
                     .await
             },
-            |response_result| {
-                response_result.as_ref().map(|res| res.status().is_success()).unwrap_or(false)
-            },
+            |response_result| response_result.as_ref().is_ok_and(|res| res.status().is_success()),
             Some(logger),
         )
         .await;
@@ -88,7 +88,7 @@ impl MonitoringClient {
         match result {
             Some(Ok(response)) => {
                 // Parse the response body.
-                let body_bytes = to_bytes(response.into_body()).await.unwrap();
+                let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
                 Ok(String::from_utf8(body_bytes.to_vec()).unwrap())
             }
             Some(Err(err)) => {
@@ -100,17 +100,38 @@ impl MonitoringClient {
         }
     }
 
-    // TODO(Yael/Itay): add labels support
-    // TODO(Itay): Consider making this private
-    pub async fn get_metric<T: Num + FromStr>(
+    // TODO(Yael/Tsabary): add labels support
+    pub async fn get_metric<T: Num + FromStr + Send + Debug + 'static>(
         &self,
         metric_name: &str,
     ) -> Result<T, MonitoringClientError> {
-        let body_string = self.get_metrics().await?;
+        // Todo(Tsabary): consider if these should be configurable.
+        const INTERVAL_MS: u64 = 10;
+        const MAX_ATTEMPTS: usize = 25;
 
-        // Extract and return the metric value, or a suitable error.
-        parse_numeric_metric::<T>(&body_string, metric_name, None)
-            .ok_or(MonitoringClientError::MetricNotFound { metric_name: metric_name.to_string() })
+        let logger = CustomLogger::new(
+            TraceLevel::Info,
+            Some(format!("Polling for metric '{}'", metric_name)),
+        );
+
+        // Todo(Tsabary): consider changing `run_until` to return a `Result` instead of an `Option`.
+        let result = run_until(
+            INTERVAL_MS,
+            MAX_ATTEMPTS,
+            || async {
+                let body_string = self.get_metrics().await?;
+                parse_numeric_metric::<T>(&body_string, metric_name, None).ok_or(
+                    MonitoringClientError::MetricNotFound { metric_name: metric_name.to_string() },
+                )
+            },
+            |result: &Result<T, MonitoringClientError>| result.is_ok(),
+            Some(logger),
+        )
+        .await;
+
+        result.unwrap_or(Err(MonitoringClientError::MetricNotFound {
+            metric_name: metric_name.to_string(),
+        }))
     }
 }
 

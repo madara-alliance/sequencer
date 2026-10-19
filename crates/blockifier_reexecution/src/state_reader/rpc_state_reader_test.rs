@@ -12,9 +12,6 @@
 use std::env;
 use std::sync::{Arc, Mutex};
 
-use apollo_gateway::rpc_objects::BlockId;
-use apollo_gateway::rpc_state_reader::RpcStateReader as GatewayRpcStateReader;
-use apollo_gateway_config::config::RpcStateReaderConfig;
 use assert_matches::assert_matches;
 use blockifier::blockifier::config::ContractClassManagerConfig;
 use blockifier::state::contract_class_manager::ContractClassManager;
@@ -32,13 +29,15 @@ use starknet_core::types::ContractClass::{Legacy, Sierra};
 
 use crate::cli::guess_chain_id_from_node_url;
 use crate::compile::legacy_to_contract_class_v0;
+use crate::state_reader::config::RpcStateReaderConfig;
 use crate::state_reader::reexecution_state_reader::ReexecutionStateReader;
+use crate::state_reader::rpc_objects::BlockId;
 use crate::state_reader::rpc_state_reader::{
     ConsecutiveRpcStateReaders,
     RetryConfig,
     RpcStateReader,
 };
-use crate::utils::RPC_NODE_URL;
+use crate::utils::{get_chain_info, RPC_NODE_URL};
 
 const EXAMPLE_INVOKE_TX_HASH: &str =
     "0xa7c7db686c7f756ceb7ca85a759caef879d425d156da83d6a836f86851983";
@@ -100,12 +99,10 @@ pub fn get_test_rpc_config() -> RpcStateReaderConfig {
 #[fixture]
 pub fn test_state_reader() -> RpcStateReader {
     RpcStateReader {
-        rpc_state_reader: GatewayRpcStateReader {
-            config: get_test_rpc_config(),
-            block_id: get_test_block_id(),
-        },
+        config: get_test_rpc_config(),
+        block_id: get_test_block_id(),
         retry_config: RetryConfig::default(),
-        chain_id: ChainId::Mainnet,
+        chain_info: get_chain_info(&ChainId::Mainnet, None),
         contract_class_mapping_dumper: Arc::new(Mutex::new(None)),
     }
 }
@@ -133,9 +130,10 @@ pub fn test_state_readers_last_and_current_block(
     ConsecutiveRpcStateReaders::new(
         last_constructed_block,
         None,
-        ChainId::Mainnet,
+        get_chain_info(&ChainId::Mainnet, None),
         false,
         contract_class_manager,
+        false,
     )
 }
 
@@ -273,7 +271,7 @@ pub fn test_get_versioned_constants(test_state_reader: RpcStateReader) {
 
 #[rstest]
 pub fn test_get_block_context(test_state_reader: RpcStateReader) {
-    test_state_reader.get_block_context().unwrap();
+    test_state_reader.get_block_context(None).unwrap();
 }
 
 #[rstest]

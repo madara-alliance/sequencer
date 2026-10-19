@@ -2,12 +2,12 @@ use std::convert::TryInto;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use apollo_proc_macros::unique_u16;
 use async_trait::async_trait;
 use metrics::set_default_local_recorder;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
-use strum::EnumVariantNames;
-use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
+use strum::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr, VariantNames};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::Semaphore;
 use tokio::task::{self, JoinSet};
@@ -33,8 +33,8 @@ use crate::component_server::{
     RemoteComponentServer,
 };
 use crate::tests::{
+    available_ports_factory,
     dummy_remote_server_config,
-    AVAILABLE_PORTS,
     TEST_LOCAL_CLIENT_METRICS,
     TEST_LOCAL_SERVER_METRICS,
     TEST_REMOTE_CLIENT_METRICS,
@@ -49,7 +49,7 @@ const NUMBER_OF_ITERATIONS: usize = 10;
 #[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
 #[strum_discriminants(
     name(TestComponentRequestLabelValue),
-    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    derive(IntoStaticStr, EnumIter, VariantNames),
     strum(serialize_all = "snake_case")
 )]
 enum TestComponentRequest {
@@ -169,11 +169,12 @@ async fn setup_concurrent_local_server_test(
     (test_sem, local_client)
 }
 
+// Uses available_ports_factory with index 6.
 async fn setup_remote_server_test(
     max_concurrency: usize,
 ) -> (Arc<Semaphore>, RemoteTestComponentClient) {
     let (test_sem, local_client) = setup_local_server_test().await;
-    let socket = AVAILABLE_PORTS.lock().await.get_next_local_host_socket();
+    let socket = available_ports_factory(unique_u16!()).get_next_local_host_socket();
     let config = RemoteClientConfig::default();
 
     let mut remote_server = RemoteComponentServer::new(

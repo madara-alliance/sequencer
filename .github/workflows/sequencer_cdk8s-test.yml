@@ -1,37 +1,45 @@
-name: Sequencer-Cdk8s-Test
+name: Sequencer CdK8s Dry Test
 on:
-  workflow_dispatch:
-
-  # push:
-  #   branches:
-  #     - main
-  #     - main-v[0-9].**
-  #   tags:
-  #     - v[0-9].**
-  #   paths:
-  #     - ".github/workflows/sequencer_cdk8s-test.yml"
-  #     - "deployments/sequencer/**"
-
-  # pull_request:
-  #   branches:
-  #     - main
-  #     - main-v[0-9].**
-  #   paths:
-  #     - ".github/workflows/sequencer_cdk8s-test.yml"
-  #     - "deployments/sequencer/**"
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - edited
+      - synchronize
+    paths:
+      - ".github/workflows/sequencer_cdk8s-test.yml"
+      - "crates/apollo_deployments/**"
+      - "deployments/sequencer/**"
 
 jobs:
+  # https://graphite.com/docs/stacking-and-ci
+  optimize_ci:
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.check_skip.outputs.skip }}
+    steps:
+      - name: Optimize CI
+        id: check_skip
+        uses: withgraphite/graphite-ci-action@v0.0.9
+        with:
+          graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZER_TOKEN }}
+
   prepare:
     runs-on: ubuntu-24.04
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
     env:
       cluster: test
       namespace: test
-      deployment_config_path: ${{ github.workspace }}/crates/apollo_deployments/resources/deployments/testing/deployment_config_consolidated.json
+      layout: hybrid
+      overlay: hybrid.testing.node-0
+      overlay2: hybrid.testing.all-constructs
       monitoring_dashboard_file: ${{ github.workspace }}/deployments/monitoring/examples/output/dashboards/sequencer_node_dashboard.json
+      cdk8s_sequencer_path: ${{ github.workspace }}/deployments/sequencer
 
     steps:
       - name: Checkout sequencer
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup python
         uses: actions/setup-python@v5.4.0
@@ -52,25 +60,33 @@ jobs:
 
       # Synthesize the CDK8s Sequencer app.
       - name: CDk8s synth
-        working-directory: deployments/sequencer
+        working-directory: ${{ env.cdk8s_sequencer_path }}
         run: |
+          echo "Importing CDK8s Sequencer app..."
           cdk8s import
+          echo "Installing pip dependencies..."
           pipenv install
-          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.namespace }} --deployment-config-file ${{ env.deployment_config_path }} --monitoring-dashboard-file ${{ env.monitoring_dashboard_file }} --cluster ${{ env.cluster }}"
+          echo "Synthesizing CDK8s Sequencer app with overlay ${{ env.overlay }}..."
+          cdk8s synth --app "pipenv run python -m main --namespace ${{ env.namespace }} -l ${{ env.layout }} -o ${{ env.overlay }} --monitoring-dashboard-file ${{ env.monitoring_dashboard_file }} --cluster ${{ env.cluster }}" --output dist1
+          echo "Synthesizing CDK8s Sequencer app with overlay ${{ env.overlay2 }}..."
+          cdk8s synth --app "pipenv run python -m main --namespace ${{ env.namespace }} -l ${{ env.layout }} -o ${{ env.overlay2 }} --monitoring-dashboard-file ${{ env.monitoring_dashboard_file }} --cluster ${{ env.cluster }}" --output dist2
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: cdk8s-artifacts
           path: |
-            deployments/sequencer/dist
-            deployments/sequencer/resources
+            ${{ env.cdk8s_sequencer_path }}/dist1
+            ${{ env.cdk8s_sequencer_path }}/dist2
+            ${{ env.cdk8s_sequencer_path }}/resources
 
   validate:
     runs-on: ubuntu-24.04
-    needs: prepare
+    needs: [prepare, optimize_ci]
+    if: success() && needs.optimize_ci.outputs.skip == 'false'
     env:
-      dist_path: ./cdk8s-artifacts/dist
+      dist1_path: ./cdk8s-artifacts/dist1
+      dist2_path: ./cdk8s-artifacts/dist2
       crds_path: ./cdk8s-artifacts/resources/crds
     steps:
       - name: Setup go lang
@@ -88,26 +104,10 @@ jobs:
           path: cdk8s-artifacts
           merge-multiple: true
 
-      - name: kubectl validation test for version 1.27
-        run: kubectl validate ${{ env.dist_path }} --local-crds ${{ env.crds_path }} --version 1.27
-        continue-on-error: true
-
-      - name: kubectl validation test for version 1.28
-        run: kubectl validate ${{ env.dist_path }} --local-crds ${{ env.crds_path }} --version 1.28
-        continue-on-error: true
-
-      - name: kubectl validation test for version 1.29
-        run: kubectl validate ${{ env.dist_path }} --local-crds ${{ env.crds_path }} --version 1.29
+      - name: kubectl validation test for version 1.33
+        run: kubectl validate ${{ env.dist1_path }} ${{ env.dist2_path }} --local-crds ${{ env.crds_path }} --version 1.33
         continue-on-error: false
 
-      - name: kubectl validation test for version 1.30
-        run: kubectl validate ${{ env.dist_path }} --local-crds ${{ env.crds_path }} --version 1.30
-        continue-on-error: false
-
-      - name: kubectl validation test for version 1.31
-        run: kubectl validate ${{ env.dist_path }} --local-crds ${{ env.crds_path }} --version 1.31
-        continue-on-error: false
-
-      - name: kubectl validation test for version 1.32
-        run: kubectl validate ${{ env.dist_path }} --local-crds ${{ env.crds_path }} --version 1.32
+      - name: kubectl validation test for version 1.34
+        run: kubectl validate ${{ env.dist1_path }} ${{ env.dist2_path }} --local-crds ${{ env.crds_path }} --version 1.34
         continue-on-error: false

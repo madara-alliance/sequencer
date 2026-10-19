@@ -7,14 +7,15 @@ use num_bigint::BigUint;
 use num_integer::Integer;
 use num_traits::{ToPrimitive, Zero};
 use starknet_types_core::felt::Felt;
-use strum::EnumCount;
-use strum_macros::Display;
+use strum::{Display, EnumCount};
 
 use crate::hints::error::OsHintError;
 
+pub type ElmBoundType = u128;
+
 pub(crate) const COMPRESSION_VERSION: u8 = 0;
 pub(crate) const HEADER_ELM_N_BITS: usize = 20;
-pub(crate) const HEADER_ELM_BOUND: u32 = 1 << HEADER_ELM_N_BITS;
+pub(crate) const HEADER_ELM_BOUND: ElmBoundType = 1 << HEADER_ELM_N_BITS;
 
 pub(crate) const N_UNIQUE_BUCKETS: usize = BitLength::COUNT;
 /// Number of buckets, including the repeating values bucket.
@@ -23,7 +24,7 @@ pub(crate) const TOTAL_N_BUCKETS: usize = N_UNIQUE_BUCKETS + 1;
 pub(crate) const MAX_N_BITS: usize = 251;
 const HEADER_LEN: usize = 1 + 1 + TOTAL_N_BUCKETS;
 
-#[derive(Debug, Display, strum_macros::EnumCount)]
+#[derive(Debug, Display, strum::EnumCount)]
 pub(crate) enum BitLength {
     Bits15,
     Bits31,
@@ -424,14 +425,14 @@ pub(crate) fn compress(data: &[Felt]) -> Vec<Felt> {
         .chain([compression_set.n_repeating_values()])
         .collect();
 
-    let packed_header = pack_usize_in_felts(&header, HEADER_ELM_BOUND);
-    let packed_repeating_value_pointers = pack_usize_in_felts(
+    let packed_header = pack_in_felts(&header, HEADER_ELM_BOUND);
+    let packed_repeating_value_pointers = pack_in_felts(
         &compression_set.get_repeating_value_pointers(),
-        u32::try_from(n_unique_values).expect("Too many unique values"),
+        ElmBoundType::try_from(n_unique_values).expect("Too many unique values"),
     );
-    let packed_bucket_index_per_elm = pack_usize_in_felts(
+    let packed_bucket_index_per_elm = pack_in_felts(
         &compression_set.bucket_index_per_elm,
-        u32::try_from(TOTAL_N_BUCKETS).expect("Too many buckets"),
+        ElmBoundType::try_from(TOTAL_N_BUCKETS).expect("Too many buckets"),
     );
 
     let unique_values = compression_set.pack_unique_values();
@@ -443,26 +444,34 @@ pub(crate) fn compress(data: &[Felt]) -> Vec<Felt> {
 
 /// Calculates how many instances of the largest element below the (non-inclusive) element bound can
 /// fit into the bit length of a single felt.
-pub fn get_n_elms_per_felt(elm_bound: u32) -> usize {
+pub fn get_n_elms_per_felt(elm_bound: ElmBoundType) -> usize {
     if elm_bound <= 1 {
         return MAX_N_BITS;
     }
     // Calculate: ceil(log2(elm_bound)).
-    let n_bits_required = u32::BITS - (elm_bound - 1).leading_zeros();
+    let n_bits_required = ElmBoundType::BITS - (elm_bound - 1).leading_zeros();
     MAX_N_BITS / usize::try_from(n_bits_required).expect("usize overflow")
 }
 
 /// Packs a list of elements into multiple felts, ensuring that each felt contains as many elements
 /// as can fit.
-pub fn pack_usize_in_felts(elms: &[usize], elm_bound: u32) -> Vec<Felt> {
+pub fn pack_in_felts<U>(elms: &[U], elm_bound: ElmBoundType) -> Vec<Felt>
+where
+    U: Copy,
+    BigUint: From<U>,
+{
     elms.chunks(get_n_elms_per_felt(elm_bound))
-        .map(|chunk| pack_usize_in_felt(chunk, elm_bound))
+        .map(|chunk| pack_in_felt(chunk, elm_bound))
         .collect()
 }
 
 /// Packs a chunk of elements into a single felt. Assumes that the elms fit in a felt.
-fn pack_usize_in_felt(elms: &[usize], elm_bound: u32) -> Felt {
-    let elm_bound_as_big = BigUint::from(elm_bound);
+fn pack_in_felt<U>(elms: &[U], elm_bound: ElmBoundType) -> Felt
+where
+    U: Copy,
+    BigUint: From<U>,
+{
+    let elm_bound_as_big: BigUint = elm_bound.into();
     elms.iter()
         .enumerate()
         .fold(BigUint::zero(), |acc, (i, elm)| {
@@ -474,11 +483,11 @@ fn pack_usize_in_felt(elms: &[usize], elm_bound: u32) -> Felt {
 /// Computes the starting offsets for each bucket in a list of buckets, based on their lengths.
 pub(crate) fn get_bucket_offsets(bucket_lengths: &[usize]) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(bucket_lengths.len());
-    let mut current = 0;
+    let mut current_offset = 0;
 
     for &length in bucket_lengths {
-        offsets.push(current);
-        current += length;
+        offsets.push(current_offset);
+        current_offset += length;
     }
 
     offsets
@@ -501,18 +510,30 @@ pub fn unpack_felts<const LENGTH: usize>(
     result
 }
 
-pub fn unpack_felts_to_usize(compressed: &[Felt], n_elms: usize, elm_bound: u32) -> Vec<usize> {
+pub fn unpack_felts_to<U>(compressed: &[Felt], n_elms: usize, elm_bound: ElmBoundType) -> Vec<U>
+where
+    U: TryFrom<BigUint>,
+    U: for<'a> TryFrom<&'a BigUint>,
+    <U as TryFrom<BigUint>>::Error: std::fmt::Debug,
+{
     let n_elms_per_felt = get_n_elms_per_felt(elm_bound);
     let elm_bound_as_big = BigUint::from(elm_bound);
+    U::try_from(&elm_bound_as_big).unwrap_or_else(|_| {
+        panic!("Elm bound {elm_bound} is too large for type {}", type_name::<U>())
+    });
     let mut result = Vec::with_capacity(n_elms);
 
     for felt in compressed {
-        let mut remaining = felt.to_biguint();
+        let mut remaining_value = felt.to_biguint();
         let n_packed_elms = min(n_elms_per_felt, n_elms - result.len());
         for _ in 0..n_packed_elms {
-            let (new_remaining, value) = remaining.div_rem(&elm_bound_as_big);
-            result.push(value.to_usize().unwrap());
-            remaining = new_remaining;
+            let (new_remaining_value, value) = remaining_value.div_rem(&elm_bound_as_big);
+            result.push(
+                value.try_into().expect(
+                    "Value is the remainder modulo elm_bound, so it should fit in the type",
+                ),
+            );
+            remaining_value = new_remaining_value;
         }
     }
 
@@ -538,13 +559,13 @@ pub fn decompress(compressed: &mut impl Iterator<Item = Felt>) -> Vec<Felt> {
     fn unpack_chunk_to_usize(
         compressed: &mut impl Iterator<Item = Felt>,
         n_elms: usize,
-        elm_bound: u32,
+        elm_bound: ElmBoundType,
     ) -> Vec<usize> {
         let n_elms_per_felt = get_n_elms_per_felt(elm_bound);
         let n_packed_felts = n_elms.div_ceil(n_elms_per_felt);
 
         let compressed_chunk: Vec<_> = compressed.take(n_packed_felts).collect();
-        unpack_felts_to_usize(&compressed_chunk, n_elms, elm_bound)
+        unpack_felts_to::<usize>(&compressed_chunk, n_elms, elm_bound)
     }
 
     let header = unpack_chunk_to_usize(compressed, HEADER_LEN, HEADER_ELM_BOUND);

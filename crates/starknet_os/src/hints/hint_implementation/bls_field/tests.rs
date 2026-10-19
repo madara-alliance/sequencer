@@ -1,5 +1,6 @@
 use std::array;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use apollo_starknet_os_program::OS_PROGRAM_BYTES;
 use cairo_vm::types::builtin_name::BuiltinName;
@@ -29,6 +30,8 @@ use crate::test_utils::utils::{
 };
 
 const REDUCED_MUL_LIMB_BOUND: i128 = 2_i128.pow(104);
+static MAX_VALUE: LazyLock<Felt> = LazyLock::new(|| Felt::from(REDUCED_MUL_LIMB_BOUND - 1));
+static MIN_VALUE: LazyLock<Felt> = LazyLock::new(|| Felt::from(-REDUCED_MUL_LIMB_BOUND + 1));
 
 fn run_reduced_mul_test(a_split: &[Felt], b_split: &[Felt]) {
     let explicit_args = [
@@ -129,90 +132,86 @@ fn test_felt_to_bigint3(
     );
 }
 
-#[test]
-fn test_horner_eval() {
+#[rstest]
+fn test_horner_eval(#[values(0, 100, 4096)] n_coefficients: usize) {
     let mut rng = seeded_random_prng();
     let entrypoint_runner_config = get_entrypoint_runner_config();
 
-    for n_coefficients in [0, 100, 4096] {
-        let mut explicit_args: Vec<EndpointArg> = vec![];
-        explicit_args.push(n_coefficients.into());
-        let coefficients: Vec<Felt> = (0..n_coefficients)
-            .map(|_| Felt::from(RandBigInt::gen_bigint_range(&mut rng, &0.into(), &DEFAULT_PRIME)))
-            .collect();
+    let mut explicit_args: Vec<EndpointArg> = vec![];
+    explicit_args.push(n_coefficients.into());
+    let coefficients: Vec<Felt> = (0..n_coefficients)
+        .map(|_| Felt::from(RandBigInt::gen_bigint_range(&mut rng, &0.into(), &DEFAULT_PRIME)))
+        .collect();
 
-        explicit_args.push(EndpointArg::Pointer(PointerArg::Array(
-            coefficients.iter().cloned().map(MaybeRelocatable::from).collect(),
-        )));
-        let point =
-            RandBigInt::gen_bigint_range(&mut rng, &0.into(), &BLS_PRIME.to_bigint().unwrap());
-        explicit_args.push(EndpointArg::Value(ValueArg::Array(
-            split_bigint3(point.clone()).unwrap().iter().map(MaybeRelocatable::from).collect(),
-        )));
-        let implicit_args = [ImplicitArg::Builtin(BuiltinName::range_check)];
+    explicit_args.push(EndpointArg::Pointer(PointerArg::Array(
+        coefficients.iter().cloned().map(MaybeRelocatable::from).collect(),
+    )));
+    let point = RandBigInt::gen_bigint_range(&mut rng, &0.into(), &BLS_PRIME.to_bigint().unwrap());
+    explicit_args.push(EndpointArg::Value(ValueArg::Array(
+        split_bigint3(point.clone()).unwrap().iter().map(MaybeRelocatable::from).collect(),
+    )));
+    let implicit_args = [ImplicitArg::Builtin(BuiltinName::range_check)];
 
-        let state_reader = None;
-        let (_, explicit_retdata, _) = initialize_and_run_cairo_0_entry_point(
-            &entrypoint_runner_config,
-            OS_PROGRAM_BYTES,
-            "starkware.starknet.core.os.data_availability.bls_field.horner_eval",
-            &explicit_args,
-            &implicit_args,
-            &[EndpointArg::Value(ValueArg::Array(vec![
-                Felt::ZERO.into(),
-                Felt::ZERO.into(),
-                Felt::ZERO.into(),
-            ]))],
-            HashMap::new(),
-            state_reader,
-        )
-        .unwrap();
+    let state_reader = None;
+    let (_, explicit_retdata, _) = initialize_and_run_cairo_0_entry_point(
+        &entrypoint_runner_config,
+        OS_PROGRAM_BYTES,
+        "starkware.starknet.core.os.data_availability.bls_field.horner_eval",
+        &explicit_args,
+        &implicit_args,
+        &[EndpointArg::Value(ValueArg::Array(vec![
+            Felt::ZERO.into(),
+            Felt::ZERO.into(),
+            Felt::ZERO.into(),
+        ]))],
+        HashMap::new(),
+        state_reader,
+    )
+    .unwrap();
 
-        // Get actual result.
+    // Get actual result.
+    assert_eq!(
+        explicit_retdata.len(),
+        1,
+        "Expected 1 explicit return value, got {}",
+        explicit_retdata.len()
+    );
+    let split_actual_result = if let EndpointArg::Value(ValueArg::Array(result_coefficients)) =
+        explicit_retdata.first().unwrap()
+    {
         assert_eq!(
-            explicit_retdata.len(),
-            1,
-            "Expected 1 explicit return value, got {}",
-            explicit_retdata.len()
+            result_coefficients.len(),
+            3,
+            "expected 3 coefficients in result, got {}",
+            result_coefficients.len()
         );
-        let split_actual_result = if let EndpointArg::Value(ValueArg::Array(result_coefficients)) =
+        result_coefficients
+    } else {
+        panic!(
+            "Unexpected result type. Expected `EndpointArg::Value(ValueArg::Array(_))`, got {:?}",
             explicit_retdata.first().unwrap()
-        {
-            assert_eq!(
-                result_coefficients.len(),
-                3,
-                "expected 3 coefficients in result, got {}",
-                result_coefficients.len()
-            );
-            result_coefficients
-        } else {
-            panic!(
-                "Unexpected result type. Expected `EndpointArg::Value(ValueArg::Array(_))`, got \
-                 {:?}",
-                explicit_retdata.first().unwrap()
-            );
-        };
-        let actual_result =
-            (BigUint::from_bytes_be(&split_actual_result[0].get_int().unwrap().to_bytes_be())
-                + BigUint::from_bytes_be(&split_actual_result[1].get_int().unwrap().to_bytes_be())
-                    * BASE.to_biguint().unwrap()
-                + BigUint::from_bytes_be(&split_actual_result[2].get_int().unwrap().to_bytes_be())
-                    * BASE.to_biguint().unwrap().pow(2))
-            .mod_floor(&BLS_PRIME.clone());
-
-        // Calculate expected result.
-        let expected_result =
-            coefficients.iter().enumerate().fold(BigUint::ZERO, |acc, (i, coefficient)| {
-                acc + BigUint::from_bytes_be(&coefficient.to_bytes_be())
-                    * point.to_biguint().unwrap().modpow(&BigUint::from(i), &BLS_PRIME.clone())
-            }) % BLS_PRIME.clone();
-
-        assert_eq!(
-            actual_result, expected_result,
-            "expected result does not match actual result. Actual result: {actual_result}, \
-             Expected result: {expected_result}"
         );
-    }
+    };
+    let actual_result =
+        (BigUint::from_bytes_be(&split_actual_result[0].get_int().unwrap().to_bytes_be())
+            + BigUint::from_bytes_be(&split_actual_result[1].get_int().unwrap().to_bytes_be())
+                * BASE.to_biguint().unwrap()
+            + BigUint::from_bytes_be(&split_actual_result[2].get_int().unwrap().to_bytes_be())
+                * BASE.to_biguint().unwrap().pow(2))
+        .mod_floor(&BLS_PRIME.clone());
+
+    // Calculate expected result.
+    let expected_result =
+        coefficients.iter().enumerate().fold(BigUint::ZERO, |acc, (i, coefficient)| {
+            acc + BigUint::from_bytes_be(&coefficient.to_bytes_be())
+                * point.to_biguint().unwrap().modpow(&BigUint::from(i), &BLS_PRIME.clone())
+        }) % BLS_PRIME.clone();
+
+    assert_eq!(
+        actual_result, expected_result,
+        "expected result does not match actual result. Actual result: {actual_result}, Expected \
+         result: {expected_result}"
+    );
 }
 
 #[test]
@@ -229,19 +228,17 @@ fn test_reduced_mul_random() {
     run_reduced_mul_test(&a_split, &b_split)
 }
 
-#[test]
-fn test_reduced_mul_parameterized() {
-    let max_value = Felt::from(REDUCED_MUL_LIMB_BOUND - 1);
-    let min_value = Felt::from(-REDUCED_MUL_LIMB_BOUND + 1);
-    let values: [([Felt; 3], [Felt; 3]); 4] = [
-        (array::from_fn(|_| max_value), array::from_fn(|_| max_value)),
-        (array::from_fn(|_| min_value), array::from_fn(|_| min_value)),
-        ([-Felt::ONE, Felt::ZERO, Felt::ZERO], [Felt::ONE, Felt::ZERO, Felt::ZERO]),
-        ([Felt::ONE, Felt::from(2), Felt::from(3)], [Felt::ZERO, Felt::ZERO, Felt::ZERO]),
-    ];
-    for (a_split, b_split) in values {
-        run_reduced_mul_test(&a_split, &b_split);
-    }
+#[rstest]
+#[case::max(array::from_fn(|_| *MAX_VALUE), array::from_fn(|_| *MAX_VALUE))]
+#[case::min(array::from_fn(|_| *MIN_VALUE), array::from_fn(|_| *MIN_VALUE))]
+#[case::negative_and_positive(
+    [-Felt::ONE, Felt::ZERO, Felt::ZERO], [Felt::ONE, Felt::ZERO, Felt::ZERO]
+)]
+#[case::sequence_and_zero(
+    [Felt::ONE, Felt::from(2), Felt::from(3)], [Felt::ZERO, Felt::ZERO, Felt::ZERO]
+)]
+fn test_reduced_mul_parameterized(#[case] a_split: [Felt; 3], #[case] b_split: [Felt; 3]) {
+    run_reduced_mul_test(&a_split, &b_split);
 }
 
 #[test]

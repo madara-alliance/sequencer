@@ -61,6 +61,12 @@ async fn main() {
         .send_txs_and_verify(N_INVOKE_TXS, N_L1_HANDLER_TXS, BLOCK_TO_REVERT_FROM)
         .await;
 
+    // This method is called twice in the test, once before and once after the revert.
+    // The first call is mainly to verify block hashes were written to storage before the revert.
+    integration_test_manager
+        .verify_block_hash_across_all_running_nodes(Some(BLOCK_TO_REVERT_FROM.unchecked_next()))
+        .await;
+
     info!("Shutting down nodes.");
     integration_test_manager.shutdown_nodes(node_indices.clone());
 
@@ -116,6 +122,12 @@ async fn main() {
         .send_txs_and_verify(N_INVOKE_TXS, N_L1_HANDLER_TXS, BLOCK_TO_WAIT_FOR_AFTER_REVERT)
         .await;
 
+    integration_test_manager
+        .verify_block_hash_across_all_running_nodes(Some(
+            BLOCK_TO_WAIT_FOR_AFTER_REVERT.unchecked_next(),
+        ))
+        .await;
+
     integration_test_manager.shutdown_nodes(node_indices);
 
     info!("Revert flow integration test completed successfully!");
@@ -162,14 +174,20 @@ fn modify_revert_config(
     revert_up_to_and_including: Option<BlockNumber>,
 ) {
     let should_revert = revert_up_to_and_including.is_some();
-    config.state_sync_config.as_mut().unwrap().revert_config.should_revert = should_revert;
+    config.state_sync_config.as_mut().unwrap().static_config.revert_config.should_revert =
+        should_revert;
     config.consensus_manager_config.as_mut().unwrap().revert_config.should_revert = should_revert;
 
     // If should revert is false, the revert_up_to_and_including value is irrelevant.
     if should_revert {
         let revert_up_to_and_including = revert_up_to_and_including.unwrap();
-        config.state_sync_config.as_mut().unwrap().revert_config.revert_up_to_and_including =
-            revert_up_to_and_including;
+        config
+            .state_sync_config
+            .as_mut()
+            .unwrap()
+            .static_config
+            .revert_config
+            .revert_up_to_and_including = revert_up_to_and_including;
         config
             .consensus_manager_config
             .as_mut()

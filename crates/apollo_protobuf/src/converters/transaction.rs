@@ -637,9 +637,12 @@ impl TryFrom<protobuf::InvokeV3> for InvokeTransactionV3 {
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
-        let proof_facts = ProofFacts(
-            value.proof_facts.into_iter().map(Felt::try_from).collect::<Result<Vec<_>, _>>()?,
-        );
+        let proof_facts: ProofFacts = value
+            .proof_facts
+            .into_iter()
+            .map(Felt::try_from)
+            .collect::<Result<Vec<_>, _>>()?
+            .into();
 
         Ok(Self {
             resource_bounds,
@@ -692,8 +695,6 @@ impl From<InvokeTransactionV3> for protobuf::InvokeV3 {
                 .iter()
                 .map(|proof_fact| (*proof_fact).into())
                 .collect(),
-            // TODO(AvivG): Understand in what flow this is used. Is info lost?
-            proof: vec![],
         }
     }
 }

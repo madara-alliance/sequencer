@@ -5,9 +5,9 @@ use num_enum::IntoPrimitive;
 use serde::Serialize;
 use socket2::{Domain, Socket, Type};
 use strum::EnumCount;
-use tracing::{info, instrument};
+use tracing::instrument;
 
-const PORTS_PER_INSTANCE: u16 = 60;
+const PORTS_PER_INSTANCE: u16 = 80;
 pub const MAX_NUMBER_OF_INSTANCES_PER_TEST: u16 = 28;
 #[allow(clippy::as_conversions)]
 const MAX_NUMBER_OF_TESTS: u16 = TestIdentifier::COUNT as u16;
@@ -38,9 +38,16 @@ pub enum TestIdentifier {
     RestartServiceMultipleNodesFlowIntegrationTest,
     RestartServiceSingleNodeFlowIntegrationTest,
     RevertFlowIntegrationTest,
-    SystemTestDumpSingleNodeConfig,
     HttpServerUnitTests,
     SyncFlowIntegrationTest,
+    StorageReaderServerUnitTests,
+    StorageReaderTypesUnitTests,
+    L1EventsScraperEndToEndTest,
+    MockedStarknetStateUpdateTest,
+    LatestProvedBlockEthereumTest,
+    EventsFromOtherContractsTest,
+    L1ProviderUnitTests,
+    AnvilStartsWithNoContractTest,
 }
 
 #[derive(Debug)]
@@ -77,12 +84,12 @@ impl AvailablePorts {
             self.current_port += 1;
 
             if is_port_in_use(port) {
-                info!(
-                    "Skipping occupied port: {} in range [{},{}]",
-                    port, self.start_port, self.max_port
+                println!(
+                    "Skipping occupied port: {port} in range [{},{}]",
+                    self.start_port, self.max_port
                 );
             } else {
-                info!("Allocated port: {} in range [{},{}]", port, self.start_port, self.max_port);
+                println!("Allocated port: {port} in range [{},{}]", self.start_port, self.max_port);
                 return port;
             }
         }

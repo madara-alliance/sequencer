@@ -15,8 +15,7 @@ use blockifier::metrics::{
     TOTAL_CALLS,
 };
 use starknet_api::block::BlockNumber;
-use strum::{EnumVariantNames, VariantNames};
-use strum_macros::IntoStaticStr;
+use strum::{IntoStaticStr, VariantNames};
 
 define_infra_metrics!(batcher);
 
@@ -26,7 +25,8 @@ define_metrics!(
         MetricCounter { CLASS_CACHE_MISSES, "batcher_class_cache_misses", "Counter of the batcher's global class cache misses", init=0 },
         MetricCounter { CLASS_CACHE_HITS, "batcher_class_cache_hits", "Counter of the batcher's global class cache hits", init=0 },
         // Heights
-        MetricGauge { STORAGE_HEIGHT, "batcher_storage_height", "The height of the batcher's storage" },
+        MetricGauge { BUILDING_HEIGHT, "batcher_building_height", "The height of the block that should be built next. The height of the state diff marker as stored in the batcher's storage." },
+        MetricGauge { GLOBAL_ROOT_HEIGHT, "batcher_global_root_height", "The height of the first block without global root stored." },
         MetricGauge { LAST_BATCHED_BLOCK_HEIGHT, "batcher_last_batched_block_height", "The height of the last block received by batching" },
         MetricGauge { LAST_SYNCED_BLOCK_HEIGHT, "batcher_last_synced_block_height", "The height of the last block received by syncing" },
         MetricGauge { LAST_PROPOSED_BLOCK_HEIGHT, "batcher_last_proposed_block_height", "The height of the last block proposed by this sequencer" },
@@ -51,14 +51,32 @@ define_metrics!(
         // Block close reason
         LabeledMetricCounter { BLOCK_CLOSE_REASON, "batcher_block_close_reason", "Number of blocks closed by reason", init = 0 , labels = BLOCK_CLOSE_REASON_LABELS},
         // Block weights
+        // TODO(MatanL): Consider using histogram for these metrics.
         MetricGauge { SIERRA_GAS_IN_LAST_BLOCK, "batcher_sierra_gas_in_last_block", "The sierra gas in the last block"},
         MetricGauge { PROVING_GAS_IN_LAST_BLOCK, "batcher_proving_gas_in_last_block", "The proving gas in the last block"},
+        MetricGauge { L2_GAS_IN_LAST_BLOCK, "batcher_l2_gas_in_last_block", "The L2 gas used in the last block"},
+        // Commitment manager
+        MetricCounter { COMMITMENT_MANAGER_COMMIT_BLOCK_LATENCY, "batcher_commitment_manager_commit_block_latency", "Total latency of commit tasks in the commitment manager in milliseconds (cumulative)", init=0 },
+        MetricCounter { COMMITMENT_MANAGER_COMMIT_BLOCK_COUNT, "batcher_commitment_manager_commit_block_count", "Number of commit tasks in the commitment manager", init=0 },
+        MetricCounter { COMMITMENT_MANAGER_REVERT_BLOCK_LATENCY, "batcher_commitment_manager_revert_block_latency", "Total latency of revert tasks in the commitment manager in milliseconds (cumulative)", init=0 },
+        MetricCounter { COMMITMENT_MANAGER_REVERT_BLOCK_COUNT, "batcher_commitment_manager_revert_block_count", "Number of revert tasks in the commitment manager", init=0 },
+        MetricCounter { COMMITMENT_MANAGER_NUM_COMMIT_RESULTS, "batcher_commitment_manager_num_commit_results", "The number of commit results received from the commitment manager (cumulative)", init=0 },
+        // Block commitment components computation timings
+        MetricCounter { TX_COMMITMENT_LATENCY, "batcher_tx_commitment_latency", "Total duration of transaction commitment computation in microseconds (cumulative)", init=0 },
+        MetricCounter { TX_COMMITMENT_COUNT, "batcher_tx_commitment_count", "The number of transactions commitment computations (cumulative)", init = 0 },
+        MetricCounter { EVENT_COMMITMENT_LATENCY, "batcher_event_commitment_latency", "Total duration of event commitment computation in microseconds (cumulative)", init=0 },
+        MetricCounter { EVENT_COMMITMENT_COUNT, "batcher_event_commitment_count", "The number of event commitment computations (cumulative)", init = 0 },
+        MetricCounter { RECEIPT_COMMITMENT_LATENCY, "batcher_receipt_commitment_latency", "Total duration of receipt commitment computation in microseconds (cumulative)", init=0 },
+        MetricCounter { STATE_DIFF_COMMITMENT_LATENCY, "batcher_state_diff_commitment_latency", "Total duration of state diff commitment computation in microseconds (cumulative)", init=0 },
+        MetricCounter { STATE_DIFF_LENGTH, "batcher_state_diff_length", "The length of the state diff (cumaltive)", init = 0 },
+        // Number of blocks for which commitment measurements were recorded (in block_builder).
+        MetricCounter { BLOCK_COMMITMENT_MEASUREMENTS_COUNT, "batcher_block_commitment_measurements_count", "Number of blocks for which block commitment measurements were recorded (cumulative)", init=0 },
     },
 );
 
 pub const LABEL_NAME_BLOCK_CLOSE_REASON: &str = "block_close_reason";
 
-#[derive(Clone, Copy, Debug, IntoStaticStr, EnumVariantNames)]
+#[derive(Clone, Copy, Debug, IntoStaticStr, VariantNames)]
 #[strum(serialize_all = "snake_case")]
 pub enum BlockCloseReason {
     FullBlock,
@@ -80,9 +98,11 @@ pub(crate) fn record_block_close_reason(reason: BlockCloseReason) {
 pub const BATCHER_CLASS_CACHE_METRICS: CacheMetrics =
     CacheMetrics::new(CLASS_CACHE_MISSES, CLASS_CACHE_HITS);
 
-pub fn register_metrics(storage_height: BlockNumber) {
-    STORAGE_HEIGHT.register();
-    STORAGE_HEIGHT.set_lossy(storage_height.0);
+pub fn register_metrics(storage_height: BlockNumber, global_root_height: BlockNumber) {
+    BUILDING_HEIGHT.register();
+    BUILDING_HEIGHT.set_lossy(storage_height.0);
+    GLOBAL_ROOT_HEIGHT.register();
+    GLOBAL_ROOT_HEIGHT.set_lossy(global_root_height.0);
     LAST_BATCHED_BLOCK_HEIGHT.register();
     LAST_SYNCED_BLOCK_HEIGHT.register();
     LAST_PROPOSED_BLOCK_HEIGHT.register();
@@ -107,6 +127,22 @@ pub fn register_metrics(storage_height: BlockNumber) {
 
     SIERRA_GAS_IN_LAST_BLOCK.register();
     PROVING_GAS_IN_LAST_BLOCK.register();
+    L2_GAS_IN_LAST_BLOCK.register();
+
+    COMMITMENT_MANAGER_COMMIT_BLOCK_LATENCY.register();
+    COMMITMENT_MANAGER_COMMIT_BLOCK_COUNT.register();
+    COMMITMENT_MANAGER_REVERT_BLOCK_LATENCY.register();
+    COMMITMENT_MANAGER_REVERT_BLOCK_COUNT.register();
+    COMMITMENT_MANAGER_NUM_COMMIT_RESULTS.register();
+
+    TX_COMMITMENT_LATENCY.register();
+    TX_COMMITMENT_COUNT.register();
+    EVENT_COMMITMENT_LATENCY.register();
+    EVENT_COMMITMENT_COUNT.register();
+    RECEIPT_COMMITMENT_LATENCY.register();
+    STATE_DIFF_COMMITMENT_LATENCY.register();
+    STATE_DIFF_LENGTH.register();
+    BLOCK_COMMITMENT_MEASUREMENTS_COUNT.register();
 
     // Blockifier's metrics
     BATCHER_CLASS_CACHE_METRICS.register();

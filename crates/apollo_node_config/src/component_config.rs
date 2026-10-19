@@ -28,8 +28,6 @@ pub struct ComponentConfig {
     #[validate(nested)]
     pub gateway: ReactiveComponentExecutionConfig,
     #[validate(nested)]
-    pub l1_endpoint_monitor: ReactiveComponentExecutionConfig,
-    #[validate(nested)]
     pub l1_provider: ReactiveComponentExecutionConfig,
     #[validate(nested)]
     pub l1_gas_price_provider: ReactiveComponentExecutionConfig,
@@ -37,6 +35,8 @@ pub struct ComponentConfig {
     pub mempool: ReactiveComponentExecutionConfig,
     #[validate(nested)]
     pub mempool_p2p: ReactiveComponentExecutionConfig,
+    #[validate(nested)]
+    pub proof_manager: ReactiveComponentExecutionConfig,
     #[validate(nested)]
     pub sierra_compiler: ReactiveComponentExecutionConfig,
     #[validate(nested)]
@@ -67,7 +67,6 @@ impl SerializeConfig for ComponentConfig {
             prepend_sub_config_name(self.consensus_manager.dump(), "consensus_manager"),
             prepend_sub_config_name(self.gateway.dump(), "gateway"),
             prepend_sub_config_name(self.http_server.dump(), "http_server"),
-            prepend_sub_config_name(self.l1_endpoint_monitor.dump(), "l1_endpoint_monitor"),
             prepend_sub_config_name(self.l1_provider.dump(), "l1_provider"),
             prepend_sub_config_name(self.l1_gas_price_provider.dump(), "l1_gas_price_provider"),
             prepend_sub_config_name(self.l1_scraper.dump(), "l1_scraper"),
@@ -75,6 +74,7 @@ impl SerializeConfig for ComponentConfig {
             prepend_sub_config_name(self.mempool.dump(), "mempool"),
             prepend_sub_config_name(self.mempool_p2p.dump(), "mempool_p2p"),
             prepend_sub_config_name(self.monitoring_endpoint.dump(), "monitoring_endpoint"),
+            prepend_sub_config_name(self.proof_manager.dump(), "proof_manager"),
             prepend_sub_config_name(self.sierra_compiler.dump(), "sierra_compiler"),
             prepend_sub_config_name(self.signature_manager.dump(), "signature_manager"),
             prepend_sub_config_name(self.state_sync.dump(), "state_sync"),
@@ -94,7 +94,6 @@ impl ComponentConfig {
             consensus_manager: ActiveComponentExecutionConfig::disabled(),
             http_server: ActiveComponentExecutionConfig::disabled(),
             gateway: ReactiveComponentExecutionConfig::disabled(),
-            l1_endpoint_monitor: ReactiveComponentExecutionConfig::disabled(),
             l1_provider: ReactiveComponentExecutionConfig::disabled(),
             l1_gas_price_provider: ReactiveComponentExecutionConfig::disabled(),
             l1_scraper: ActiveComponentExecutionConfig::disabled(),
@@ -102,6 +101,7 @@ impl ComponentConfig {
             mempool: ReactiveComponentExecutionConfig::disabled(),
             mempool_p2p: ReactiveComponentExecutionConfig::disabled(),
             monitoring_endpoint: ActiveComponentExecutionConfig::disabled(),
+            proof_manager: ReactiveComponentExecutionConfig::disabled(),
             sierra_compiler: ReactiveComponentExecutionConfig::disabled(),
             signature_manager: ReactiveComponentExecutionConfig::disabled(),
             state_sync: ReactiveComponentExecutionConfig::disabled(),
@@ -115,11 +115,11 @@ impl ComponentConfig {
         self.committer.set_url_to_localhost();
         self.config_manager.set_url_to_localhost();
         self.gateway.set_url_to_localhost();
-        self.l1_endpoint_monitor.set_url_to_localhost();
         self.l1_provider.set_url_to_localhost();
         self.l1_gas_price_provider.set_url_to_localhost();
         self.mempool.set_url_to_localhost();
         self.mempool_p2p.set_url_to_localhost();
+        self.proof_manager.set_url_to_localhost();
         self.sierra_compiler.set_url_to_localhost();
         self.signature_manager.set_url_to_localhost();
         self.state_sync.set_url_to_localhost();

@@ -5,8 +5,13 @@ use std::sync::Arc;
 use assert_matches::assert_matches;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::contracts::FeatureContract;
+use cairo_lang_starknet_classes::casm_contract_class::{
+    CasmContractEntryPoint,
+    CasmContractEntryPoints,
+};
 use cairo_lang_starknet_classes::NestedIntList;
 use cairo_lang_utils::bigint::BigUintAsHex;
+use num_bigint::BigUint;
 use rstest::rstest;
 use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
 use starknet_api::contract_class::ContractClass;
@@ -14,8 +19,11 @@ use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::Blake2Felt252;
 
 use crate::execution::contract_class::{
+    program_hints_to_casm_hints,
     CompiledClassV1,
     ContractClassV1Inner,
+    EntryPointV1,
+    EntryPointsByType,
     FeltSizeCount,
     NestedFeltCounts,
     RunnableCompiledClass,
@@ -138,6 +146,10 @@ fn test_create_bytecode_segment_felt_sizes(
 ) {
     let result = NestedFeltCounts::new(&bytecode_segment_lengths, &bytecode);
     assert_eq!(result, expected_structure);
+
+    // Verify round-trip: NestedFeltCounts -> NestedIntList returns original.
+    let round_tripped: NestedIntList = (&result).into();
+    assert_eq!(round_tripped, bytecode_segment_lengths);
 }
 
 #[rstest]
@@ -179,4 +191,78 @@ fn test_encoded_u32_len(#[case] test_data: &[Felt]) {
     let actual_u32_len = Blake2Felt252::encode_felts_to_u32s(test_data).len();
 
     assert_eq!(actual_u32_len, estimated_u32_len);
+}
+
+#[rstest]
+#[case::empty(CasmContractEntryPoints::default())]
+#[case::single_external(CasmContractEntryPoints {
+    external: vec![CasmContractEntryPoint {
+        selector: BigUint::from(123u64),
+        offset: 42,
+        builtins: vec!["range_check".to_string(), "pedersen".to_string()],
+    }],
+    l1_handler: vec![],
+    constructor: vec![],
+})]
+#[case::all_types(CasmContractEntryPoints {
+    external: vec![
+        CasmContractEntryPoint {
+            selector: BigUint::from(100u64),
+            offset: 10,
+            builtins: vec!["range_check".to_string()],
+        },
+        CasmContractEntryPoint {
+            selector: BigUint::from(200u64),
+            offset: 20,
+            builtins: vec![],
+        },
+    ],
+    l1_handler: vec![CasmContractEntryPoint {
+        selector: BigUint::from(300u64),
+        offset: 30,
+        builtins: vec!["pedersen".to_string()],
+    }],
+    constructor: vec![CasmContractEntryPoint {
+        selector: BigUint::from(400u64),
+        offset: 40,
+        builtins: vec!["range_check".to_string(), "bitwise".to_string()],
+    }],
+})]
+fn test_entry_points_round_trip(#[case] original: CasmContractEntryPoints) {
+    // Convert CasmContractEntryPoints -> EntryPointsByType<EntryPointV1>.
+    let entry_points_by_type: EntryPointsByType<EntryPointV1> = (&original).into();
+
+    // Convert back: EntryPointsByType<EntryPointV1> -> CasmContractEntryPoints.
+    let round_tripped: CasmContractEntryPoints = (&entry_points_by_type).into();
+
+    assert_eq!(round_tripped, original);
+}
+
+#[rstest]
+fn test_hints_round_trip() {
+    // Get a test contract that has hints.
+    let feature_contract =
+        FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
+    let (casm, sierra_version) = match feature_contract.get_class() {
+        ContractClass::V1(versioned_casm) => versioned_casm,
+        _ => panic!("Expected ContractClass::V1"),
+    };
+
+    // Panic if the contract has no hints - we need hints to test the roundtrip.
+    assert!(!casm.hints.is_empty(), "Test contract must have hints for roundtrip test");
+
+    // Get original hints from the CasmContractClass.
+    let original_hints = casm.hints.clone();
+
+    // Forward conversion: Convert CasmContractClass convert the hints from Vec<(usize, Vec<Hint>)>
+    // to HashMap<usize, Vec<HintParams>>.
+    let compiled_class = CompiledClassV1::try_from((casm, sierra_version)).unwrap();
+
+    // Reverse conversion: Access the hints from the VM program and convert back.
+    // The program stores hints as a HintsCollection, which can be converted to BTreeMap.
+    let program_hints = &compiled_class.program.shared_program_data.hints_collection;
+    let round_tripped_hints = program_hints_to_casm_hints(program_hints).unwrap();
+
+    // Compare with original.
+    assert_eq!(round_tripped_hints, original_hints);
 }

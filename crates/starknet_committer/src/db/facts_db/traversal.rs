@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use starknet_api::hash::HashOutput;
-use starknet_patricia::patricia_merkle_tree::filled_tree::node::FilledNode;
 use starknet_patricia::patricia_merkle_tree::node_data::inner_node::{
     NodeData,
     Preimage,
@@ -11,39 +10,15 @@ use starknet_patricia::patricia_merkle_tree::node_data::leaf::Leaf;
 use starknet_patricia::patricia_merkle_tree::traversal::{SubTreeTrait, TraversalResult};
 use starknet_patricia::patricia_merkle_tree::types::{NodeIndex, SortedLeafIndices};
 use starknet_patricia_storage::db_object::HasStaticPrefix;
-use starknet_patricia_storage::errors::StorageError;
-use starknet_patricia_storage::storage_trait::{create_db_key, DbKey, Storage};
+use starknet_patricia_storage::storage_trait::Storage;
 
 use crate::db::facts_db::types::FactsSubTree;
+use crate::db::facts_db::FactsNodeLayout;
+use crate::db::trie_traversal::get_roots_from_storage;
 
 #[cfg(test)]
 #[path = "traversal_test.rs"]
 pub mod traversal_test;
-
-// TODO(Aviv, 17/07/2024): Split between storage prefix implementation and function logic.
-pub async fn calculate_subtrees_roots<'a, L: Leaf>(
-    subtrees: &[FactsSubTree<'a>],
-    storage: &mut impl Storage,
-    key_context: &<L as HasStaticPrefix>::KeyContext,
-) -> TraversalResult<Vec<FilledNode<L>>> {
-    let mut subtrees_roots = vec![];
-    let db_keys: Vec<DbKey> = subtrees
-        .iter()
-        .map(|subtree| {
-            create_db_key(
-                subtree.get_root_prefix::<L>(key_context),
-                &subtree.root_hash.0.to_bytes_be(),
-            )
-        })
-        .collect();
-
-    let db_vals = storage.mget(&db_keys.iter().collect::<Vec<&DbKey>>()).await?;
-    for ((subtree, optional_val), db_key) in subtrees.iter().zip(db_vals.iter()).zip(db_keys) {
-        let Some(val) = optional_val else { Err(StorageError::MissingKey(db_key))? };
-        subtrees_roots.push(FilledNode::deserialize(subtree.root_hash, val, subtree.is_leaf())?)
-    }
-    Ok(subtrees_roots)
-}
 
 /// Returns the Patricia inner nodes ([PreimageMap]) in the paths to the given `leaf_indices` in the
 /// given tree according to the `root_hash`.
@@ -95,7 +70,8 @@ pub(crate) async fn fetch_patricia_paths_inner<'a, L: Leaf>(
     let mut next_subtrees = Vec::new();
     while !current_subtrees.is_empty() {
         let filled_roots =
-            calculate_subtrees_roots::<L>(&current_subtrees, storage, key_context).await?;
+            get_roots_from_storage::<L, FactsNodeLayout>(&current_subtrees, storage, key_context)
+                .await?;
         for (filled_root, subtree) in filled_roots.into_iter().zip(current_subtrees.iter()) {
             match filled_root.data {
                 // Binary node.
@@ -107,7 +83,7 @@ pub(crate) async fn fetch_patricia_paths_inner<'a, L: Leaf>(
                 NodeData::Binary(binary_data) => {
                     witnesses.insert(subtree.root_hash, Preimage::Binary(binary_data.clone()));
                     let (left_subtree, right_subtree) = subtree
-                        .get_children_subtrees(binary_data.left_hash, binary_data.right_hash);
+                        .get_children_subtrees(binary_data.left_data, binary_data.right_data);
 
                     if !left_subtree.is_unmodified() {
                         next_subtrees.push(left_subtree);
@@ -125,7 +101,7 @@ pub(crate) async fn fetch_patricia_paths_inner<'a, L: Leaf>(
                     witnesses.insert(subtree.root_hash, Preimage::Edge(edge_data));
                     // Parse bottom.
                     let (bottom_subtree, empty_leaves_indices) = subtree
-                        .get_bottom_subtree(&edge_data.path_to_bottom, edge_data.bottom_hash);
+                        .get_bottom_subtree(&edge_data.path_to_bottom, edge_data.bottom_data);
                     if let Some(ref mut leaves_map) = leaves {
                         // Insert empty leaves descendent of the current subtree, that are not
                         // descendents of the bottom node.

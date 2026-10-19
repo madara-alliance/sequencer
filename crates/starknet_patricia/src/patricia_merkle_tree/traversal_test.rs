@@ -2,12 +2,12 @@ use ethnum::U256;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 use starknet_patricia_storage::db_object::HasStaticPrefix;
-use starknet_patricia_storage::storage_trait::DbKeyPrefix;
+use starknet_patricia_storage::storage_trait::DbKey;
 
 use crate::patricia_merkle_tree::external_test_utils::small_tree_index_to_full;
 use crate::patricia_merkle_tree::node_data::inner_node::{EdgePath, EdgePathLength, PathToBottom};
 use crate::patricia_merkle_tree::node_data::leaf::Leaf;
-use crate::patricia_merkle_tree::traversal::SubTreeTrait;
+use crate::patricia_merkle_tree::traversal::{SubTreeTrait, UnmodifiedChildTraversal};
 use crate::patricia_merkle_tree::types::{NodeIndex, SortedLeafIndices, SubTreeHeight};
 
 /// Test implementation for [SubTreeTrait]. It should only be used for child creation purposes,
@@ -20,6 +20,7 @@ struct TestSubTree<'a> {
 
 impl<'a> SubTreeTrait<'a> for TestSubTree<'a> {
     type NodeData = ();
+    type NodeDeserializeContext = ();
 
     fn create(
         sorted_leaf_indices: SortedLeafIndices<'a>,
@@ -37,16 +38,14 @@ impl<'a> SubTreeTrait<'a> for TestSubTree<'a> {
         &self.sorted_leaf_indices
     }
 
-    fn should_traverse_unmodified_children() -> bool {
-        false
+    fn should_traverse_unmodified_child(_child_data: Self::NodeData) -> UnmodifiedChildTraversal {
+        UnmodifiedChildTraversal::Traverse
     }
 
-    fn get_root_prefix<L: Leaf>(
-        &self,
-        _key_context: &<L as HasStaticPrefix>::KeyContext,
-    ) -> DbKeyPrefix {
-        // Dummy prefix for testing purposes (we only need a prefix when interacting with storage).
-        DbKeyPrefix::new(&[0])
+    fn get_root_context(&self) -> Self::NodeDeserializeContext {}
+
+    fn get_root_db_key<L: Leaf>(&self, _key_context: &<L as HasStaticPrefix>::KeyContext) -> DbKey {
+        DbKey(vec![])
     }
 }
 

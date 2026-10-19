@@ -1,11 +1,14 @@
 use std::future::ready;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use apollo_batcher_types::batcher_types::{
+    FinishedProposalInfo,
+    FinishedProposalInfoWithoutParent,
     GetProposalContent,
     GetProposalContentResponse,
     ProposalCommitment,
+    ProposalId,
     ProposalStatus,
     ProposeBlockInput,
     SendProposalContent,
@@ -13,14 +16,15 @@ use apollo_batcher_types::batcher_types::{
     SendProposalContentResponse,
     ValidateBlockInput,
 };
-use apollo_batcher_types::communication::MockBatcherClient;
-use apollo_class_manager_types::transaction_converter::{
-    MockTransactionConverterTrait,
-    TransactionConverter,
-    TransactionConverterTrait,
-};
+use apollo_batcher_types::communication::{BatcherClientError, MockBatcherClient};
+use apollo_batcher_types::errors::BatcherError;
 use apollo_class_manager_types::EmptyClassManagerClient;
-use apollo_consensus_orchestrator_config::config::ContextConfig;
+use apollo_consensus::types::Round;
+use apollo_consensus_orchestrator_config::config::{
+    ContextConfig,
+    ContextStaticConfig,
+    PricePerHeight,
+};
 use apollo_l1_gas_price_types::{MockL1GasPriceProviderClient, PriceInfo};
 use apollo_network::network_manager::test_utils::{
     mock_register_broadcast_topic,
@@ -28,59 +32,88 @@ use apollo_network::network_manager::test_utils::{
     TestSubscriberChannels,
 };
 use apollo_network::network_manager::{BroadcastTopicChannels, BroadcastTopicClient};
-use apollo_protobuf::consensus::{ConsensusBlockInfo, HeightAndRound, ProposalPart, Vote};
+use apollo_proof_manager_types::MockProofManagerClient;
+use apollo_protobuf::consensus::{
+    BuildParam,
+    HeightAndRound,
+    ProposalCommitment as ProtoProposalCommitment,
+    ProposalFin,
+    ProposalInit,
+    ProposalPart,
+    TransactionBatch,
+    Vote,
+};
 use apollo_state_sync_types::communication::MockStateSyncClient;
-use apollo_time::time::{Clock, DefaultClock};
+use apollo_time::time::{Clock, DateTime, DefaultClock};
+use apollo_transaction_converter::{
+    MockTransactionConverterTrait,
+    TransactionConverter,
+    TransactionConverterTrait,
+};
 use futures::channel::mpsc;
 use futures::executor::block_on;
+use futures::SinkExt;
+use mockall::Sequence;
 use starknet_api::block::{
     BlockNumber,
     GasPrice,
     TEMP_ETH_BLOB_GAS_FEE_IN_WEI,
     TEMP_ETH_GAS_FEE_IN_WEI,
 };
+use starknet_api::block_hash::block_hash_calculator::{BlockHeaderCommitments, PartialBlockHash};
 use starknet_api::consensus_transaction::{ConsensusTransaction, InternalConsensusTransaction};
-use starknet_api::core::{ChainId, Nonce, StateDiffCommitment};
+use starknet_api::core::{ChainId, ContractAddress, Nonce};
 use starknet_api::data_availability::L1DataAvailabilityMode;
+use starknet_api::execution_resources::GasAmount;
 use starknet_api::felt;
-use starknet_api::hash::PoseidonHash;
+use starknet_api::hash::StarkHash;
 use starknet_api::test_utils::invoke::{rpc_invoke_tx, InvokeTxArgs};
 use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
-use starknet_types_core::felt::Felt;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
+use crate::build_proposal::ProposalBuildArguments;
 use crate::cende::MockCendeContext;
 use crate::orchestrator_versioned_constants::VersionedConstants;
 use crate::sequencer_consensus_context::{
+    BuiltProposals,
     SequencerConsensusContext,
     SequencerConsensusContextDeps,
 };
+use crate::utils::{make_gas_price_params, GasPriceParams, PreviousBlockInfo, StreamSender};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_millis(1200);
 pub(crate) const CHANNEL_SIZE: usize = 5000;
-pub(crate) const NUM_VALIDATORS: u64 = 4;
-pub(crate) const STATE_DIFF_COMMITMENT: StateDiffCommitment =
-    StateDiffCommitment(PoseidonHash(Felt::ZERO));
+pub(crate) const PARTIAL_BLOCK_HASH: PartialBlockHash = PartialBlockHash(StarkHash::ZERO);
 pub(crate) const CHAIN_ID: ChainId = ChainId::Mainnet;
 
-// In order for gas price in ETH to be greather than 0 (required) we must have large enough
+// In order for gas price in ETH to be greater than 0 (required) we must have large enough
 // values here.
-pub(crate) const ETH_TO_FRI_RATE: u128 = u128::pow(10, 18);
+pub(crate) const ETH_TO_FRI_RATE: u128 = 2 * u128::pow(10, 18);
 
 pub(crate) static TX_BATCH: LazyLock<Vec<ConsensusTransaction>> =
     LazyLock::new(|| (0..3).map(generate_invoke_tx).collect());
 
+// TODO(Einat): Add client side proving transactions.
 pub(crate) static INTERNAL_TX_BATCH: LazyLock<Vec<InternalConsensusTransaction>> =
     LazyLock::new(|| {
         // TODO(shahak): Use MockTransactionConverter instead.
         static TRANSACTION_CONVERTER: LazyLock<TransactionConverter> = LazyLock::new(|| {
-            TransactionConverter::new(Arc::new(EmptyClassManagerClient), CHAIN_ID)
+            TransactionConverter::new(
+                Arc::new(EmptyClassManagerClient),
+                Arc::new(MockProofManagerClient::new()),
+                CHAIN_ID,
+            )
         });
         TX_BATCH
             .iter()
             .cloned()
             .map(|tx| {
-                block_on(TRANSACTION_CONVERTER.convert_consensus_tx_to_internal_consensus_tx(tx))
-                    .unwrap()
+                let (internal_tx, _) = block_on(
+                    TRANSACTION_CONVERTER.convert_consensus_tx_to_internal_consensus_tx(tx),
+                )
+                .unwrap();
+                internal_tx
             })
             .collect()
     });
@@ -107,6 +140,27 @@ impl From<TestDeps> for SequencerConsensusContextDeps {
             clock: deps.clock,
             outbound_proposal_sender: deps.outbound_proposal_sender,
             vote_broadcast_client: deps.vote_broadcast_client,
+            config_manager_client: None,
+        }
+    }
+}
+
+pub struct SetupDepsArgs {
+    pub start_block_number: BlockNumber,
+    pub n_executed_txs_count: usize,
+    pub number_of_times: usize,
+    pub expect_start_height: bool,
+    pub l2_gas_used: Option<GasAmount>,
+}
+
+impl Default for SetupDepsArgs {
+    fn default() -> Self {
+        Self {
+            start_block_number: BlockNumber(0),
+            n_executed_txs_count: INTERNAL_TX_BATCH.len(),
+            number_of_times: 1,
+            expect_start_height: true,
+            l2_gas_used: None,
         }
     }
 }
@@ -118,89 +172,132 @@ impl TestDeps {
         self.setup_default_gas_price_provider();
     }
 
-    pub(crate) fn setup_deps_for_build(
-        &mut self,
-        block_number: BlockNumber,
-        final_n_executed_txs: usize,
-        number_of_times: usize,
-    ) {
-        assert!(final_n_executed_txs <= INTERNAL_TX_BATCH.len());
+    pub(crate) fn setup_deps_for_build(&mut self, args: SetupDepsArgs) {
+        assert!(args.n_executed_txs_count <= INTERNAL_TX_BATCH.len());
+        let mut block_number = args.start_block_number;
         self.setup_default_expectations();
         let proposal_id = Arc::new(OnceLock::new());
-        let proposal_id_clone = Arc::clone(&proposal_id);
-        self.batcher.expect_propose_block().times(number_of_times).returning(
-            move |input: ProposeBlockInput| {
-                proposal_id_clone.set(input.proposal_id).unwrap();
-                Ok(())
-            },
-        );
-        self.batcher
-            .expect_start_height()
-            .times(1)
-            .withf(move |input| input.height == block_number)
-            .return_const(Ok(()));
-        let proposal_id_clone = Arc::clone(&proposal_id);
-        self.batcher.expect_get_proposal_content().times(number_of_times).returning(move |input| {
-            assert_eq!(input.proposal_id, *proposal_id_clone.get().unwrap());
-            Ok(GetProposalContentResponse {
-                content: GetProposalContent::Txs(INTERNAL_TX_BATCH.clone()),
-            })
-        });
-        let proposal_id_clone = Arc::clone(&proposal_id);
-        self.batcher.expect_get_proposal_content().times(number_of_times).returning(move |input| {
-            assert_eq!(input.proposal_id, *proposal_id_clone.get().unwrap());
-            Ok(GetProposalContentResponse {
-                content: GetProposalContent::Finished {
-                    id: ProposalCommitment { state_diff_commitment: STATE_DIFF_COMMITMENT },
-                    final_n_executed_txs,
+        let mut seq = Sequence::new();
+
+        for _ in 0..args.number_of_times {
+            let proposal_id_clone = Arc::clone(&proposal_id);
+            if args.expect_start_height {
+                self.batcher
+                    .expect_start_height()
+                    .times(1)
+                    .in_sequence(&mut seq)
+                    .withf(move |input| input.height == block_number)
+                    .return_const(Ok(()));
+            }
+            self.batcher.expect_propose_block().times(1).in_sequence(&mut seq).returning(
+                move |input: ProposeBlockInput| {
+                    proposal_id_clone.set(input.proposal_id).unwrap();
+                    Ok(())
                 },
-            })
-        });
+            );
+            let proposal_id_clone = Arc::clone(&proposal_id);
+            self.batcher
+                .expect_get_proposal_content()
+                .times(1)
+                .in_sequence(&mut seq)
+                .withf(move |input| input.proposal_id == *proposal_id_clone.get().unwrap())
+                .returning(move |_input| {
+                    Ok(GetProposalContentResponse {
+                        content: GetProposalContent::Txs(INTERNAL_TX_BATCH.clone()),
+                    })
+                });
+            let proposal_id_clone = Arc::clone(&proposal_id);
+            self.batcher
+                .expect_get_proposal_content()
+                .times(1)
+                .in_sequence(&mut seq)
+                .withf(move |input| input.proposal_id == *proposal_id_clone.get().unwrap())
+                .returning(move |_input| {
+                    Ok(GetProposalContentResponse {
+                        content: GetProposalContent::Finished(FinishedProposalInfo {
+                            artifact: FinishedProposalInfoWithoutParent {
+                                proposal_commitment: ProposalCommitment {
+                                    partial_block_hash: PARTIAL_BLOCK_HASH,
+                                },
+                                final_n_executed_txs: args.n_executed_txs_count,
+                                block_header_commitments: BlockHeaderCommitments::default(),
+                                l2_gas_used: args.l2_gas_used.unwrap_or_default(),
+                            },
+                            parent_proposal_commitment: None,
+                        }),
+                    })
+                });
+            block_number = block_number.unchecked_next();
+        }
+        self.setup_default_batcher_get_block_hash();
     }
 
-    pub(crate) fn setup_deps_for_validate(
-        &mut self,
-        block_number: BlockNumber,
-        final_n_executed_txs: usize,
-        number_of_times: usize,
-    ) {
-        assert!(final_n_executed_txs <= INTERNAL_TX_BATCH.len());
+    pub(crate) fn setup_deps_for_validate(&mut self, args: SetupDepsArgs) {
+        let mut block_number = args.start_block_number;
+        assert!(args.n_executed_txs_count <= INTERNAL_TX_BATCH.len());
         self.setup_default_expectations();
-        let proposal_id = Arc::new(OnceLock::new());
-        let proposal_id_clone = Arc::clone(&proposal_id);
-        self.batcher.expect_validate_block().times(number_of_times).returning(
-            move |input: ValidateBlockInput| {
-                proposal_id_clone.set(input.proposal_id).unwrap();
-                Ok(())
-            },
-        );
-        self.batcher
-            .expect_start_height()
-            .withf(move |input| input.height == block_number)
-            .return_const(Ok(()));
-        let proposal_id_clone = Arc::clone(&proposal_id);
-        self.batcher.expect_send_proposal_content().times(number_of_times).returning(
-            move |input: SendProposalContentInput| {
-                assert_eq!(input.proposal_id, *proposal_id_clone.get().unwrap());
-                let SendProposalContent::Txs(txs) = input.content else {
-                    panic!("Expected SendProposalContent::Txs, got {:?}", input.content);
-                };
-                assert_eq!(txs, *INTERNAL_TX_BATCH);
-                Ok(SendProposalContentResponse { response: ProposalStatus::Processing })
-            },
-        );
-        let proposal_id_clone = Arc::clone(&proposal_id);
-        self.batcher.expect_send_proposal_content().times(number_of_times).returning(
-            move |input: SendProposalContentInput| {
-                assert_eq!(input.proposal_id, *proposal_id_clone.get().unwrap());
-                assert_eq!(input.content, SendProposalContent::Finish(final_n_executed_txs));
-                Ok(SendProposalContentResponse {
-                    response: ProposalStatus::Finished(ProposalCommitment {
-                        state_diff_commitment: STATE_DIFF_COMMITMENT,
-                    }),
-                })
-            },
-        );
+        let mut seq = Sequence::new();
+        for _ in 0..args.number_of_times {
+            let proposal_id = Arc::new(OnceLock::new());
+            if args.expect_start_height {
+                self.batcher
+                    .expect_start_height()
+                    .times(1)
+                    .in_sequence(&mut seq)
+                    .withf(move |input| input.height == block_number)
+                    .return_const(Ok(()));
+            }
+
+            let proposal_id_clone = Arc::clone(&proposal_id);
+            self.batcher.expect_validate_block().times(1).in_sequence(&mut seq).returning(
+                move |input: ValidateBlockInput| {
+                    proposal_id_clone.set(input.proposal_id).unwrap();
+                    Ok(())
+                },
+            );
+
+            let proposal_id_clone = Arc::clone(&proposal_id);
+            self.batcher
+                .expect_send_proposal_content()
+                .times(1)
+                .in_sequence(&mut seq)
+                .withf(move |input| input.proposal_id == *proposal_id_clone.get().unwrap())
+                .returning(move |input: SendProposalContentInput| {
+                    let SendProposalContent::Txs(txs) = input.content else {
+                        panic!("Expected SendProposalContent::Txs, got {:?}", input.content);
+                    };
+                    assert_eq!(txs, INTERNAL_TX_BATCH.clone());
+                    Ok(SendProposalContentResponse { response: ProposalStatus::Processing })
+                });
+            let proposal_id_clone = Arc::clone(&proposal_id);
+
+            self.batcher
+                .expect_send_proposal_content()
+                .times(1)
+                .in_sequence(&mut seq)
+                .withf(move |input| input.proposal_id == *proposal_id_clone.get().unwrap())
+                .returning(move |input: SendProposalContentInput| {
+                    assert_eq!(
+                        input.content,
+                        SendProposalContent::Finish(args.n_executed_txs_count)
+                    );
+                    Ok(SendProposalContentResponse {
+                        response: ProposalStatus::Finished(FinishedProposalInfo {
+                            artifact: FinishedProposalInfoWithoutParent {
+                                proposal_commitment: ProposalCommitment {
+                                    partial_block_hash: PARTIAL_BLOCK_HASH,
+                                },
+                                final_n_executed_txs: args.n_executed_txs_count,
+                                block_header_commitments: BlockHeaderCommitments::default(),
+                                l2_gas_used: GasAmount::default(),
+                            },
+                            parent_proposal_commitment: None,
+                        }),
+                    })
+                });
+            block_number = block_number.unchecked_next();
+        }
+        self.setup_default_batcher_get_block_hash();
     }
 
     pub(crate) fn setup_default_transaction_converter(&mut self) {
@@ -212,7 +309,8 @@ impl TestDeps {
             self.transaction_converter
                 .expect_convert_consensus_tx_to_internal_consensus_tx()
                 .withf(move |internal_tx| internal_tx == tx)
-                .returning(|_| Ok(internal_tx.clone()));
+                // TODO(Einat): Add verification handle when client-side proving is tested in the validate proposal test.
+                .returning(|_| Ok((internal_tx.clone(), None)));
         }
     }
 
@@ -230,12 +328,20 @@ impl TestDeps {
         self.l1_gas_price_provider.expect_get_eth_to_fri_rate().return_const(Ok(ETH_TO_FRI_RATE));
     }
 
+    pub(crate) fn setup_default_batcher_get_block_hash(&mut self) {
+        self.batcher.expect_get_block_hash().returning(|block_number| {
+            Err(BatcherClientError::BatcherError(BatcherError::BlockHashNotFound(block_number)))
+        });
+    }
+
     pub(crate) fn build_context(self) -> SequencerConsensusContext {
         SequencerConsensusContext::new(
             ContextConfig {
-                proposal_buffer_size: CHANNEL_SIZE,
-                num_validators: NUM_VALIDATORS,
-                chain_id: CHAIN_ID,
+                static_config: ContextStaticConfig {
+                    proposal_buffer_size: CHANNEL_SIZE,
+                    chain_id: CHAIN_ID,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             self.into(),
@@ -283,23 +389,167 @@ pub(crate) fn generate_invoke_tx(nonce: u8) -> ConsensusTransaction {
     }))
 }
 
-pub(crate) fn block_info(height: BlockNumber) -> ConsensusBlockInfo {
+pub(crate) fn proposal_init(height: BlockNumber, round: u32) -> ProposalInit {
     let context_config = ContextConfig::default();
-    ConsensusBlockInfo {
+    let l1_gas_price_wei =
+        GasPrice(TEMP_ETH_GAS_FEE_IN_WEI + context_config.dynamic_config.l1_gas_tip_wei);
+    let l1_data_gas_price_wei = GasPrice(
+        TEMP_ETH_BLOB_GAS_FEE_IN_WEI
+            * context_config.dynamic_config.l1_data_gas_price_multiplier_ppt
+            / 1000,
+    );
+    let l1_gas_price_fri =
+        l1_gas_price_wei.wei_to_fri(ETH_TO_FRI_RATE).expect("L1 gas price must be non-zero");
+    let l1_data_gas_price_fri = l1_data_gas_price_wei
+        .wei_to_fri(ETH_TO_FRI_RATE)
+        .expect("L1 data gas price must be non-zero");
+    ProposalInit {
         height,
+        round,
+        valid_round: None,
+        proposer: Default::default(),
         timestamp: chrono::Utc::now().timestamp().try_into().expect("Timestamp conversion failed"),
         builder: Default::default(),
         l1_da_mode: L1DataAvailabilityMode::Blob,
         l2_gas_price_fri: VersionedConstants::latest_constants().min_gas_price,
-        l1_gas_price_wei: GasPrice(TEMP_ETH_GAS_FEE_IN_WEI + context_config.l1_gas_tip_wei),
-        l1_data_gas_price_wei: GasPrice(
-            TEMP_ETH_BLOB_GAS_FEE_IN_WEI * context_config.l1_data_gas_price_multiplier_ppt / 1000,
-        ),
-        eth_to_fri_rate: ETH_TO_FRI_RATE,
+        l1_gas_price_fri,
+        l1_data_gas_price_fri,
+        l1_gas_price_wei,
+        l1_data_gas_price_wei,
+        starknet_version: starknet_api::block::StarknetVersion::LATEST,
+        version_constant_commitment: Default::default(),
     }
 }
+
+// Send the given block info, some txs, the number of txs, and the fin, returning the
+// content_receiver.
+pub(crate) async fn send_proposal_to_validator_context(
+    context: &mut SequencerConsensusContext,
+) -> mpsc::Receiver<ProposalPart> {
+    let (mut content_sender, content_receiver) =
+        mpsc::channel(context.get_config().static_config.proposal_buffer_size);
+    content_sender
+        .send(ProposalPart::Transactions(TransactionBatch { transactions: TX_BATCH.to_vec() }))
+        .await
+        .unwrap();
+    content_sender
+        .send(ProposalPart::Fin(ProposalFin {
+            proposal_commitment: ProtoProposalCommitment(PARTIAL_BLOCK_HASH.0),
+            executed_transaction_count: INTERNAL_TX_BATCH.len().try_into().unwrap(),
+            fin_payload: None,
+        }))
+        .await
+        .unwrap();
+    content_sender.close_channel();
+    content_receiver
+}
+
 // Structs which aren't utilized but should not be dropped.
 pub(crate) struct NetworkDependencies {
     _vote_network: BroadcastNetworkMock<Vote>,
     pub outbound_proposal_receiver: mpsc::Receiver<(HeightAndRound, mpsc::Receiver<ProposalPart>)>,
+}
+
+// TODO(Dafna): Remove this struct and use ProposalBuildArguments directly.
+pub(crate) struct TestProposalBuildArguments {
+    pub deps: TestDeps,
+    pub batcher_deadline: DateTime,
+    pub build_param: BuildParam,
+    pub l1_da_mode: L1DataAvailabilityMode,
+    pub stream_sender: StreamSender,
+    pub gas_price_params: GasPriceParams,
+    pub valid_proposals: Arc<Mutex<BuiltProposals>>,
+    pub proposal_id: ProposalId,
+    pub cende_write_success: AbortOnDropHandle<bool>,
+    pub l2_gas_price: GasPrice,
+    pub builder_address: ContractAddress,
+    pub cancel_token: CancellationToken,
+    pub previous_block_info: Option<PreviousBlockInfo>,
+    pub proposal_round: Round,
+    pub retrospective_block_hash_deadline: DateTime,
+    pub retrospective_block_hash_retry_interval_millis: Duration,
+    pub override_timestamp: bool,
+    pub override_l2_gas_price_fri: Option<u128>,
+    pub min_l2_gas_price_per_height: Vec<PricePerHeight>,
+    pub compare_retrospective_block_hash: bool,
+}
+
+impl From<TestProposalBuildArguments> for ProposalBuildArguments {
+    fn from(args: TestProposalBuildArguments) -> Self {
+        ProposalBuildArguments {
+            deps: args.deps.into(),
+            batcher_deadline: args.batcher_deadline,
+            build_param: args.build_param,
+            l1_da_mode: args.l1_da_mode,
+            stream_sender: args.stream_sender,
+            gas_price_params: args.gas_price_params,
+            valid_proposals: args.valid_proposals,
+            proposal_id: args.proposal_id,
+            cende_write_success: args.cende_write_success,
+            l2_gas_price: args.l2_gas_price,
+            builder_address: args.builder_address,
+            cancel_token: args.cancel_token,
+            previous_block_info: args.previous_block_info,
+            proposal_round: args.proposal_round,
+            retrospective_block_hash_deadline: args.retrospective_block_hash_deadline,
+            retrospective_block_hash_retry_interval_millis: args
+                .retrospective_block_hash_retry_interval_millis,
+            override_timestamp: args.override_timestamp,
+            override_l2_gas_price_fri: args.override_l2_gas_price_fri,
+            min_l2_gas_price_per_height: args.min_l2_gas_price_per_height,
+            compare_retrospective_block_hash: args.compare_retrospective_block_hash,
+        }
+    }
+}
+
+pub(crate) fn create_proposal_build_arguments()
+-> (TestProposalBuildArguments, mpsc::Receiver<ProposalPart>) {
+    let (mut deps, _) = create_test_and_network_deps();
+    deps.setup_default_expectations();
+    let time_now = deps.clock.now();
+    let batcher_deadline = time_now + TIMEOUT;
+    let retrospective_block_hash_deadline = time_now + TIMEOUT.mul_f32(0.1);
+    let retrospective_block_hash_retry_interval_millis = Duration::from_millis(25);
+    let build_param = BuildParam::default();
+    let l1_da_mode = L1DataAvailabilityMode::Calldata;
+    let (proposal_sender, proposal_receiver) = mpsc::channel::<ProposalPart>(CHANNEL_SIZE);
+    let stream_sender = StreamSender { proposal_sender };
+    let context_config = ContextConfig::default();
+
+    let gas_price_params = make_gas_price_params(&context_config.dynamic_config);
+    let valid_proposals = Arc::new(Mutex::new(BuiltProposals::new()));
+    let proposal_id = ProposalId(1);
+    let cende_write_success = AbortOnDropHandle::new(tokio::spawn(async { true }));
+    let l2_gas_price = VersionedConstants::latest_constants().min_gas_price;
+    let builder_address = ContractAddress::default();
+    let cancel_token = CancellationToken::new();
+    let previous_block_info = None;
+    let proposal_round = 0;
+    let override_timestamp = false;
+
+    (
+        TestProposalBuildArguments {
+            deps,
+            batcher_deadline,
+            build_param,
+            l1_da_mode,
+            stream_sender,
+            gas_price_params,
+            valid_proposals,
+            proposal_id,
+            cende_write_success,
+            l2_gas_price,
+            builder_address,
+            cancel_token,
+            previous_block_info,
+            proposal_round,
+            retrospective_block_hash_deadline,
+            retrospective_block_hash_retry_interval_millis,
+            override_timestamp,
+            override_l2_gas_price_fri: None,
+            min_l2_gas_price_per_height: vec![],
+            compare_retrospective_block_hash: true,
+        },
+        proposal_receiver,
+    )
 }

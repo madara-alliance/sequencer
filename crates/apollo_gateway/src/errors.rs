@@ -1,4 +1,3 @@
-use apollo_class_manager_types::transaction_converter::TransactionConverterError;
 use apollo_class_manager_types::{ClassManagerClientError, ClassManagerError};
 use apollo_gateway_config::compiler_version::{VersionId, VersionIdError};
 use apollo_gateway_types::deprecated_gateway_error::{
@@ -10,9 +9,7 @@ use apollo_gateway_types::errors::GatewaySpecError;
 use apollo_gateway_types::gateway_types::SUPPORTED_TRANSACTION_VERSIONS;
 use apollo_mempool_types::communication::{MempoolClientError, MempoolClientResult};
 use apollo_mempool_types::errors::MempoolError;
-use blockifier::state::errors::StateError;
-use reqwest::StatusCode;
-use serde_json::{Error as SerdeError, Value};
+use apollo_transaction_converter::TransactionConverterError;
 use starknet_api::block::GasPrice;
 use starknet_api::executable_transaction::ValidateCompiledClassHashError;
 use starknet_api::execution_resources::GasAmount;
@@ -20,8 +17,6 @@ use starknet_api::transaction::fields::{AllResourceBounds, TransactionSignature}
 use starknet_api::StarknetApiError;
 use thiserror::Error;
 use tracing::{debug, error, warn};
-
-use crate::rpc_objects::{RpcErrorCode, RpcErrorResponse};
 
 pub type GatewayResult<T> = Result<T, StarknetError>;
 
@@ -83,6 +78,19 @@ pub enum StatelessTransactionValidatorError {
          {max_gas_amount:?}."
     )]
     MaxGasAmountTooHigh { gas_amount: GasAmount, max_gas_amount: u64 },
+    #[error(
+        "Transactions with client-side proving (non-empty proof_facts or proof) are not accepted."
+    )]
+    ClientSideProvingNotAllowed,
+    #[error(
+        "Invalid proof data: Proof facts and proof must either both be present or both be absent:
+        (has_proof_facts: {has_proof_facts:?}, has_proof: {has_proof:?})."
+    )]
+    ProofFactsAndProofConsistency { has_proof_facts: bool, has_proof: bool },
+    #[error(
+        "Client-side proof is too large: size {proof_size} (maximum allowed: {max_proof_size})."
+    )]
+    ProofTooLarge { proof_size: usize, max_proof_size: usize },
 }
 
 impl From<StatelessTransactionValidatorError> for GatewaySpecError {
@@ -104,7 +112,10 @@ impl From<StatelessTransactionValidatorError> for GatewaySpecError {
             | StatelessTransactionValidatorError::StarknetApiError(..)
             | StatelessTransactionValidatorError::ZeroResourceBounds { .. }
             | StatelessTransactionValidatorError::MaxGasPriceTooLow { .. }
-            | StatelessTransactionValidatorError::MaxGasAmountTooHigh { .. } => {
+            | StatelessTransactionValidatorError::MaxGasAmountTooHigh { .. }
+            | StatelessTransactionValidatorError::ClientSideProvingNotAllowed
+            | StatelessTransactionValidatorError::ProofFactsAndProofConsistency { .. }
+            | StatelessTransactionValidatorError::ProofTooLarge { .. } => {
                 GatewaySpecError::ValidationFailure { data: e.to_string() }
             }
         }
@@ -177,6 +188,19 @@ impl From<StatelessTransactionValidatorError> for StarknetError {
             StatelessTransactionValidatorError::ZeroResourceBounds { .. }
             | StatelessTransactionValidatorError::MaxGasPriceTooLow { .. } => {
                 StarknetErrorCode::KnownErrorCode(KnownStarknetErrorCode::InsufficientMaxFee)
+            }
+            StatelessTransactionValidatorError::ClientSideProvingNotAllowed => {
+                StarknetErrorCode::UnknownErrorCode(
+                    "StarknetErrorCode.CLIENT_SIDE_PROVING_NOT_ALLOWED".to_string(),
+                )
+            }
+            StatelessTransactionValidatorError::ProofFactsAndProofConsistency { .. } => {
+                StarknetErrorCode::UnknownErrorCode(
+                    "StarknetErrorCode.PROOF_FACTS_AND_PROOF_CONSISTENCY".to_string(),
+                )
+            }
+            StatelessTransactionValidatorError::ProofTooLarge { .. } => {
+                StarknetErrorCode::UnknownErrorCode("StarknetErrorCode.PROOF_TOO_LARGE".to_string())
             }
         };
         StarknetError { code, message }
@@ -291,54 +315,18 @@ pub type StatelessTransactionValidatorResult<T> = Result<T, StatelessTransaction
 
 pub type StatefulTransactionValidatorResult<T> = Result<T, StarknetError>;
 
-#[derive(Debug, Error)]
-pub enum RPCStateReaderError {
-    #[error("Block not found for request {0}")]
-    BlockNotFound(Value),
-    #[error("Class hash not found for request {0}")]
-    ClassHashNotFound(Value),
-    #[error("Contract address not found for request {0}")]
-    ContractAddressNotFound(Value),
-    #[error("Failed to parse gas price {:?}", 0)]
-    GasPriceParsingFailure(GasPrice),
-    #[error("Invalid params: {0:?}")]
-    InvalidParams(RpcErrorResponse),
-    #[error("RPC error: {0}")]
-    RPCError(StatusCode),
-    #[error(transparent)]
-    ReqwestError(#[from] reqwest::Error),
-    #[error("Unexpected error code: {0}")]
-    UnexpectedErrorCode(RpcErrorCode),
-    #[error(transparent)]
-    StarknetApi(#[from] StarknetApiError),
-}
-
-pub type RPCStateReaderResult<T> = Result<T, RPCStateReaderError>;
-
-impl From<RPCStateReaderError> for StateError {
-    fn from(err: RPCStateReaderError) -> Self {
-        match err {
-            RPCStateReaderError::ClassHashNotFound(request) => {
-                match serde_json::from_value(request["params"]["class_hash"].clone()) {
-                    Ok(class_hash) => StateError::UndeclaredClassHash(class_hash),
-                    Err(e) => serde_err_to_state_err(e),
-                }
-            }
-            _ => StateError::StateReadError(err.to_string()),
-        }
-    }
-}
-
-// Converts a serde error to the error type of the state reader.
-pub fn serde_err_to_state_err(err: SerdeError) -> StateError {
-    StateError::StateReadError(format!("Failed to parse rpc result {:?}", err.to_string()))
-}
-
 pub fn transaction_converter_err_to_deprecated_gw_err(
     tx_signature: &TransactionSignature,
     err: TransactionConverterError,
 ) -> StarknetError {
     match err {
+        TransactionConverterError::ProofManagerClientError(err) => {
+            StarknetError::internal_with_logging("Proof manager client error", err)
+        }
+        TransactionConverterError::ProofVerificationError(err) => StarknetError {
+            code: StarknetErrorCode::KnownErrorCode(KnownStarknetErrorCode::InvalidProof),
+            message: format!("Proof verification error: {err}"),
+        },
         TransactionConverterError::ValidateCompiledClassHashError(err) => {
             convert_compiled_class_hash_error(err)
         }
@@ -348,6 +336,9 @@ pub fn transaction_converter_err_to_deprecated_gw_err(
         // Internal error because the class manager should have the class in its storage.
         TransactionConverterError::ClassNotFound { .. } => {
             StarknetError::internal_with_signature_logging("Class not found", tx_signature, err)
+        }
+        TransactionConverterError::ProofNotFound { .. } => {
+            StarknetError::internal_with_signature_logging("Proof not found", tx_signature, err)
         }
         TransactionConverterError::StarknetApiError(err) => convert_sn_api_error(err),
     }
@@ -440,7 +431,8 @@ fn convert_sn_api_error(err: StarknetApiError) -> StarknetError {
         | StarknetApiError::ResourceHexToFeltConversion(..)
         | StarknetApiError::OutOfRange { .. }
         | StarknetApiError::InvalidChainIdHex(..)
-        | StarknetApiError::MissingBlockHeaderCommitments { .. } => StarknetError {
+        | StarknetApiError::MissingBlockHeaderCommitments { .. }
+        | StarknetApiError::InvalidProofFacts(..) => StarknetError {
             code: StarknetErrorCode::KnownErrorCode(KnownStarknetErrorCode::MalformedRequest),
             message: err.to_string(),
         },

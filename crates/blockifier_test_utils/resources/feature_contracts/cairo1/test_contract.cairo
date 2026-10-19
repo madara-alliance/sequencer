@@ -3,6 +3,7 @@ mod TestContract {
     use array::ArrayTrait;
     use box::BoxTrait;
     use clone::Clone;
+    use core::blake::{blake2s_compress, blake2s_finalize};
     use core::bytes_31::POW_2_128;
     use core::circuit::{
         AddInputResultTrait, CircuitElement, CircuitInput, CircuitInputs, CircuitModulus,
@@ -19,7 +20,8 @@ mod TestContract {
     use starknet::class_hash::ClassHashZero;
     use starknet::eth_address::U256IntoEthAddress;
     use starknet::eth_signature::verify_eth_signature;
-    use starknet::info::v2::{ExecutionInfo, ResourceBounds, TxInfo};
+    use starknet::info::v2::{ExecutionInfo, ResourceBounds, TxInfo as TxInfoV2};
+    use starknet::info::v3::TxInfo as TxInfoV3;
     use starknet::info::{BlockInfo, SyscallResultTrait, get_contract_address};
     use starknet::secp256_trait::{Signature, is_valid_signature};
     use starknet::secp256r1::{Secp256r1Impl, Secp256r1Point};
@@ -75,7 +77,7 @@ mod TestContract {
     // TODO(Dori): Delete this function, use `test` instead.
     #[external(v0)]
     fn test_increment(
-        ref self: ContractState, ref arg: felt252, arg1: felt252, arg2: felt252
+        ref self: ContractState, ref arg: felt252, arg1: felt252, arg2: felt252,
     ) -> felt252 {
         let x = self.my_storage_var.read();
         self.my_storage_var.write(x + 1);
@@ -150,6 +152,7 @@ mod TestContract {
         res.append_span(res_1);
         res.span()
     }
+
 
     #[external(v0)]
     fn test_revert_helper(
@@ -257,15 +260,15 @@ mod TestContract {
 
         // Validate the class hash of an undeployed contract.
         let actual_class_hash_of_undeployed = starknet::syscalls::get_class_hash_at_syscall(
-            undeployed_address
+            undeployed_address,
         )
             .unwrap_syscall();
-        assert(actual_class_hash_of_undeployed == ClassHashZero::zero(), 'WRONG_CLASS_HASH',);
+        assert(actual_class_hash_of_undeployed == ClassHashZero::zero(), 'WRONG_CLASS_HASH');
     }
 
     #[external(v0)]
     fn test_get_block_hash(
-        self: @ContractState, block_number: u64, expected_block_hash: felt252
+        self: @ContractState, block_number: u64, expected_block_hash: felt252,
     ) -> felt252 {
         let block_hash = syscalls::get_block_hash_syscall(block_number).unwrap_syscall();
         assert(block_hash == expected_block_hash, 'Unexpected block hash.');
@@ -273,14 +276,91 @@ mod TestContract {
     }
 
     #[external(v0)]
-    fn test_get_execution_info(
+    fn test_get_block_hash_current_block_number(self: @ContractState) {
+        let execution_info = get_execution_info().unbox();
+        let block_info = execution_info.block_info.unbox();
+        let current_block_number = block_info.block_number;
+        match syscalls::get_block_hash_syscall(current_block_number) {
+            Result::Ok(_) => panic_with_felt252('should_fail'),
+            Result::Err(_) => {},
+        }
+    }
+
+    #[external(v0)]
+    fn test_get_execution_info_v3(
         self: @ContractState,
         expected_block_info: BlockInfo,
-        expected_tx_info: TxInfo,
         // Expected call info.
         expected_caller_address: felt252,
         expected_contract_address: felt252,
         expected_entry_point_selector: felt252,
+        expected_tx_info: TxInfoV3,
+    ) {
+        let execution_info = starknet::syscalls::get_execution_info_v3_syscall()
+            .unwrap_syscall()
+            .unbox();
+        let block_info = execution_info.block_info.unbox();
+        assert(block_info == expected_block_info, 'BLOCK_INFO_MISMATCH');
+
+        let tx_info = execution_info.tx_info.unbox();
+
+        // Signature is expected to contain the tx hash.
+        assert(tx_info.signature.len() == 1_u32, 'SIGNATURE_MISMATCH');
+        let transaction_hash = *tx_info.signature.at(0_u32);
+        assert(tx_info.transaction_hash == transaction_hash, 'TRANSACTION_HASH_MISMATCH');
+
+        // Compare the rest of the fields explicitly.
+        assert(tx_info.version == expected_tx_info.version, 'VERSION_MISMATCH');
+        assert(
+            tx_info.account_contract_address == expected_tx_info.account_contract_address,
+            'ACCOUNT_MISMATCH',
+        );
+        assert(tx_info.max_fee == expected_tx_info.max_fee, 'MAX_FEE_MISMATCH');
+        assert(tx_info.chain_id == expected_tx_info.chain_id, 'CHAIN_ID_MISMATCH');
+        assert(tx_info.nonce == expected_tx_info.nonce, 'NONCE_MISMATCH');
+        assert(
+            tx_info.resource_bounds == expected_tx_info.resource_bounds, 'RESOURCE_BOUND_MISMATCH',
+        );
+        assert(tx_info.tip == expected_tx_info.tip, 'TIP_MISMATCH');
+        assert(
+            tx_info.paymaster_data == expected_tx_info.paymaster_data, 'PAYMASTER_DATA_MISMATCH',
+        );
+        assert(
+            tx_info.nonce_data_availability_mode == expected_tx_info.nonce_data_availability_mode,
+            'NONCE_DA_MODE_MISMATCH',
+        );
+        assert(
+            tx_info.fee_data_availability_mode == expected_tx_info.fee_data_availability_mode,
+            'FEE_DA_MODE_MISMATCH',
+        );
+        assert(
+            tx_info.account_deployment_data == expected_tx_info.account_deployment_data,
+            'DEPLOYMENT_DATA_MISMATCH',
+        );
+
+        assert(tx_info.proof_facts == expected_tx_info.proof_facts, 'PROOF_FACTS_MISMATCH');
+
+        assert(execution_info.caller_address.into() == expected_caller_address, 'CALLER_MISMATCH');
+        assert(
+            execution_info.contract_address.into() == expected_contract_address,
+            'CONTRACT_MISMATCH',
+        );
+        assert(
+            execution_info.entry_point_selector == expected_entry_point_selector,
+            'SELECTOR_MISMATCH',
+        );
+    }
+
+
+    #[external(v0)]
+    fn test_get_execution_info_v2(
+        self: @ContractState,
+        expected_block_info: BlockInfo,
+        // Expected call info.
+        expected_caller_address: felt252,
+        expected_contract_address: felt252,
+        expected_entry_point_selector: felt252,
+        expected_tx_info: TxInfoV2,
     ) {
         let execution_info = starknet::get_execution_info().unbox();
         let block_info = execution_info.block_info.unbox();
@@ -303,7 +383,7 @@ mod TestContract {
         assert(tx_info.chain_id == expected_tx_info.chain_id, 'CHAIN_ID_MISMATCH');
         assert(tx_info.nonce == expected_tx_info.nonce, 'NONCE_MISMATCH');
         assert(
-            tx_info.resource_bounds == expected_tx_info.resource_bounds, 'RESOURCE_BOUND_MISMATCH'
+            tx_info.resource_bounds == expected_tx_info.resource_bounds, 'RESOURCE_BOUND_MISMATCH',
         );
         assert(tx_info.tip == expected_tx_info.tip, 'TIP_MISMATCH');
         assert(
@@ -364,10 +444,10 @@ mod TestContract {
 
     #[external(v0)]
     fn test_direct_execute_call(
-        ref self: ContractState, contract_address: ContractAddress, calldata: Array::<felt252>
+        ref self: ContractState, contract_address: ContractAddress, calldata: Array<felt252>,
     ) {
         let call_execute_result = syscalls::call_contract_syscall(
-            contract_address, selector!("__execute__"), calldata.span()
+            contract_address, selector!("__execute__"), calldata.span(),
         );
         match call_execute_result {
             Result::Ok(_) => panic!("Calling execute directly should fail."),
@@ -379,7 +459,7 @@ mod TestContract {
                     panic!(
                         "Unexpected inner error during direct execute call. Expected {}. Got: {}",
                         expected_error_msg,
-                        actual_error_msg
+                        actual_error_msg,
                     )
                 }
             },
@@ -459,7 +539,7 @@ mod TestContract {
 
     #[l1_handler]
     fn l1_handler_set_value_and_revert(
-        self: @ContractState, from_address: felt252, key: StorageAddress, value: felt252
+        self: @ContractState, from_address: felt252, key: StorageAddress, value: felt252,
     ) {
         let address_domain = 0;
         syscalls::storage_write_syscall(address_domain, key, value).unwrap_syscall();
@@ -495,6 +575,49 @@ mod TestContract {
             class_hash, contract_address_salt, calldata.span(), deploy_from_zero,
         )
             .unwrap_syscall();
+    }
+
+    #[external(v0)]
+    fn deploy_and_fail(
+        self: @ContractState,
+        class_hash: ClassHash,
+        contract_address_salt: felt252,
+        expected_deploy_address: ContractAddress,
+    ) {
+        match syscalls::deploy_syscall(class_hash, contract_address_salt, array![].span(), false) {
+            Ok((address, _)) => assert(address == expected_deploy_address, 'WRONG_DEPLOY_ADDRESS'),
+            Err(_revert_reason) => panic_with_felt252('deploy failed'),
+        }
+        panic_with_felt252('Designed fail');
+    }
+
+    #[external(v0)]
+    fn test_get_class_hash_after_failed_deploy(
+        self: @ContractState,
+        class_hash: ClassHash,
+        self_address: ContractAddress,
+        contract_address_salt: felt252,
+        expected_deploy_address: ContractAddress,
+    ) {
+        let zero_class_hash = ClassHashZero::zero();
+        let current_class_hash = syscalls::get_class_hash_at_syscall(expected_deploy_address)
+            .unwrap_syscall();
+        assert(current_class_hash == zero_class_hash, 'ALREADY_DEPLOYED');
+        match syscalls::call_contract_syscall(
+            self_address,
+            selector!("deploy_and_fail"),
+            array![class_hash.into(), contract_address_salt, expected_deploy_address.into()].span(),
+        ) {
+            Ok(_) => panic_with_felt252('Should fail inner'),
+            Err(revert_reason) => {
+                assert(*revert_reason.at(0) == 'Designed fail', 'WRONG_REVERT_REASON');
+                let current_class_hash = syscalls::get_class_hash_at_syscall(
+                    expected_deploy_address,
+                )
+                    .unwrap_syscall();
+                assert(current_class_hash == zero_class_hash, 'NONZERO_HASH');
+            },
+        }
     }
 
     #[external(v0)]
@@ -552,7 +675,7 @@ mod TestContract {
 
     // TODO(Nimrod): Consider providing the expected result as [u32; 8].
     fn test_sha256_helper(value: u32, expected_res: u32) {
-        let [res, _, _, _, _, _, _, _,] = compute_sha256_u32_array(array![value], 0, 0);
+        let [res, _, _, _, _, _, _, _] = compute_sha256_u32_array(array![value], 0, 0);
         assert(res == expected_res, 'Wrong hash value');
     }
 
@@ -751,26 +874,26 @@ mod TestContract {
         // Test a point not on the curve.
         assert(
             starknet::secp256r1::secp256r1_new_syscall(x: 0, y: 1).unwrap_syscall().is_none(),
-            'Should be none'
+            'Should be none',
         );
 
         // Test a point with x == Secp256r1_prime.
         match starknet::secp256r1::secp256r1_new_syscall(
-            x: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff, y: 1
+            x: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff, y: 1,
         ) {
             Result::Ok(_) => panic_with_felt252('Should fail'),
             Result::Err(revert_reason) => assert(
-                *revert_reason.at(0) == 'Invalid argument', 'Wrong error msg'
+                *revert_reason.at(0) == 'Invalid argument', 'Wrong error msg',
             ),
         }
 
         // Test a point with x == Secp_prime.
         match starknet::secp256r1::secp256r1_get_point_from_x_syscall(
-            x: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff, y_parity: true
+            x: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff, y_parity: true,
         ) {
             Result::Ok(_) => panic_with_felt252('Should fail'),
             Result::Err(revert_reason) => assert(
-                *revert_reason.at(0) == 'Invalid argument', 'Wrong error msg'
+                *revert_reason.at(0) == 'Invalid argument', 'Wrong error msg',
             ),
         }
 
@@ -788,7 +911,7 @@ mod TestContract {
             starknet::secp256r1::secp256r1_get_point_from_x_syscall(:x, y_parity: true)
                 .unwrap_syscall()
                 .is_some(),
-            'Should be some'
+            'Should be some',
         );
     }
 
@@ -856,9 +979,9 @@ mod TestContract {
         }
     }
 
-    impl TxInfoPartialEq of PartialEq<TxInfo> {
+    impl TxInfoPartialEq of PartialEq<TxInfoV3> {
         #[inline(always)]
-        fn eq(lhs: @TxInfo, rhs: @TxInfo) -> bool {
+        fn eq(lhs: @TxInfoV3, rhs: @TxInfoV3) -> bool {
             (*lhs.version == *rhs.version)
                 && (*lhs.account_contract_address == *rhs.account_contract_address)
                 && (*lhs.max_fee == *rhs.max_fee)
@@ -872,9 +995,10 @@ mod TestContract {
                 && (*lhs.nonce_data_availability_mode == *rhs.nonce_data_availability_mode)
                 && (*lhs.fee_data_availability_mode == *rhs.fee_data_availability_mode)
                 && (*lhs.account_deployment_data == *rhs.account_deployment_data)
+                && (*lhs.proof_facts == *rhs.proof_facts)
         }
         #[inline(always)]
-        fn ne(lhs: @TxInfo, rhs: @TxInfo) -> bool {
+        fn ne(lhs: @TxInfoV3, rhs: @TxInfoV3) -> bool {
             !(*lhs == *rhs)
         }
     }
@@ -1195,6 +1319,36 @@ mod TestContract {
     }
 
     #[external(v0)]
+    fn test_blake_compress(ref self: ContractState) {
+        // Blake2s IV (standard initialization vector for 32-byte digest).
+        let iv: [u32; 8] = [
+            0x6B08C647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+            0x5BE0CD19,
+        ];
+        let state = BoxTrait::new(iv);
+        // A single 64-byte block of zeros.
+        let msg: [u32; 16] = [0; 16];
+        let input = BoxTrait::new(msg);
+        let byte_count: u32 = 64;
+        let _result = blake2s_compress(state, byte_count, input);
+    }
+
+    #[external(v0)]
+    fn test_blake_finalize(ref self: ContractState) {
+        // Blake2s IV (standard initialization vector for 32-byte digest).
+        let iv: [u32; 8] = [
+            0x6B08C647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+            0x5BE0CD19,
+        ];
+        let state = BoxTrait::new(iv);
+        // A single 64-byte block of zeros.
+        let msg: [u32; 16] = [0; 16];
+        let input = BoxTrait::new(msg);
+        let byte_count: u32 = 64;
+        let _result = blake2s_finalize(state, byte_count, input);
+    }
+
+    #[external(v0)]
     fn test_builtin_counts_consistency(ref self: ContractState) {
         test_range_check(ref self);
         test_bitwise(ref self);
@@ -1204,5 +1358,91 @@ mod TestContract {
         test_keccak(ref self);
         // Test add_mod, mul_mod and range_check96.
         test_circuit(ref self);
+        test_blake_compress(ref self);
+        test_blake_finalize(ref self);
+    }
+
+
+    // Test functions for storage revert behavior with nested calls.
+    // write_1: writes storage cell to 1, emits a dummy event and sends a dummy L1 message.
+    #[external(v0)]
+    fn write_1(ref self: ContractState, key: StorageAddress) {
+        let address_domain = 0;
+        syscalls::storage_write_syscall(address_domain, key, 1).unwrap_syscall();
+        // Emit a dummy event and send a dummy L1 message (should be reverted by caller panic).
+        let dummy_span = array![0].span();
+        syscalls::emit_event_syscall(dummy_span, dummy_span).unwrap_syscall();
+        syscalls::send_message_to_l1_syscall(17.try_into().unwrap(), dummy_span).unwrap_syscall();
+    }
+    // call_write_rewrite_panic: calls write_1, then writes storage cell to 2, then panics.
+    #[external(v0)]
+    fn call_write_rewrite_panic(
+        ref self: ContractState, contract_address: ContractAddress, key: StorageAddress,
+    ) {
+        // Call write_1 which writes 1 to the storage cell.
+        let calldata = array![key.into()];
+        syscalls::call_contract_syscall(contract_address, selector!("write_1"), calldata.span())
+            .unwrap_syscall();
+        // Now write 2 to the same storage cell
+        let address_domain = 0;
+        syscalls::storage_write_syscall(address_domain, key, 2).unwrap_syscall();
+        // Panic to trigger revert
+        core::panic_with_felt252('call_write_rewrite_panic');
+    }
+
+    // catch_write_revert_panic: calls call_write_rewrite_panic and catches/ignores the revert,
+    // then reads storage to verify.
+    #[external(v0)]
+    fn catch_write_revert_panic(
+        ref self: ContractState, contract_address: ContractAddress, key: StorageAddress,
+    ) -> felt252 {
+        // Call call_write_rewrite_panic which will revert.
+        let calldata = array![contract_address.into(), key.into()];
+        match syscalls::call_contract_syscall(
+            contract_address, selector!("call_write_rewrite_panic"), calldata.span(),
+        ) {
+            Result::Ok(_) => core::panic_with_felt252('expected_fail'),
+            Result::Err(_) => {} // Ignore the revert
+        }
+        // Read the storage value - should be 0 (original) not 1 (write_1's write)
+        let address_domain = 0;
+        syscalls::storage_read_syscall(address_domain, key).unwrap_syscall()
+    }
+
+    // Tests forbidden syscalls in virtual OS mode.
+    // Gets valid class_hash and contract_address from the current contract.
+    // syscall_selector should be one of: 'Deploy', 'GetBlockHash', 'Keccak', 'ReplaceClass',
+    // 'MetaTxV0'.
+    #[external(v0)]
+    fn test_forbidden_syscall_in_virtual_mode(self: @ContractState, syscall_selector: felt252) {
+        let execution_info = get_execution_info().unbox();
+        let contract_address = execution_info.contract_address;
+        let class_hash = syscalls::get_class_hash_at_syscall(contract_address).unwrap_syscall();
+
+        if syscall_selector == 'GetBlockHash' {
+            syscalls::get_block_hash_syscall(0).unwrap_syscall();
+        } else if syscall_selector == 'Keccak' {
+            // Use the high-level keccak function which internally calls the keccak syscall.
+            let mut input: Array<u256> = Default::default();
+            input.append(u256 { low: 1, high: 0 });
+            keccak::keccak_u256s_le_inputs(input.span());
+        } else if syscall_selector == 'ReplaceClass' {
+            syscalls::replace_class_syscall(class_hash).unwrap_syscall();
+        } else if syscall_selector == 'Deploy' {
+            // Pass constructor arguments (two felt252 values).
+            syscalls::deploy_syscall(class_hash, 0, array![0, 0].span(), false).unwrap_syscall();
+        } else if syscall_selector == 'MetaTxV0' {
+            // meta_tx_v0 requires the selector to be `__execute__`.
+            // __execute__ takes (class_hash: ClassHash, to_panic: bool).
+            meta_tx_v0_syscall(
+                contract_address,
+                selector!("__execute__"),
+                array![class_hash.into(), 0].span(),
+                array![].span(),
+            )
+                .unwrap_syscall();
+        } else {
+            panic!("Unexpected syscall selector");
+        }
     }
 }

@@ -1,4 +1,6 @@
-use apollo_class_manager_config::config::{ClassManagerConfig, FsClassManagerConfig};
+use std::time::Instant;
+
+use apollo_class_manager_config::config::{ClassManagerDynamicConfig, FsClassManagerConfig};
 use apollo_class_manager_types::{
     ClassHashes,
     ClassId,
@@ -12,10 +14,11 @@ use apollo_compile_to_casm_types::{
     SharedSierraCompilerClient,
     SierraCompilerClientError,
 };
+use apollo_config_manager_types::communication::SharedConfigManagerClient;
 use apollo_infra::component_definitions::{default_component_start_fn, ComponentStarter};
 use async_trait::async_trait;
 use starknet_api::state::{SierraContractClass, CONTRACT_CLASS_VERSION};
-use tracing::instrument;
+use tracing::{debug, instrument};
 
 use crate::class_storage::{CachedClassStorage, ClassStorage, FsClassStorage};
 use crate::metrics::register_metrics;
@@ -26,9 +29,10 @@ use crate::FsClassManager;
 pub mod class_manager_test;
 
 pub struct ClassManager<S: ClassStorage> {
-    pub config: ClassManagerConfig,
+    pub config: FsClassManagerConfig,
     pub compiler: SharedSierraCompilerClient,
     pub classes: CachedClassStorage<S>,
+    pub config_manager_client: SharedConfigManagerClient,
 }
 
 impl<S> ClassManager<S>
@@ -37,16 +41,23 @@ where
     apollo_class_manager_types::CachedClassStorageError<S::Error>: From<S::Error>,
 {
     pub fn new(
-        config: ClassManagerConfig,
+        config: FsClassManagerConfig,
         compiler: SharedSierraCompilerClient,
         storage: S,
+        config_manager_client: SharedConfigManagerClient,
     ) -> Self {
-        let cached_class_storage_config = config.cached_class_storage_config.clone();
+        let cached_class_storage_config =
+            config.static_config.class_manager_config.cached_class_storage_config.clone();
         Self {
             config,
             compiler,
             classes: CachedClassStorage::new(cached_class_storage_config, storage),
+            config_manager_client,
         }
+    }
+
+    pub fn update_dynamic_config(&mut self, dynamic_config: ClassManagerDynamicConfig) {
+        self.config.dynamic_config = dynamic_config;
     }
 
     #[instrument(skip(self, class), ret, err)]
@@ -60,6 +71,7 @@ where
             return Ok(ClassHashes { class_hash, executable_class_hash_v2 });
         }
 
+        let compilation_start_time = Instant::now();
         let (raw_executable_class, executable_class_hash_v2) =
             self.compiler.compile(class.clone()).await.map_err(|err| match err {
                 SierraCompilerClientError::SierraCompilerError(error) => {
@@ -69,6 +81,16 @@ where
                     ClassManagerError::Client(error.to_string())
                 }
             })?;
+        debug!(
+            %class_hash,
+            compiled_class_hash = %executable_class_hash_v2,
+            compilation_elapsed_ms = compilation_start_time.elapsed().as_millis(),
+            class_size_bytes =
+                class.size().map_or("Failed to get class size".to_owned(), |size| size.to_string()),
+            casm_size_bytes =
+                raw_executable_class.size().map_or("Failed to get casm size".to_owned(), |size| size.to_string()),
+            "Finished compiling class."
+        );
 
         self.validate_class_length(&raw_executable_class)?;
         Self::validate_class_version(&sierra_class)?;
@@ -133,10 +155,16 @@ where
 
         let contract_class_object_size =
             serialized_class.size().expect("Unexpected error serializing contract class.");
-        if contract_class_object_size > self.config.max_compiled_contract_class_object_size {
+        if contract_class_object_size
+            > self.config.static_config.class_manager_config.max_compiled_contract_class_object_size
+        {
             return Err(ClassManagerError::ContractClassObjectSizeTooLarge {
                 contract_class_object_size,
-                max_contract_class_object_size: self.config.max_compiled_contract_class_object_size,
+                max_contract_class_object_size: self
+                    .config
+                    .static_config
+                    .class_manager_config
+                    .max_compiled_contract_class_object_size,
             });
         }
 
@@ -157,11 +185,15 @@ where
 pub fn create_class_manager(
     config: FsClassManagerConfig,
     compiler_client: SharedSierraCompilerClient,
+    config_manager_client: SharedConfigManagerClient,
 ) -> FsClassManager {
-    let FsClassManagerConfig { class_manager_config, class_storage_config } = config;
-    let fs_class_storage =
-        FsClassStorage::new(class_storage_config).expect("Failed to create class storage.");
-    let class_manager = ClassManager::new(class_manager_config, compiler_client, fs_class_storage);
+    let fs_class_storage = FsClassStorage::new(
+        config.static_config.class_storage_config.clone(),
+        config.dynamic_config.storage_reader_server_dynamic_config.clone(),
+    )
+    .expect("Failed to create class storage.");
+    let class_manager =
+        ClassManager::new(config, compiler_client, fs_class_storage, config_manager_client);
 
     FsClassManager(class_manager)
 }

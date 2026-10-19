@@ -1,0 +1,78 @@
+[package]
+name = "starknet_transaction_prover"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "Standalone service that proves individual Starknet transactions using the virtual Starknet OS and Stwo prover."
+
+[features]
+cairo_native = ["blockifier/cairo_native"]
+# Enables in-memory stwo proving.  Requires a nightly Rust toolchain because the
+# stwo prover crate uses unstable features (array_chunks, portable_simd, …).
+stwo_proving = ["dep:privacy-prove"]
+
+[dependencies]
+anyhow.workspace = true
+apollo_infra_utils.workspace = true
+async-trait.workspace = true
+blockifier.workspace = true
+blockifier_reexecution.workspace = true
+bytes.workspace = true
+cairo-lang-starknet-classes.workspace = true
+cairo-lang-utils.workspace = true
+cairo-vm.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+indexmap.workspace = true
+jsonrpsee = { workspace = true, features = ["macros", "server"] }
+privacy-prove = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+shared_execution_objects.workspace = true
+starknet-rust.workspace = true
+starknet-rust-core.workspace = true
+starknet-types-core.workspace = true
+starknet_api.workspace = true
+starknet_committer.workspace = true
+starknet_os.workspace = true
+starknet_patricia.workspace = true
+starknet_patricia_storage.workspace = true
+starknet_proof_verifier.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time"] }
+tokio-rustls.workspace = true
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true, features = [
+  "compression-full",
+  "cors",
+  "map-request-body",
+  "map-response-body",
+] }
+tower_ohttp.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url.workspace = true
+
+[dev-dependencies]
+apollo_starknet_os_program.workspace = true
+assert_matches.workspace = true
+axum.workspace = true
+blockifier = { workspace = true, features = ["testing"] }
+blockifier_test_utils.workspace = true
+flate2.workspace = true
+jsonschema.workspace = true
+mockito.workspace = true
+privacy-circuit-verify.workspace = true
+reqwest.workspace = true
+rstest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+starknet-types-core.workspace = true
+tower_ohttp = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

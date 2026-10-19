@@ -8,6 +8,7 @@ use apollo_config::secrets::Sensitive;
 use apollo_l1_gas_price_provider_config::config::EthToStrkOracleConfig;
 use apollo_l1_gas_price_types::errors::EthToStrkOracleClientError;
 use apollo_l1_gas_price_types::EthToStrkOracleClientTrait;
+use apollo_metrics::metrics::set_unix_now_seconds;
 use async_trait::async_trait;
 use futures::FutureExt;
 use lru::LruCache;
@@ -20,6 +21,7 @@ use url::Url;
 use crate::metrics::{
     register_eth_to_strk_metrics,
     ETH_TO_STRK_ERROR_COUNT,
+    ETH_TO_STRK_LAST_SUCCESS_TIMESTAMP_SECONDS,
     ETH_TO_STRK_RATE,
     ETH_TO_STRK_SUCCESS_COUNT,
 };
@@ -78,8 +80,8 @@ impl EthToStrkOracleClient {
             .expect("url_header_list should be set in the config")
             .iter()
             .map(|uh| UrlAndHeaderMap {
-                url: uh.as_ref().url.clone(),
-                headers: btreemap_to_headermap(uh.as_ref().headers.clone()).into(),
+                url: uh.peek_secret().url.clone(),
+                headers: btreemap_to_headermap(uh.peek_secret().headers.clone()).into(),
             })
             .collect::<Vec<_>>();
         Self {
@@ -114,9 +116,11 @@ impl EthToStrkOracleClient {
                 let UrlAndHeaderMap { mut url, headers } = url_and_headers.clone();
                 url.query_pairs_mut().append_pair("timestamp", &adjusted_timestamp.to_string());
                 let result = tokio::time::timeout(Duration::from_secs(query_timeout_sec), async {
-                    // TODO(victork): make sure we're allowed to expose the headers here
-                    let response =
-                        client.get(url.clone()).headers(headers.as_ref().clone()).send().await?;
+                    let response = client
+                        .get(url.clone())
+                        .headers(headers.peek_secret().clone())
+                        .send()
+                        .await?;
                     let body = response.text().await?;
                     let rate = resolve_query(body)?;
                     Ok::<_, EthToStrkOracleClientError>(rate)
@@ -178,6 +182,7 @@ fn resolve_query(body: String) -> Result<u128, EthToStrkOracleClientError> {
         ));
     }
     ETH_TO_STRK_SUCCESS_COUNT.increment(1);
+    set_unix_now_seconds(&ETH_TO_STRK_LAST_SUCCESS_TIMESTAMP_SECONDS);
     ETH_TO_STRK_RATE.set_lossy(rate);
     Ok(rate)
 }

@@ -58,12 +58,7 @@ func combine_blocks{range_check_ptr}(
 
     local initial_carried_outputs: OsCarriedOutputs*;
 
-    %{
-        # Allocate segments for the messages.
-        ids.initial_carried_outputs = segments.gen_arg(
-            [segments.add_temp_segment(), segments.add_temp_segment()]
-        )
-    %}
+    %{ AllocateSegmentsForMessages %}
 
     let first = os_outputs[0];
     // Validate fields of the first inner OS outputs. It cannot be checked in the inner function
@@ -103,7 +98,7 @@ func combine_blocks{range_check_ptr}(
     let res = combine_blocks_inner(aggregated=aggregated, n=n - 1, os_outputs=&os_outputs[1]);
     local res_state_update: SquashedOsStateUpdate = [res.squashed_os_state_update];
 
-    %{ state_update_pointers = None %}
+    %{ SetStateUpdatePointersToNone %}
 
     // Squash the contract state diff dict.
     let (n_contract_state_changes, squashed_contract_state_dict) = squash_state_changes(

@@ -21,6 +21,7 @@ use starknet_api::transaction::fields::{
     Calldata,
     ContractAddressSalt,
     PaymasterData,
+    Proof,
     ProofFacts,
     ResourceBounds,
     Tip,
@@ -34,6 +35,9 @@ use starknet_api::transaction::fields::{
 #[path = "deprecated_gateway_transaction_test.rs"]
 mod deprecated_gateway_transaction_test;
 
+/// Legacy V3 transaction formats accepted by the Pythonic Starknet Gateway for backward
+/// compatibility. Allows existing clients using the old Gateway API to submit transactions while
+/// the system transitions to the newer RPC-based transaction format.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Hash)]
 #[serde(tag = "type")]
 #[serde(deny_unknown_fields)]
@@ -108,6 +112,10 @@ pub struct DeprecatedGatewayInvokeTransactionV3 {
     pub account_deployment_data: AccountDeploymentData,
     pub nonce_data_availability_mode: DataAvailabilityMode,
     pub fee_data_availability_mode: DataAvailabilityMode,
+    #[serde(default, skip_serializing_if = "ProofFacts::is_empty")]
+    pub proof_facts: ProofFacts,
+    #[serde(default, skip_serializing_if = "Proof::is_empty")]
+    pub proof: Proof,
 }
 
 impl From<DeprecatedGatewayInvokeTransactionV3> for RpcInvokeTransactionV3 {
@@ -123,7 +131,8 @@ impl From<DeprecatedGatewayInvokeTransactionV3> for RpcInvokeTransactionV3 {
             account_deployment_data: deprecated_invoke_tx.account_deployment_data,
             nonce_data_availability_mode: deprecated_invoke_tx.nonce_data_availability_mode,
             fee_data_availability_mode: deprecated_invoke_tx.fee_data_availability_mode,
-            proof_facts: ProofFacts::default(),
+            proof_facts: deprecated_invoke_tx.proof_facts,
+            proof: deprecated_invoke_tx.proof,
         }
     }
 }
@@ -142,6 +151,8 @@ impl From<RpcInvokeTransactionV3> for DeprecatedGatewayInvokeTransactionV3 {
             account_deployment_data: value.account_deployment_data,
             nonce_data_availability_mode: value.nonce_data_availability_mode,
             fee_data_availability_mode: value.fee_data_availability_mode,
+            proof_facts: value.proof_facts,
+            proof: value.proof,
         }
     }
 }

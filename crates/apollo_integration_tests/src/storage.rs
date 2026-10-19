@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use blockifier::context::ChainInfo;
 use mempool_test_utils::starknet_api_test_utils::AccountTransactionGenerator;
 
-use crate::executable_setup::NodeExecutionId;
+use crate::executable_setup::NodeExecutableId;
 use crate::state_reader::{
     StorageTestConfig,
     StorageTestSetup,
@@ -11,7 +11,9 @@ use crate::state_reader::{
     CLASSES_STORAGE_DB_PATH_SUFFIX,
     CLASS_HASH_STORAGE_DB_PATH_SUFFIX,
     CLASS_MANAGER_DB_PATH_SUFFIX,
+    COMMITTER_DB_PATH_SUFFIX,
     CONSENSUS_DB_PATH_SUFFIX,
+    PROOF_MANAGER_DB_PATH_SUFFIX,
     STATE_SYNC_DB_PATH_SUFFIX,
 };
 
@@ -23,7 +25,9 @@ pub struct StorageExecutablePaths {
 
 impl StorageExecutablePaths {
     pub fn new(db_base: &Path, node_index: usize) -> Self {
-        let node_index = NodeExecutionId::new(node_index);
+        // We use a single storage handler per node, regardless of how it is split into various
+        // services and which of these actually requires the storage.
+        let node_index = NodeExecutableId::new(node_index, "".to_string());
 
         let path = node_index.build_path(db_base);
 
@@ -46,6 +50,14 @@ impl StorageExecutablePaths {
         &self.path
     }
 
+    pub fn get_proof_manager_exec_path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn get_committer_exec_path(&self) -> &PathBuf {
+        &self.path
+    }
+
     pub fn get_batcher_path_with_db_suffix(&self) -> PathBuf {
         self.path.join(BATCHER_DB_PATH_SUFFIX)
     }
@@ -60,6 +72,14 @@ impl StorageExecutablePaths {
 
     pub fn get_consensus_path_with_db_suffix(&self) -> PathBuf {
         self.path.join(CONSENSUS_DB_PATH_SUFFIX)
+    }
+
+    pub fn get_proof_manager_path_with_db_suffix(&self) -> PathBuf {
+        self.path.join(PROOF_MANAGER_DB_PATH_SUFFIX)
+    }
+
+    pub fn get_committer_path_with_db_suffix(&self) -> PathBuf {
+        self.path.join(COMMITTER_DB_PATH_SUFFIX)
     }
 }
 
@@ -83,8 +103,8 @@ impl CustomPaths {
         self.db_base.as_ref()
     }
 
-    pub fn get_config_path(&self, node_execution_id: &NodeExecutionId) -> Option<PathBuf> {
-        self.config_base.as_ref().map(|p| node_execution_id.build_path(p))
+    pub fn get_config_path(&self, node_executable_id: &NodeExecutableId) -> Option<PathBuf> {
+        self.config_base.as_ref().map(|p| node_executable_id.build_path(p))
     }
 
     pub fn get_data_prefix_path(&self) -> Option<&PathBuf> {
@@ -129,6 +149,11 @@ pub fn get_integration_test_storage(
                 .join(CLASSES_STORAGE_DB_PATH_SUFFIX);
             storage_config.consensus_storage_config.db_config.path_prefix =
                 custom_storage_exec_paths.get_consensus_exec_path().join(CONSENSUS_DB_PATH_SUFFIX);
+            storage_config.proof_manager_config.persistent_root = custom_storage_exec_paths
+                .get_proof_manager_exec_path()
+                .join(PROOF_MANAGER_DB_PATH_SUFFIX);
+            storage_config.committer_db_path =
+                custom_storage_exec_paths.get_committer_exec_path().join(COMMITTER_DB_PATH_SUFFIX);
         }
     }
 
@@ -138,6 +163,8 @@ pub fn get_integration_test_storage(
             storage_config.state_sync_storage_config,
             storage_config.class_manager_storage_config,
             storage_config.consensus_storage_config,
+            storage_config.proof_manager_config,
+            storage_config.committer_db_path,
         ),
         storage_handles,
     }

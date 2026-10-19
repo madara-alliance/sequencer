@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::vec;
 
@@ -19,10 +19,14 @@ use apollo_sizeof::SizeOf;
 use apollo_starknet_client::reader::objects::state::StateDiff;
 use apollo_starknet_client::reader::objects::transaction::ReservedDataAvailabilityMode;
 use apollo_starknet_client::reader::StorageEntry;
+use blockifier::bouncer::BouncerWeights;
 use blockifier::execution::call_info::{
     CallExecution,
     CallInfo,
+    ExtendedExecutionResources,
     MessageToL1,
+    OpcodeCounterMap,
+    OpcodeName,
     OrderedEvent,
     OrderedL2ToL1Message,
     Retdata,
@@ -46,11 +50,7 @@ use blockifier::state::cached_state::{
     StateChangesCount,
     StateChangesCountForFee,
 };
-use blockifier::transaction::objects::{
-    ExecutionResourcesTraits,
-    RevertError,
-    TransactionExecutionInfo,
-};
+use blockifier::transaction::objects::{RevertError, TransactionExecutionInfo};
 use cairo_lang_casm::hints::{CoreHint, CoreHintBase, Hint};
 use cairo_lang_casm::operand::{CellRef, Register};
 use cairo_lang_starknet_classes::casm_contract_class::{
@@ -70,6 +70,7 @@ use serde::Serialize;
 use shared_execution_objects::central_objects::CentralTransactionExecutionInfo;
 use starknet_api::block::{
     BlockHash,
+    BlockHashAndNumber,
     BlockInfo,
     BlockNumber,
     BlockTimestamp,
@@ -82,7 +83,7 @@ use starknet_api::block::{
 };
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::contract_class::{ContractClass, EntryPointType, SierraVersion};
-use starknet_api::core::{ClassHash, CompiledClassHash, EntryPointSelector, L1Address};
+use starknet_api::core::{ClassHash, CompiledClassHash, EntryPointSelector, EthAddress, L1Address};
 use starknet_api::data_availability::{DataAvailabilityMode, L1DataAvailabilityMode};
 use starknet_api::executable_transaction::L1HandlerTransaction;
 use starknet_api::execution_resources::{GasAmount, GasVector};
@@ -90,12 +91,11 @@ use starknet_api::rpc_transaction::{
     EntryPointByType,
     InternalRpcDeclareTransactionV3,
     InternalRpcDeployAccountTransaction,
+    InternalRpcInvokeTransactionV3,
     InternalRpcTransaction,
     InternalRpcTransactionWithoutTxHash,
     RpcDeployAccountTransaction,
     RpcDeployAccountTransactionV3,
-    RpcInvokeTransaction,
-    RpcInvokeTransactionV3,
 };
 use starknet_api::state::{
     EntryPoint,
@@ -123,6 +123,7 @@ use starknet_api::transaction::{
     EventData,
     EventKey,
     L2ToL1Payload,
+    MessageToL1 as StarknetAPIMessageToL1,
     TransactionHash,
     TransactionOffsetInBlock,
     TransactionVersion,
@@ -151,6 +152,8 @@ use crate::cende::{AerospikeBlob, BlobParameters, InternalTransactionWithReceipt
 
 pub const CENTRAL_STATE_DIFF_JSON_PATH: &str = "central_state_diff.json";
 pub const CENTRAL_INVOKE_TX_JSON_PATH: &str = "central_invoke_tx.json";
+pub const CENTRAL_INVOKE_TX_CLIENT_SIDE_PROVING_JSON_PATH: &str =
+    "central_invoke_tx_client_side_proving.json";
 pub const CENTRAL_DEPLOY_ACCOUNT_TX_JSON_PATH: &str = "central_deploy_account_tx.json";
 pub const CENTRAL_DECLARE_TX_JSON_PATH: &str = "central_declare_tx.json";
 pub const CENTRAL_L1_HANDLER_TX_JSON_PATH: &str = "central_l1_handler_tx.json";
@@ -162,6 +165,8 @@ pub const CENTRAL_CASM_CONTRACT_CLASS_DEFAULT_OPTIONALS_JSON_PATH: &str =
     "central_contract_class_default_optionals.casm.json";
 pub const CENTRAL_TRANSACTION_EXECUTION_INFO_JSON_PATH: &str =
     "central_transaction_execution_info.json";
+pub const CENTRAL_TRANSACTION_EXECUTION_INFO_WITH_OPCODES_JSON_PATH: &str =
+    "central_transaction_execution_info_with_opcodes.json";
 pub const CENTRAL_TRANSACTION_EXECUTION_INFO_REVERTED_JSON_PATH: &str =
     "central_transaction_execution_info_reverted.json";
 pub const CENTRAL_BLOB_JSON_PATH: &str = "central_blob.json";
@@ -255,8 +260,12 @@ fn central_compressed_state_diff() -> CentralCompressedStateDiff {
     (state_diff, (block_info, starknet_version).into()).into()
 }
 
-fn invoke_transaction() -> RpcInvokeTransaction {
-    RpcInvokeTransaction::V3(RpcInvokeTransactionV3 {
+fn invoke_transaction() -> InternalRpcInvokeTransactionV3 {
+    invoke_transaction_with_proof_facts(ProofFacts::default())
+}
+
+fn invoke_transaction_with_proof_facts(proof_facts: ProofFacts) -> InternalRpcInvokeTransactionV3 {
+    InternalRpcInvokeTransactionV3 {
         resource_bounds: resource_bounds(),
         tip: Tip(1),
         signature: TransactionSignature(felt_vector().into()),
@@ -269,8 +278,8 @@ fn invoke_transaction() -> RpcInvokeTransaction {
         fee_data_availability_mode: DataAvailabilityMode::L1,
         paymaster_data: PaymasterData(vec![]),
         account_deployment_data: AccountDeploymentData(vec![]),
-        proof_facts: ProofFacts::default(),
-    })
+        proof_facts,
+    }
 }
 
 fn central_invoke_tx() -> CentralTransactionWritten {
@@ -281,6 +290,17 @@ fn central_invoke_tx() -> CentralTransactionWritten {
     CentralTransactionWritten {
         tx: CentralTransaction::Invoke(CentralInvokeTransaction::V3((invoke_tx, tx_hash).into())),
         time_created: 1734601615,
+    }
+}
+
+fn central_invoke_tx_client_side_proving() -> CentralTransactionWritten {
+    let invoke_tx = invoke_transaction_with_proof_facts(ProofFacts::snos_proof_facts_for_testing());
+    let tx_hash =
+        TransactionHash(felt!("0x71f8d4162900190e3bcfcce259d99c2e657015c5e429c5f2f2db6c07267358e"));
+
+    CentralTransactionWritten {
+        tx: CentralTransaction::Invoke(CentralInvokeTransaction::V3((invoke_tx, tx_hash).into())),
+        time_created: 1767225600,
     }
 }
 
@@ -376,8 +396,8 @@ fn central_l1_handler_tx() -> CentralTransactionWritten {
     }
 }
 
-fn central_bouncer_weights() -> CentralBouncerWeights {
-    CentralBouncerWeights {
+fn test_bouncer_weights() -> BouncerWeights {
+    BouncerWeights {
         l1_gas: 8,
         message_segment_length: 9,
         n_events: 2,
@@ -385,7 +405,12 @@ fn central_bouncer_weights() -> CentralBouncerWeights {
         sierra_gas: GasAmount(10),
         n_txs: 2,
         proving_gas: GasAmount(11),
+        receipt_l2_gas: GasAmount(7),
     }
+}
+
+fn central_bouncer_weights() -> CentralBouncerWeights {
+    test_bouncer_weights().into()
 }
 
 fn central_fee_market_info() -> CentralFeeMarketInfo {
@@ -475,18 +500,38 @@ fn central_casm_contract_class_default_optional_fields() -> CentralCasmContractC
     CentralCasmContractClass::from(casm_contract_class)
 }
 
-fn execution_resources() -> ExecutionResources {
-    ExecutionResources {
-        n_steps: 2,
-        n_memory_holes: 3,
-        builtin_instance_counter: HashMap::from([
-            (BuiltinName::range_check, 31),
-            (BuiltinName::pedersen, 4),
-        ]),
+fn extended_execution_resources(include_opcodes: bool) -> ExtendedExecutionResources {
+    ExtendedExecutionResources {
+        vm_resources: ExecutionResources {
+            n_steps: 2,
+            n_memory_holes: 3,
+            builtin_instance_counter: BTreeMap::from([
+                (BuiltinName::range_check, 31),
+                (BuiltinName::pedersen, 4),
+            ]),
+        },
+        opcode_instance_counter: if include_opcodes {
+            BTreeMap::from([(OpcodeName::blake, 5)])
+        } else {
+            OpcodeCounterMap::default()
+        },
     }
 }
 
+/// Backward-compatible wrapper: creates CallInfo without opcodes.
 fn call_info() -> CallInfo {
+    build_call_info(false)
+}
+
+/// Creates CallInfo with opcode instance counter populated.
+fn call_info_with_opcodes() -> CallInfo {
+    build_call_info(true)
+}
+
+fn build_call_info(include_opcodes: bool) -> CallInfo {
+    let extended_execution_resources = extended_execution_resources(include_opcodes);
+    let builtin_counters = extended_execution_resources.prover_cairo_primitives();
+
     CallInfo {
         call: CallEntryPoint {
             class_hash: Some(ClassHash(felt!("0x80020000"))),
@@ -527,7 +572,7 @@ fn call_info() -> CallInfo {
             cairo_native: false,
         },
         inner_calls: Vec::new(),
-        resources: execution_resources(),
+        resources: extended_execution_resources,
         tracked_resource: TrackedResource::SierraGas,
         storage_access_tracker: StorageAccessTracker {
             storage_read_values: felt_vector(),
@@ -537,7 +582,7 @@ fn call_info() -> CallInfo {
             read_block_hash_values: vec![BlockHash(felt!("0xdeafbee"))],
             accessed_blocks: HashSet::from([BlockNumber(100)]),
         },
-        builtin_counters: execution_resources().prover_builtins(),
+        builtin_counters,
         syscalls_usage: HashMap::from([
             (SyscallSelector::CallContract, SyscallUsage { call_count: 7, linear_factor: 0 }),
             (SyscallSelector::StorageRead, SyscallUsage { call_count: 4, linear_factor: 0 }),
@@ -547,14 +592,32 @@ fn call_info() -> CallInfo {
     }
 }
 
+fn transaction_execution_info() -> TransactionExecutionInfo {
+    build_transaction_execution_info(false)
+}
+
+fn transaction_execution_info_with_opcodes() -> TransactionExecutionInfo {
+    build_transaction_execution_info(true)
+}
+
 // This object is very long , so in order to test all types of sub-structs and refrain from filling
 // the entire object, we fill only one CallInfo with non-default values and the other CallInfos are
 // None.
-fn transaction_execution_info() -> TransactionExecutionInfo {
+fn build_transaction_execution_info(include_opcodes: bool) -> TransactionExecutionInfo {
+    let call_info = if include_opcodes { call_info_with_opcodes() } else { call_info() };
     TransactionExecutionInfo {
-        validate_call_info: Some(CallInfo { inner_calls: vec![call_info()], ..call_info() }),
-        execute_call_info: Some(CallInfo { inner_calls: vec![call_info()], ..call_info() }),
-        fee_transfer_call_info: Some(CallInfo { inner_calls: vec![call_info()], ..call_info() }),
+        validate_call_info: Some(CallInfo {
+            inner_calls: vec![call_info.clone()],
+            ..call_info.clone()
+        }),
+        execute_call_info: Some(CallInfo {
+            inner_calls: vec![call_info.clone()],
+            ..call_info.clone()
+        }),
+        fee_transfer_call_info: Some(CallInfo {
+            inner_calls: vec![call_info.clone()],
+            ..call_info
+        }),
         revert_error: None,
         receipt: TransactionReceipt {
             fee: Fee(0x26fe9d250e000),
@@ -591,7 +654,7 @@ fn transaction_execution_info() -> TransactionExecutionInfo {
                     },
                 },
                 computation: ComputationResources {
-                    tx_vm_resources: execution_resources(),
+                    tx_extended_vm_resources: extended_execution_resources(include_opcodes),
                     os_vm_resources: ExecutionResources::default(),
                     n_reverted_steps: 2,
                     sierra_gas: GasAmount(0x128140),
@@ -604,6 +667,10 @@ fn transaction_execution_info() -> TransactionExecutionInfo {
 
 fn central_transaction_execution_info() -> CentralTransactionExecutionInfo {
     transaction_execution_info().into()
+}
+
+fn central_transaction_execution_info_with_opcodes() -> CentralTransactionExecutionInfo {
+    transaction_execution_info_with_opcodes().into()
 }
 
 fn central_transaction_execution_info_reverted() -> CentralTransactionExecutionInfo {
@@ -676,13 +743,17 @@ fn central_blob() -> AerospikeBlob {
         state_diff: thin_state_diff(),
         compressed_state_diff: Some(commitment_state_diff()),
         transactions_with_execution_infos,
-        bouncer_weights: central_bouncer_weights(),
+        bouncer_weights: test_bouncer_weights(),
         fee_market_info: central_fee_market_info(),
         casm_hash_computation_data_sierra_gas: central_casm_hash_computation_data(),
         casm_hash_computation_data_proving_gas: central_casm_hash_computation_data(),
         compiled_class_hashes_for_migration: central_compiled_class_hashes_for_migration(),
         proposal_commitment: ProposalCommitment(felt!("0x80020000")),
         parent_proposal_commitment: Some(ProposalCommitment(felt!("0x1000200"))),
+        recent_block_hashes: vec![
+            BlockHashAndNumber { number: BlockNumber(1), hash: BlockHash(felt!("0x1")) },
+            BlockHashAndNumber { number: BlockNumber(2), hash: BlockHash(felt!("0x2")) },
+        ],
     };
 
     // This is to make the function sync (not async) so that it can be used as a case in the
@@ -703,13 +774,14 @@ fn central_blob_with_empty_or_none_fields() -> AerospikeBlob {
         state_diff: thin_state_diff(),
         compressed_state_diff: None,
         transactions_with_execution_infos: vec![],
-        bouncer_weights: central_bouncer_weights(),
+        bouncer_weights: test_bouncer_weights(),
         fee_market_info: central_fee_market_info(),
         casm_hash_computation_data_sierra_gas: central_casm_hash_computation_data(),
         casm_hash_computation_data_proving_gas: central_casm_hash_computation_data(),
         compiled_class_hashes_for_migration: vec![],
         proposal_commitment: ProposalCommitment(felt!("0x80020000")),
         parent_proposal_commitment: None,
+        recent_block_hashes: vec![],
     };
 
     // This is to make the function sync (not async) so that it can be used as a case in the
@@ -721,6 +793,19 @@ fn central_blob_with_empty_or_none_fields() -> AerospikeBlob {
             Arc::new(mock_class_manager),
         ))
         .unwrap()
+}
+
+fn message_to_l1_from_serialized_fields(
+    from_address: &str,
+    to_address: &str,
+    payload: Vec<&str>,
+) -> StarknetAPIMessageToL1 {
+    StarknetAPIMessageToL1 {
+        from_address: contract_address!(from_address),
+        to_address: EthAddress::try_from(felt!(to_address))
+            .expect("Failed to convert to_address to EthAddress"),
+        payload: L2ToL1Payload(payload.into_iter().map(|s| felt!(s)).collect::<Vec<_>>()),
+    }
 }
 
 fn event_from_serialized_fields(from_address: &str, keys: Vec<&str>, data: Vec<&str>) -> Event {
@@ -813,6 +898,8 @@ fn starknet_preconfiremd_block() -> CendePreconfirmedBlock {
             // Irrelevant for V3 InvokeTransaction.
             entry_point_selector: None,
             max_fee: None,
+            // Test with non-empty proof_facts for client-side proving.
+            proof_facts: Some(ProofFacts::snos_proof_facts_for_testing()),
         }),
         CendePreconfirmedTransaction::Invoke(IntermediateInvokeTransaction {
             resource_bounds: Some(
@@ -876,6 +963,8 @@ fn starknet_preconfiremd_block() -> CendePreconfirmedBlock {
             // Irrelevant for V3 InvokeTransaction.
             entry_point_selector: None,
             max_fee: None,
+            // Test without proof_facts (standard flow without client-side proving).
+            proof_facts: None,
         }),
     ];
 
@@ -885,7 +974,18 @@ fn starknet_preconfiremd_block() -> CendePreconfirmedBlock {
             "0xa07cd0a966655216edb9bf3982e8c3ee6321c7fb7a218c5c25e30c462f3f39"
         )),
         l1_to_l2_consumed_message: None,
-        l2_to_l1_messages: vec![],
+        l2_to_l1_messages: vec![
+            message_to_l1_from_serialized_fields(
+                "0x53c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8",
+                "0x2",
+                vec!["0x2000", "0x2001", "0x2002", "0x2003", "0x2004"],
+            ),
+            message_to_l1_from_serialized_fields(
+                "0x67e7555f9ff00f5c4e9b353ad1f400e2274964ea0942483fae97363fd5d7958",
+                "0x3",
+                vec!["0x3000", "0x3001"],
+            ),
+        ],
         events: vec![
             event_from_serialized_fields(
                 "0x53c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8",
@@ -990,6 +1090,10 @@ fn starknet_preconfiremd_block() -> CendePreconfirmedBlock {
 #[case::compressed_state_diff(central_compressed_state_diff(), CENTRAL_STATE_DIFF_JSON_PATH)]
 #[case::state_diff(central_state_diff(), CENTRAL_STATE_DIFF_JSON_PATH)]
 #[case::invoke_tx(central_invoke_tx(), CENTRAL_INVOKE_TX_JSON_PATH)]
+#[case::invoke_tx_client_side_proving(
+    central_invoke_tx_client_side_proving(),
+    CENTRAL_INVOKE_TX_CLIENT_SIDE_PROVING_JSON_PATH
+)]
 #[case::deploy_account_tx(central_deploy_account_tx(), CENTRAL_DEPLOY_ACCOUNT_TX_JSON_PATH)]
 #[case::declare_tx(central_declare_tx(), CENTRAL_DECLARE_TX_JSON_PATH)]
 #[case::l1_handler_tx(central_l1_handler_tx(), CENTRAL_L1_HANDLER_TX_JSON_PATH)]
@@ -1007,6 +1111,10 @@ fn starknet_preconfiremd_block() -> CendePreconfirmedBlock {
 #[case::transaction_execution_info(
     central_transaction_execution_info(),
     CENTRAL_TRANSACTION_EXECUTION_INFO_JSON_PATH
+)]
+#[case::transaction_execution_info_with_opcodes(
+    central_transaction_execution_info_with_opcodes(),
+    CENTRAL_TRANSACTION_EXECUTION_INFO_WITH_OPCODES_JSON_PATH
 )]
 #[case::transaction_execution_info_reverted(
     central_transaction_execution_info_reverted(),
@@ -1099,5 +1207,5 @@ fn test_invoke_tx_size_of() {
     // + internal_invoke_tx.tip.dynamic_size();
     // + internal_invoke_tx.proof_facts.dynamic_size();
 
-    assert_eq!(invoke_tx.size_bytes(), 480);
+    assert_eq!(invoke_tx.size_bytes(), 488);
 }

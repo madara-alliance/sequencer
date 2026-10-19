@@ -1,23 +1,22 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::{Arc, LazyLock};
 
-use apollo_gateway_config::config::RpcStateReaderConfig;
 use apollo_rpc_execution::{ETH_FEE_CONTRACT_ADDRESS, STRK_FEE_CONTRACT_ADDRESS};
 use blockifier::context::{ChainInfo, FeeTokenAddresses};
 use blockifier::execution::contract_class::{CompiledClassV0, CompiledClassV1};
-use blockifier::state::cached_state::{CommitmentStateDiff, StateMaps};
+use blockifier::state::cached_state::CommitmentStateDiff;
 use blockifier::state::global_cache::CompiledClasses;
 use blockifier::state::state_api::StateResult;
 use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
-use serde::{Deserialize, Serialize};
+use starknet_api::block::BlockNumber;
 use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{ChainId, ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::state::{SierraContractClass, StorageKey};
 use starknet_types_core::felt::Felt;
 
-use crate::errors::ReexecutionError;
+use crate::state_reader::config::RpcStateReaderConfig;
 
 pub static RPC_NODE_URL: LazyLock<String> = LazyLock::new(|| {
     env::var("TEST_URL")
@@ -48,12 +47,18 @@ pub fn contract_class_to_compiled_classes(
     }
 }
 
-/// Returns the fee token addresses of mainnet.
-pub fn get_fee_token_addresses(chain_id: &ChainId) -> FeeTokenAddresses {
+/// Returns the fee token addresses for the given chain.
+/// If `strk_fee_token_address_override` is provided, it overrides the default STRK fee token
+/// address.
+pub fn get_fee_token_addresses(
+    chain_id: &ChainId,
+    strk_fee_token_address_override: Option<ContractAddress>,
+) -> FeeTokenAddresses {
     match chain_id {
         // Mainnet, testnet and integration systems have the same fee token addresses.
         ChainId::Mainnet | ChainId::Sepolia | ChainId::IntegrationSepolia => FeeTokenAddresses {
-            strk_fee_token_address: *STRK_FEE_CONTRACT_ADDRESS,
+            strk_fee_token_address: strk_fee_token_address_override
+                .unwrap_or(*STRK_FEE_CONTRACT_ADDRESS),
             eth_fee_token_address: *ETH_FEE_CONTRACT_ADDRESS,
         },
         unknown_chain => unimplemented!("Unknown chain ID {unknown_chain}."),
@@ -65,11 +70,14 @@ pub fn get_rpc_state_reader_config() -> RpcStateReaderConfig {
     RpcStateReaderConfig::from_url(RPC_NODE_URL.clone())
 }
 
-/// Returns the chain info of mainnet.
-pub fn get_chain_info(chain_id: &ChainId) -> ChainInfo {
+/// Returns the chain info for the given chain.
+pub fn get_chain_info(
+    chain_id: &ChainId,
+    strk_fee_token_address_override: Option<ContractAddress>,
+) -> ChainInfo {
     ChainInfo {
         chain_id: chain_id.clone(),
-        fee_token_addresses: get_fee_token_addresses(chain_id),
+        fee_token_addresses: get_fee_token_addresses(chain_id, strk_fee_token_address_override),
         is_l3: false,
     }
 }
@@ -84,60 +92,6 @@ pub(crate) fn disjoint_hashmap_union<K: std::hash::Hash + std::cmp::Eq, V>(
     // verify union length is sum of lengths (disjoint union)
     assert_eq!(union_map.len(), expected_len, "Intersection of hashmaps is not empty.");
     union_map
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReexecutionStateMaps {
-    nonces: HashMap<ContractAddress, Nonce>,
-    class_hashes: HashMap<ContractAddress, ClassHash>,
-    storage: HashMap<ContractAddress, HashMap<StorageKey, Felt>>,
-    compiled_class_hashes: HashMap<ClassHash, CompiledClassHash>,
-    declared_contracts: HashMap<ClassHash, bool>,
-}
-
-impl From<StateMaps> for ReexecutionStateMaps {
-    fn from(value: StateMaps) -> Self {
-        let mut storage: HashMap<ContractAddress, HashMap<StorageKey, Felt>> = HashMap::new();
-        for ((address, key), v) in value.storage {
-            match storage.get_mut(&address) {
-                Some(entry) => {
-                    entry.insert(key, v);
-                }
-                None => {
-                    let mut entry = HashMap::new();
-                    entry.insert(key, v);
-                    storage.insert(address, entry);
-                }
-            }
-        }
-        ReexecutionStateMaps {
-            nonces: value.nonces,
-            class_hashes: value.class_hashes,
-            storage,
-            compiled_class_hashes: value.compiled_class_hashes,
-            declared_contracts: value.declared_contracts,
-        }
-    }
-}
-
-impl TryFrom<ReexecutionStateMaps> for StateMaps {
-    type Error = ReexecutionError;
-
-    fn try_from(value: ReexecutionStateMaps) -> Result<Self, Self::Error> {
-        let mut storage: HashMap<(ContractAddress, StorageKey), Felt> = HashMap::new();
-        for (address, inner_map) in value.storage {
-            for (key, v) in inner_map {
-                storage.insert((address, key), v);
-            }
-        }
-        Ok(StateMaps {
-            nonces: value.nonces,
-            class_hashes: value.class_hashes,
-            storage,
-            compiled_class_hashes: value.compiled_class_hashes,
-            declared_contracts: value.declared_contracts,
-        })
-    }
 }
 
 #[macro_export]
@@ -158,12 +112,9 @@ macro_rules! retry_request {
                             .iter()
                             .any(|s| e.to_string().contains(s)) =>
                     {
-                        println!(
-                            "Attempt {}: Retrying request due to error: {:?}",
-                            attempt_number, e
-                        );
-                        println!(
-                            "Retry delay in milliseconds: {}",
+                        tracing::warn!(
+                            "Attempt {attempt_number}: Retrying request due to error: {e:?}. \
+                             Retry delay in milliseconds: {}",
                             $retry_config.retry_interval_milliseconds
                         );
                         retry::OperationResult::Retry(e)
@@ -215,6 +166,25 @@ impl From<CommitmentStateDiff> for ComparableStateDiff {
             ),
         }
     }
+}
+
+/// Compares two state diffs, Returns `true` if they match.
+/// On mismatch, logs a detailed diff.
+pub fn compare_state_diffs(
+    expected_state_diff: CommitmentStateDiff,
+    actual_state_diff: CommitmentStateDiff,
+    block_number: BlockNumber,
+) -> bool {
+    let expected = ComparableStateDiff::from(expected_state_diff);
+    let actual = ComparableStateDiff::from(actual_state_diff);
+    let is_match = expected == actual;
+    if !is_match {
+        let expected_str = format!("{expected:#?}");
+        let actual_str = format!("{actual:#?}");
+        let diff = pretty_assertions::StrComparison::new(&expected_str, &actual_str);
+        tracing::warn!("State diff mismatch for block {block_number}.\n{diff}");
+    }
+    is_match
 }
 
 /// Asserts equality between two `CommitmentStateDiff` structs, ignoring insertion order.

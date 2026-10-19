@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, Index};
 use std::sync::{Arc, LazyLock};
 
@@ -20,7 +20,7 @@ use cairo_vm::serde::deserialize_program::{
 };
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::types::errors::program_errors::ProgramError;
-use cairo_vm::types::program::Program;
+use cairo_vm::types::program::{HintsCollection, Program};
 use cairo_vm::types::relocatable::MaybeRelocatable;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use itertools::Itertools;
@@ -44,11 +44,11 @@ use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::Blake2Felt252;
 
 use crate::abi::constants::{self};
+use crate::execution::call_info::ExtendedExecutionResources;
 use crate::execution::casm_hash_estimation::{
     CasmV1HashResourceEstimate,
     CasmV2HashResourceEstimate,
     EstimateCasmHashResources,
-    EstimatedExecutionResources,
 };
 use crate::execution::entry_point::{EntryPointExecutionContext, EntryPointTypeAndSelector};
 use crate::execution::errors::PreExecutionError;
@@ -194,6 +194,17 @@ impl NestedFeltCounts {
     }
 }
 
+impl From<&NestedFeltCounts> for NestedIntList {
+    fn from(counts: &NestedFeltCounts) -> Self {
+        match counts {
+            NestedFeltCounts::Leaf(len, _) => NestedIntList::Leaf(*len),
+            NestedFeltCounts::Node(segments) => {
+                NestedIntList::Node(segments.iter().map(Into::into).collect())
+            }
+        }
+    }
+}
+
 /// The resource used to run a contract function.
 #[cfg_attr(feature = "transaction_serde", derive(serde::Deserialize))]
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Serialize)]
@@ -236,7 +247,7 @@ impl RunnableCompiledClass {
         }
     }
 
-    pub fn estimate_casm_hash_computation_resources(&self) -> EstimatedExecutionResources {
+    pub fn estimate_casm_hash_computation_resources(&self) -> ExtendedExecutionResources {
         match self {
             Self::V0(class) => CasmV2HashResourceEstimate::from_resources(
                 class.estimate_casm_hash_computation_resources(),
@@ -248,7 +259,7 @@ impl RunnableCompiledClass {
     }
 
     /// Estimate the VM gas required to migrate a CompiledClassHash from Poseidon hashing to Blake.
-    pub fn estimate_compiled_class_hash_migration_resources(&self) -> EstimatedExecutionResources {
+    pub fn estimate_compiled_class_hash_migration_resources(&self) -> ExtendedExecutionResources {
         match self {
             Self::V0(_) => panic!(
                 "v0 contracts do not have a Compiled Class Hash and therefore shouldn't be \
@@ -356,7 +367,7 @@ impl CompiledClassV0 {
         ExecutionResources {
             n_steps,
             n_memory_holes: 0,
-            builtin_instance_counter: HashMap::from([(BuiltinName::pedersen, hashed_data_size)]),
+            builtin_instance_counter: BTreeMap::from([(BuiltinName::pedersen, hashed_data_size)]),
         }
     }
 
@@ -435,7 +446,7 @@ impl CompiledClassV1 {
     /// Returns the estimated VM resources required for computing Casm hash.
     /// This is an empiric measurement of several bytecode lengths, which constitutes as the
     /// dominant factor in it.
-    fn estimate_casm_hash_computation_resources(&self) -> EstimatedExecutionResources {
+    fn estimate_casm_hash_computation_resources(&self) -> ExtendedExecutionResources {
         CasmV2HashResourceEstimate::estimated_resources_of_compiled_class_hash(
             &self.bytecode_segment_felt_sizes,
             &self.entry_points_by_type,
@@ -453,7 +464,7 @@ impl CompiledClassV1 {
     /// Returns:
     /// - Total gas amount.
     /// - The builtins used in the Poseidon hash.
-    fn estimate_compiled_class_hash_migration_resources(&self) -> EstimatedExecutionResources {
+    fn estimate_compiled_class_hash_migration_resources(&self) -> ExtendedExecutionResources {
         let blake_hash_resources =
             CasmV2HashResourceEstimate::estimated_resources_of_compiled_class_hash(
                 &self.bytecode_segment_felt_sizes,
@@ -466,15 +477,8 @@ impl CompiledClassV1 {
                 &self.entry_points_by_type,
             );
 
-        let migration_resources = EstimatedExecutionResources::V2Hash {
-            // Can't use `+` operator on `EstimatedExecutionResources` because the resources are of
-            // different enum variants.
-            resources: blake_hash_resources.resources_ref()
-                + poseidon_hash_resources.resources_ref(),
-            blake_count: blake_hash_resources.blake_count(),
-        };
-
-        migration_resources
+        // Combine VM resources from both hash variants and keep blake opcodes from the V2 hash.
+        &blake_hash_resources + &poseidon_hash_resources
     }
 
     // Returns the set of segments that were visited according to the given visited PCs.
@@ -698,6 +702,29 @@ fn hint_to_hint_params(hint: &Hint) -> Result<HintParams, ProgramError> {
     })
 }
 
+/// Converts `HintParams` back to `Hint` by deserializing the JSON code.
+/// This is the reverse of `hint_to_hint_params`.
+fn hint_params_to_hint(hint_params: &HintParams) -> Result<Hint, ProgramError> {
+    Ok(serde_json::from_str(&hint_params.code)?)
+}
+
+/// Converts `BTreeMap<usize, Vec<HintParams>>` back to `Vec<(usize, Vec<Hint>)>`.
+/// This is the reverse of the conversion done in `TryFrom<VersionedCasm> for CompiledClassV1`.
+pub fn program_hints_to_casm_hints(
+    program_hints: &HintsCollection,
+) -> Result<Vec<(usize, Vec<Hint>)>, ProgramError> {
+    let program_hints: BTreeMap<usize, Vec<HintParams>> = program_hints.into();
+    let mut casm_hints: Vec<(usize, Vec<Hint>)> = Vec::new();
+    for (i, hint_params_list) in program_hints.iter() {
+        let hints: Vec<Hint> = hint_params_list
+            .iter()
+            .map(hint_params_to_hint)
+            .collect::<Result<Vec<Hint>, ProgramError>>()?;
+        casm_hints.push((*i, hints));
+    }
+    Ok(casm_hints)
+}
+
 fn convert_entry_points_v1(external: &[CasmContractEntryPoint]) -> Vec<EntryPointV1> {
     external
         .iter()
@@ -735,6 +762,26 @@ impl From<&CasmContractEntryPoints> for EntryPointsByType<EntryPointV1> {
 impl From<CasmContractEntryPoints> for EntryPointsByType<EntryPointV1> {
     fn from(entry_points_by_type: CasmContractEntryPoints) -> Self {
         (&entry_points_by_type).into()
+    }
+}
+
+impl From<&EntryPointV1> for CasmContractEntryPoint {
+    fn from(ep: &EntryPointV1) -> Self {
+        CasmContractEntryPoint {
+            selector: ep.selector.0.to_biguint(),
+            offset: ep.offset.0,
+            builtins: ep.builtins.iter().map(|b| b.to_str().to_string()).collect(),
+        }
+    }
+}
+
+impl From<&EntryPointsByType<EntryPointV1>> for CasmContractEntryPoints {
+    fn from(entry_points: &EntryPointsByType<EntryPointV1>) -> Self {
+        CasmContractEntryPoints {
+            external: entry_points.external.iter().map(Into::into).collect(),
+            l1_handler: entry_points.l1_handler.iter().map(Into::into).collect(),
+            constructor: entry_points.constructor.iter().map(Into::into).collect(),
+        }
     }
 }
 

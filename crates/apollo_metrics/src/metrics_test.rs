@@ -5,7 +5,6 @@ use metrics::set_default_local_recorder;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rstest::rstest;
 use strum::VariantNames;
-use strum_macros::EnumVariantNames;
 
 use crate::generate_permutation_labels;
 use crate::metrics::{HistogramValue, LabeledMetricHistogram, MetricHistogram, MetricScope};
@@ -17,13 +16,13 @@ const LABEL_TYPE_NAME: &str = "label";
 const VALUE_TYPE_NAME: &str = "value";
 
 #[allow(dead_code)]
-#[derive(Debug, EnumVariantNames, Clone, Copy)]
+#[derive(Debug, VariantNames, Clone, Copy)]
 enum TestLabelType {
     Label1,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, EnumVariantNames, Clone, Copy)]
+#[derive(Debug, VariantNames, Clone, Copy)]
 enum TestLabelValue {
     Value1,
     Value2,

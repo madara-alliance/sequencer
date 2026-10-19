@@ -94,16 +94,7 @@ func compute_contract_state_commitment{hash_ptr: HashBuiltin*, range_check_ptr}(
     local initial_root;
     local final_root;
 
-    %{
-        ids.initial_root = block_input.contract_state_commitment_info.previous_root
-        ids.final_root = block_input.contract_state_commitment_info.updated_root
-        commitment_facts = block_input.contract_state_commitment_info.commitment_facts.items()
-        preimage = {
-            int(root): children
-            for root, children in commitment_facts
-        }
-        assert block_input.contract_state_commitment_info.tree_height == ids.MERKLE_HEIGHT
-    %}
+    %{ SetPreimageForStateCommitments %}
 
     // Call patricia_update_using_update_constants() instead of patricia_update()
     // in order not to repeat globals_pow2 calculation.
@@ -166,23 +157,14 @@ func hash_contract_state_changes{hash_ptr: HashBuiltin*, range_check_ptr}(
     local initial_contract_state_root;
     local final_contract_state_root;
 
-    %{
-        commitment_info = commitment_info_by_address[ids.contract_address]
-        ids.initial_contract_state_root = commitment_info.previous_root
-        ids.final_contract_state_root = commitment_info.updated_root
-        preimage = {
-            int(root): children
-            for root, children in commitment_info.commitment_facts.items()
-        }
-        assert commitment_info.tree_height == ids.MERKLE_HEIGHT
-    %}
+    %{ SetPreimageForCurrentCommitmentInfo %}
 
     local state_dict_start: DictAccess* = prev_state.storage_ptr;
     local state_dict_end: DictAccess* = new_state.storage_ptr;
     local n_updates = (state_dict_end - state_dict_start) / DictAccess.SIZE;
     // Call patricia_update_using_update_constants() (or the read-optimized variant) instead of
     // patricia_update() in order not to repeat globals_pow2 calculation.
-    tempvar should_use_read_optimized: felt;
+    local should_use_read_optimized: felt;
     %{ ShouldUseReadOptimizedPatriciaUpdate %}
     if (should_use_read_optimized != 0) {
         patricia_update_read_optimized(
@@ -203,7 +185,7 @@ func hash_contract_state_changes{hash_ptr: HashBuiltin*, range_check_ptr}(
             new_root=final_contract_state_root,
         );
     }
-    tempvar range_check_ptr = range_check_ptr;
+    local range_check_ptr = range_check_ptr;
 
     let (prev_value) = get_contract_state_hash(
         class_hash=prev_state.class_hash,
@@ -280,16 +262,7 @@ func compute_class_commitment{poseidon_ptr: PoseidonBuiltin*, range_check_ptr}(
     // Guess the initial and final roots of the contract class tree.
     local initial_root;
     local final_root;
-    %{
-        ids.initial_root = block_input.contract_class_commitment_info.previous_root
-        ids.final_root = block_input.contract_class_commitment_info.updated_root
-        commitment_facts = block_input.contract_class_commitment_info.commitment_facts.items()
-        preimage = {
-            int(root): children
-            for root, children in commitment_facts
-        }
-        assert block_input.contract_class_commitment_info.tree_height == ids.MERKLE_HEIGHT
-    %}
+    %{ SetPreimageForClassCommitments %}
 
     // Create a dictionary mapping class hash to the contract class leaf hash,
     // to prepare the input for the commitment tree update.

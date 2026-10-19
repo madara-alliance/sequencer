@@ -18,8 +18,9 @@ use apollo_monitoring_endpoint_config::config::{
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Router;
-use hyper::body::to_bytes;
-use hyper::Client;
+use http_body_util::BodyExt;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use metrics::{counter, describe_counter};
 use pretty_assertions::assert_eq;
 use serde_json::{from_slice, to_value, Value};
@@ -28,7 +29,7 @@ use starknet_api::core::{ContractAddress, Nonce};
 use starknet_api::{nonce, tx_hash};
 use tokio::spawn;
 use tokio::task::yield_now;
-use tower::ServiceExt;
+use tower::util::ServiceExt;
 
 use crate::monitoring_endpoint::{
     create_monitoring_endpoint,
@@ -70,7 +71,7 @@ async fn node_version() {
     let response = request_app(setup_monitoring_endpoint(None).app(), VERSION).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = to_bytes(response.into_body()).await.unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], TEST_VERSION.as_bytes());
 }
 
@@ -121,7 +122,7 @@ async fn with_metrics() {
     describe_counter!(metric_name, metric_help);
     let response = request_app(app, METRICS).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body_bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body_string = String::from_utf8(body_bytes.to_vec()).unwrap();
     let expected_prefix = format!(
         "# HELP {metric_name} {metric_help}\n# TYPE {metric_name} counter\n{metric_name} \
@@ -147,12 +148,12 @@ async fn endpoint_as_server() {
 
     let MonitoringEndpointConfig { ip, port, .. } = MonitoringEndpointConfig::default();
 
-    let client = Client::new();
+    let client = Client::builder(TokioExecutor::new()).build_http();
 
     let response = client.request(build_request(&ip, port, VERSION)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = to_bytes(response.into_body()).await.unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], TEST_VERSION.as_bytes());
 }
 
@@ -201,7 +202,7 @@ async fn mempool_snapshot() {
 
     let response = request_app(app, MEMPOOL_SNAPSHOT).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body_bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
 
     let expected_json =
         to_value(expected_mempool_snapshot()).expect("Failed to serialize MempoolSnapshot");
@@ -266,7 +267,7 @@ async fn l1_provider_snapshot() {
 
     let response = request_app(app, L1_PROVIDER_SNAPSHOT).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body_bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
 
     let expected_json =
         to_value(expected_l1_provider_snapshot()).expect("Failed to serialize L1ProviderSnapshot");

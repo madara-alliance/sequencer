@@ -1,4 +1,4 @@
-use blockifier::blockifier::config::ContractClassManagerConfig;
+use blockifier::blockifier::config::{CairoNativeRunConfig, ContractClassManagerConfig};
 use blockifier::state::contract_class_manager::ContractClassManager;
 use rstest::rstest;
 use starknet_api::block::BlockNumber;
@@ -15,8 +15,8 @@ fn reexecute_block_for_testing(block_number: u64) {
     // Initialize the contract class manager.
     let mut contract_class_manager_config = ContractClassManagerConfig::default();
     if cfg!(feature = "cairo_native") {
-        contract_class_manager_config.cairo_native_run_config.wait_on_native_compilation = true;
-        contract_class_manager_config.cairo_native_run_config.run_cairo_native = true;
+        contract_class_manager_config.cairo_native_run_config =
+            CairoNativeRunConfig::wait_on_compilation_for_testing();
     }
     let contract_class_manager = ContractClassManager::start(contract_class_manager_config);
 
@@ -38,6 +38,7 @@ fn reexecute_block_for_testing(block_number: u64) {
 #[case::v_0_13_5(1300000)]
 #[case::v_0_13_6(1743490)]
 #[case::v_0_14_0(2509604)]
+#[case::v_0_14_1(4448394)]
 #[case::first_v_0_13_5_rpc_v8(1400000)]
 #[case::second_v_0_13_5_rpc_v8(1450000)]
 #[case::invoke_with_replace_class_syscall(780008)]

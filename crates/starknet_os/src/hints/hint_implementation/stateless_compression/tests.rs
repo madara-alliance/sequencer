@@ -15,7 +15,7 @@ use super::utils::{
     compress,
     get_bucket_offsets,
     get_n_elms_per_felt,
-    pack_usize_in_felts,
+    pack_in_felts,
     BitsArray,
     BucketElement,
     BucketElement125,
@@ -31,7 +31,8 @@ use crate::hints::error::OsHintError;
 use crate::hints::hint_implementation::stateless_compression::utils::{
     decompress,
     unpack_felts,
-    unpack_felts_to_usize,
+    unpack_felts_to,
+    ElmBoundType,
 };
 use crate::test_utils::cairo_runner::{
     initialize_cairo_runner,
@@ -43,6 +44,81 @@ use crate::test_utils::cairo_runner::{
 };
 
 const COMPRESSION_MODULE_PATH: &str = "starkware.starknet.core.os.data_availability.compression";
+
+/// Runs the OS unpack_felts function and returns the unpacked felts + resources used.
+fn cairo_unpack_felts(
+    compressed: &[Felt],
+    elm_bound: u128,
+    n_elms: usize,
+) -> (Vec<Felt>, ExecutionResources) {
+    let runner_config = EntryPointRunnerConfig {
+        layout: LayoutName::starknet,
+        add_main_prefix_to_entrypoint: false,
+        ..Default::default()
+    };
+    let mut implicit_args = vec![ImplicitArg::Builtin(BuiltinName::range_check)];
+    let (mut runner, program, entrypoint) = initialize_cairo_runner(
+        &runner_config,
+        OS_PROGRAM_BYTES,
+        &format!("{COMPRESSION_MODULE_PATH}.unpack_felts"),
+        &implicit_args,
+        HashMap::new(),
+    )
+    .unwrap();
+
+    // Function accepts start pointer of the compressed data, and destination pointer of the
+    // unpacked felts, as implicit arguments.
+    let compressed_start = runner
+        .vm
+        .gen_arg(&compressed.iter().map(|x| MaybeRelocatable::Int(*x)).collect::<Vec<_>>())
+        .unwrap()
+        .get_relocatable()
+        .unwrap();
+    let decompressed_start = runner.vm.add_memory_segment();
+    implicit_args.extend([
+        ImplicitArg::NonBuiltin(EndpointArg::Value(ValueArg::Single(compressed_start.into()))),
+        ImplicitArg::NonBuiltin(EndpointArg::Value(ValueArg::Single(decompressed_start.into()))),
+    ]);
+
+    let explicit_args = vec![
+        EndpointArg::Value(ValueArg::Single(n_elms.into())),
+        EndpointArg::Value(ValueArg::Single(Felt::from(elm_bound).into())),
+        EndpointArg::Value(ValueArg::Single(Felt::from(get_n_elms_per_felt(elm_bound)).into())),
+    ];
+
+    // Run the entrypoint.
+    // The unpacked data is stored in the segment starting at `decompressed_start`, the returned
+    // implicit value is the end of the unpacked data.
+    let state_reader = None;
+    let expected_explicit_return_values = vec![];
+    let (implicit_return_values, _explicit_return_values, _hint_processor) =
+        run_cairo_0_entrypoint(
+            entrypoint,
+            &explicit_args,
+            &implicit_args,
+            state_reader,
+            &mut runner,
+            &program,
+            &runner_config,
+            &expected_explicit_return_values,
+        )
+        .unwrap();
+
+    // The implicit return values are [range_check_ptr, compressed_start, decompressed_end].
+    assert_eq!(implicit_return_values.len(), 3);
+    let EndpointArg::Value(ValueArg::Single(MaybeRelocatable::RelocatableValue(decompressed_end))) =
+        implicit_return_values[2]
+    else {
+        panic!("Unexpected implicit return values, got: {implicit_return_values:?}");
+    };
+
+    // Read the compressed data from the segment and return.
+    let unpacked_data = runner
+        .vm
+        .get_integer_range(decompressed_start, (decompressed_end - decompressed_start).unwrap())
+        .unwrap();
+    (unpacked_data.into_iter().map(|f| *f).collect(), runner.get_execution_resources().unwrap())
+}
 
 /// Runs the OS compression function and returns the compressed data, plus the execution resources
 /// used to compress the data.
@@ -238,9 +314,43 @@ fn test_buckets() {
 fn test_usize_pack_and_unpack() {
     let nums = vec![34, 0, 11111, 1034, 3404, 16, 32, 127, 129, 128];
     let elm_bound = 12345;
-    let packed = pack_usize_in_felts(&nums, elm_bound);
-    let unpacked = unpack_felts_to_usize(packed.as_ref(), nums.len(), elm_bound);
+    let packed = pack_in_felts(&nums, elm_bound);
+    let unpacked = unpack_felts_to::<usize>(packed.as_ref(), nums.len(), elm_bound);
     assert_eq!(nums, unpacked);
+}
+
+#[rstest]
+#[case::trivial(vec![], 0, None)]
+#[case::powers_of_two_plus_one((0..125).map(|i| 2_u128.pow(i) + 1).collect(), 63, Some(23))]
+#[case::small_number_range((0..2u128.pow(15)).collect(), 2usize.pow(11), Some(15))]
+#[case::large_number_range(
+    (0..2u128.pow(10)).map(|i| 2u128.pow(30) + i).collect(), 2usize.pow(7), Some(16)
+)]
+fn test_unpack_felts(
+    #[case] elms: Vec<u128>,
+    #[case] expected_compression_length: usize,
+    #[case] expected_n_steps_per_elm: Option<usize>,
+) {
+    let elm_bound = elms.iter().max().unwrap_or(&0) + 1;
+    let n_elms = elms.len();
+    let compressed = pack_in_felts(&elms, elm_bound);
+    let felt_bound = Felt::TWO.pow(251u8);
+    assert!(compressed.iter().all(|f| *f < felt_bound));
+    assert_eq!(compressed.len(), expected_compression_length);
+
+    let elm_felts: Vec<_> = elms.into_iter().map(Felt::from).collect();
+    assert_eq!(
+        elm_felts,
+        unpack_felts_to::<u128>(&compressed, n_elms, elm_bound)
+            .into_iter()
+            .map(Felt::from)
+            .collect::<Vec<Felt>>()
+    );
+    let (cairo_unpacked, resources) = cairo_unpack_felts(&compressed, elm_bound, n_elms);
+    assert_eq!(elm_felts, cairo_unpacked);
+    if n_elms > 0 {
+        assert_eq!(resources.n_steps / n_elms, expected_n_steps_per_elm.unwrap());
+    }
 }
 
 #[test]
@@ -407,10 +517,10 @@ fn test_compression_length(
 
     let n_unique_values = data.iter().collect::<HashSet<_>>().len();
     let n_repeated_values = data.len() - n_unique_values;
-    let expected_repeated_value_pointers_packed_length =
-        n_repeated_values.div_ceil(get_n_elms_per_felt(u32::try_from(n_unique_values).unwrap()));
+    let expected_repeated_value_pointers_packed_length = n_repeated_values
+        .div_ceil(get_n_elms_per_felt(ElmBoundType::try_from(n_unique_values).unwrap()));
     let expected_bucket_indices_packed_length =
-        data.len().div_ceil(get_n_elms_per_felt(u32::try_from(TOTAL_N_BUCKETS).unwrap()));
+        data.len().div_ceil(get_n_elms_per_felt(ElmBoundType::try_from(TOTAL_N_BUCKETS).unwrap()));
 
     assert_eq!(
         compressed.len(),
@@ -428,7 +538,7 @@ fn test_compression_length(
 #[rstest]
 #[case(128, 35)]
 #[case(7, 83)]
-fn test_get_n_elms_per_felt(#[case] elm_bound: u32, #[case] expected_n_elems: usize) {
+fn test_get_n_elms_per_felt(#[case] elm_bound: ElmBoundType, #[case] expected_n_elems: usize) {
     assert_eq!(get_n_elms_per_felt(elm_bound), expected_n_elems);
 }
 

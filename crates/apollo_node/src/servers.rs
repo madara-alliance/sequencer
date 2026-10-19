@@ -5,6 +5,8 @@ use apollo_batcher::communication::{LocalBatcherServer, RemoteBatcherServer};
 use apollo_batcher::metrics::BATCHER_INFRA_METRICS;
 use apollo_class_manager::communication::{LocalClassManagerServer, RemoteClassManagerServer};
 use apollo_class_manager::metrics::CLASS_MANAGER_INFRA_METRICS;
+use apollo_committer::communication::{LocalCommitterServer, RemoteCommitterServer};
+use apollo_committer::metrics::COMMITTER_INFRA_METRICS;
 use apollo_compile_to_casm::communication::{
     LocalSierraCompilerServer,
     RemoteSierraCompilerServer,
@@ -23,11 +25,6 @@ use apollo_infra::component_server::{
     RemoteComponentServer,
     WrapperServer,
 };
-use apollo_l1_endpoint_monitor::communication::{
-    LocalL1EndpointMonitorServer,
-    RemoteL1EndpointMonitorServer,
-};
-use apollo_l1_endpoint_monitor_types::L1_ENDPOINT_MONITOR_INFRA_METRICS;
 use apollo_l1_gas_price::communication::{
     L1GasPriceScraperServer,
     LocalL1GasPriceServer,
@@ -54,6 +51,8 @@ use apollo_node_config::component_execution_config::{
     ReactiveComponentExecutionMode,
 };
 use apollo_node_config::node_config::SequencerNodeConfig;
+use apollo_proof_manager::communication::{LocalProofManagerServer, RemoteProofManagerServer};
+use apollo_proof_manager::metrics::PROOF_MANAGER_INFRA_METRICS;
 use apollo_signature_manager::communication::{
     LocalSignatureManagerServer,
     RemoteSignatureManagerServer,
@@ -64,6 +63,7 @@ use apollo_state_sync::{LocalStateSyncServer, RemoteStateSyncServer};
 use apollo_state_sync_metrics::metrics::STATE_SYNC_INFRA_METRICS;
 use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt};
+use papyrus_base_layer::cyclic_base_layer_wrapper::CyclicBaseLayerWrapper;
 use papyrus_base_layer::ethereum_base_layer_contract::EthereumBaseLayerContract;
 use tracing::info;
 
@@ -77,13 +77,14 @@ use crate::components::SequencerNodeComponents;
 struct LocalServers {
     pub(crate) batcher: Option<Box<LocalBatcherServer>>,
     pub(crate) class_manager: Option<Box<LocalClassManagerServer>>,
+    pub(crate) committer: Option<Box<LocalCommitterServer>>,
     pub(crate) config_manager: Option<Box<LocalConfigManagerServer>>,
     pub(crate) gateway: Option<Box<LocalGatewayServer>>,
-    pub(crate) l1_endpoint_monitor: Option<Box<LocalL1EndpointMonitorServer>>,
     pub(crate) l1_provider: Option<Box<LocalL1ProviderServer>>,
     pub(crate) l1_gas_price_provider: Option<Box<LocalL1GasPriceServer>>,
     pub(crate) mempool: Option<Box<LocalMempoolServer>>,
     pub(crate) mempool_p2p_propagator: Option<Box<LocalMempoolP2pPropagatorServer>>,
+    pub(crate) proof_manager: Option<Box<LocalProofManagerServer>>,
     pub(crate) sierra_compiler: Option<Box<LocalSierraCompilerServer>>,
     pub(crate) signature_manager: Option<Box<LocalSignatureManagerServer>>,
     pub(crate) state_sync: Option<Box<LocalStateSyncServer>>,
@@ -94,9 +95,10 @@ struct WrapperServers {
     pub(crate) config_manager_runner: Option<Box<ConfigManagerRunnerServer>>,
     pub(crate) consensus_manager: Option<Box<ConsensusManagerServer>>,
     pub(crate) http_server: Option<Box<HttpServer>>,
-    pub(crate) l1_scraper_server: Option<Box<L1ScraperServer<EthereumBaseLayerContract>>>,
+    pub(crate) l1_scraper_server:
+        Option<Box<L1ScraperServer<CyclicBaseLayerWrapper<EthereumBaseLayerContract>>>>,
     pub(crate) l1_gas_price_scraper_server:
-        Option<Box<L1GasPriceScraperServer<EthereumBaseLayerContract>>>,
+        Option<Box<L1GasPriceScraperServer<CyclicBaseLayerWrapper<EthereumBaseLayerContract>>>>,
     pub(crate) monitoring_endpoint: Option<Box<MonitoringEndpointServer>>,
     pub(crate) mempool_p2p_runner: Option<Box<MempoolP2pRunnerServer>>,
     pub(crate) state_sync_runner: Option<Box<StateSyncRunnerServer>>,
@@ -107,14 +109,15 @@ struct WrapperServers {
 pub struct RemoteServers {
     pub batcher: Option<Box<RemoteBatcherServer>>,
     pub class_manager: Option<Box<RemoteClassManagerServer>>,
+    pub committer: Option<Box<RemoteCommitterServer>>,
     // Note: we explicitly avoid adding a config manager runner server to the remote servers as it
     // is not used for remote connections.
     pub gateway: Option<Box<RemoteGatewayServer>>,
-    pub l1_endpoint_monitor: Option<Box<RemoteL1EndpointMonitorServer>>,
     pub l1_provider: Option<Box<RemoteL1ProviderServer>>,
     pub l1_gas_price_provider: Option<Box<RemoteL1GasPriceServer>>,
     pub mempool: Option<Box<RemoteMempoolServer>>,
     pub mempool_p2p_propagator: Option<Box<RemoteMempoolP2pPropagatorServer>>,
+    pub proof_manager: Option<Box<RemoteProofManagerServer>>,
     pub sierra_compiler: Option<Box<RemoteSierraCompilerServer>>,
     pub signature_manager: Option<Box<RemoteSignatureManagerServer>>,
     pub state_sync: Option<Box<RemoteStateSyncServer>>,
@@ -321,6 +324,20 @@ fn create_local_servers(
         config.components.class_manager.max_concurrency
     );
 
+    let committer_server = create_local_server!(
+        REGULAR_LOCAL_SERVER,
+        &config.components.committer.execution_mode,
+        &mut components.committer,
+        &config
+            .components
+            .committer
+            .local_server_config
+            .as_ref()
+            .expect("Committer local server config should be available."),
+        communication.take_committer_rx(),
+        &COMMITTER_INFRA_METRICS.get_local_server_metrics()
+    );
+
     let config_manager_server = create_local_server!(
         CONCURRENT_LOCAL_SERVER,
         &config.components.config_manager.execution_mode,
@@ -349,20 +366,6 @@ fn create_local_servers(
         communication.take_gateway_rx(),
         &GATEWAY_INFRA_METRICS.get_local_server_metrics(),
         config.components.gateway.max_concurrency
-    );
-
-    let l1_endpoint_monitor_server = create_local_server!(
-        REGULAR_LOCAL_SERVER,
-        &config.components.l1_endpoint_monitor.execution_mode,
-        &mut components.l1_endpoint_monitor,
-        &config
-            .components
-            .l1_endpoint_monitor
-            .local_server_config
-            .as_ref()
-            .expect("L1 endpoint monitor local server config should be available."),
-        communication.take_l1_endpoint_monitor_rx(),
-        &L1_ENDPOINT_MONITOR_INFRA_METRICS.get_local_server_metrics()
     );
 
     let l1_gas_price_provider_server = create_local_server!(
@@ -421,6 +424,21 @@ fn create_local_servers(
         &MEMPOOL_P2P_INFRA_METRICS.get_local_server_metrics()
     );
 
+    let proof_manager_server = create_local_server!(
+        CONCURRENT_LOCAL_SERVER,
+        &config.components.proof_manager.execution_mode,
+        &mut components.proof_manager,
+        &config
+            .components
+            .proof_manager
+            .local_server_config
+            .as_ref()
+            .expect("Proof manager local server config should be available."),
+        communication.take_proof_manager_rx(),
+        &PROOF_MANAGER_INFRA_METRICS.get_local_server_metrics(),
+        config.components.proof_manager.max_concurrency
+    );
+
     let sierra_compiler_server = create_local_server!(
         CONCURRENT_LOCAL_SERVER,
         &config.components.sierra_compiler.execution_mode,
@@ -434,21 +452,6 @@ fn create_local_servers(
         communication.take_sierra_compiler_rx(),
         &SIERRA_COMPILER_INFRA_METRICS.get_local_server_metrics(),
         config.components.sierra_compiler.max_concurrency
-    );
-
-    let state_sync_server = create_local_server!(
-        CONCURRENT_LOCAL_SERVER,
-        &config.components.state_sync.execution_mode,
-        &mut components.state_sync,
-        &config
-            .components
-            .state_sync
-            .local_server_config
-            .as_ref()
-            .expect("State sync local server config should be available."),
-        communication.take_state_sync_rx(),
-        &STATE_SYNC_INFRA_METRICS.get_local_server_metrics(),
-        config.components.state_sync.max_concurrency
     );
 
     let signature_manager_server = create_local_server!(
@@ -466,14 +469,30 @@ fn create_local_servers(
         config.components.signature_manager.max_concurrency
     );
 
+    let state_sync_server = create_local_server!(
+        CONCURRENT_LOCAL_SERVER,
+        &config.components.state_sync.execution_mode,
+        &mut components.state_sync,
+        &config
+            .components
+            .state_sync
+            .local_server_config
+            .as_ref()
+            .expect("State sync local server config should be available."),
+        communication.take_state_sync_rx(),
+        &STATE_SYNC_INFRA_METRICS.get_local_server_metrics(),
+        config.components.state_sync.max_concurrency
+    );
+
     LocalServers {
         batcher: batcher_server,
         class_manager: class_manager_server,
+        committer: committer_server,
         config_manager: config_manager_server,
         gateway: gateway_server,
-        l1_endpoint_monitor: l1_endpoint_monitor_server,
         l1_provider: l1_provider_server,
         l1_gas_price_provider: l1_gas_price_provider_server,
+        proof_manager: proof_manager_server,
         mempool: mempool_server,
         mempool_p2p_propagator: mempool_p2p_propagator_server,
         sierra_compiler: sierra_compiler_server,
@@ -497,13 +516,14 @@ impl LocalServers {
         create_servers(vec![
             server_future_and_label(self.batcher, "Local Batcher"),
             server_future_and_label(self.class_manager, "Local Class Manager"),
+            server_future_and_label(self.committer, "Local Committer"),
             server_future_and_label(self.config_manager, "Local Config Manager"),
             server_future_and_label(self.gateway, "Local Gateway"),
-            server_future_and_label(self.l1_endpoint_monitor, "Local L1 Endpoint Monitor"),
             server_future_and_label(self.l1_provider, "Local L1 Provider"),
             server_future_and_label(self.l1_gas_price_provider, "Local L1 Gas Price Provider"),
             server_future_and_label(self.mempool, "Local Mempool"),
             server_future_and_label(self.mempool_p2p_propagator, "Local Mempool P2p Propagator"),
+            server_future_and_label(self.proof_manager, "Local Proof Manager"),
             server_future_and_label(self.sierra_compiler, "Concurrent Local Sierra Compiler"),
             server_future_and_label(self.signature_manager, "Concurrent Local Signature Manager"),
             server_future_and_label(self.state_sync, "Local State Sync"),
@@ -534,6 +554,15 @@ pub fn create_remote_servers(
         CLASS_MANAGER_INFRA_METRICS.get_remote_server_metrics()
     );
 
+    let committer_server = create_remote_server!(
+        &config.components.committer.execution_mode,
+        || { clients.get_committer_local_client() },
+        config.components.committer.remote_server_config,
+        config.components.committer.port,
+        config.components.committer.max_concurrency,
+        COMMITTER_INFRA_METRICS.get_remote_server_metrics()
+    );
+
     let gateway_server = create_remote_server!(
         &config.components.gateway.execution_mode,
         || { clients.get_gateway_local_client() },
@@ -541,15 +570,6 @@ pub fn create_remote_servers(
         config.components.gateway.port,
         config.components.gateway.max_concurrency,
         GATEWAY_INFRA_METRICS.get_remote_server_metrics()
-    );
-
-    let l1_endpoint_monitor_server = create_remote_server!(
-        &config.components.l1_endpoint_monitor.execution_mode,
-        || { clients.get_l1_endpoint_monitor_local_client() },
-        config.components.l1_endpoint_monitor.remote_server_config,
-        config.components.l1_endpoint_monitor.port,
-        config.components.l1_endpoint_monitor.max_concurrency,
-        L1_ENDPOINT_MONITOR_INFRA_METRICS.get_remote_server_metrics()
     );
 
     let l1_provider_server = create_remote_server!(
@@ -588,6 +608,15 @@ pub fn create_remote_servers(
         MEMPOOL_P2P_INFRA_METRICS.get_remote_server_metrics()
     );
 
+    let proof_manager_server = create_remote_server!(
+        &config.components.proof_manager.execution_mode,
+        || { clients.get_proof_manager_local_client() },
+        config.components.proof_manager.remote_server_config,
+        config.components.proof_manager.port,
+        config.components.proof_manager.max_concurrency,
+        PROOF_MANAGER_INFRA_METRICS.get_remote_server_metrics()
+    );
+
     let sierra_compiler_server = create_remote_server!(
         &config.components.sierra_compiler.execution_mode,
         || { clients.get_sierra_compiler_local_client() },
@@ -618,12 +647,13 @@ pub fn create_remote_servers(
     RemoteServers {
         batcher: batcher_server,
         class_manager: class_manager_server,
+        committer: committer_server,
         gateway: gateway_server,
-        l1_endpoint_monitor: l1_endpoint_monitor_server,
         l1_provider: l1_provider_server,
         l1_gas_price_provider: l1_gas_price_provider_server,
         mempool: mempool_server,
         mempool_p2p_propagator: mempool_p2p_propagator_server,
+        proof_manager: proof_manager_server,
         sierra_compiler: sierra_compiler_server,
         signature_manager: signature_manager_server,
         state_sync: state_sync_server,
@@ -635,12 +665,13 @@ impl RemoteServers {
         create_servers(vec![
             server_future_and_label(self.batcher, "Remote Batcher"),
             server_future_and_label(self.class_manager, "Remote Class Manager"),
+            server_future_and_label(self.committer, "Remote Committer"),
             server_future_and_label(self.gateway, "Remote Gateway"),
-            server_future_and_label(self.l1_endpoint_monitor, "Remote L1 Endpoint Monitor"),
             server_future_and_label(self.l1_provider, "Remote L1 Provider"),
             server_future_and_label(self.l1_gas_price_provider, "Remote L1 Gas Price Provider"),
             server_future_and_label(self.mempool, "Remote Mempool"),
             server_future_and_label(self.mempool_p2p_propagator, "Remote Mempool P2p Propagator"),
+            server_future_and_label(self.proof_manager, "Remote Proof Manager"),
             server_future_and_label(self.sierra_compiler, "Remote Sierra Compiler"),
             server_future_and_label(self.signature_manager, "Remote Signature Manager"),
             server_future_and_label(self.state_sync, "Remote State Sync"),
@@ -685,6 +716,7 @@ fn create_wrapper_servers(
         &config.components.mempool_p2p.execution_mode.clone().into(),
         components.mempool_p2p_runner
     );
+
     let state_sync_runner_server = create_wrapper_server!(
         &config.components.state_sync.execution_mode.clone().into(),
         components.state_sync_runner
@@ -734,7 +766,7 @@ pub fn create_node_servers(
 }
 
 pub async fn run_component_servers(servers: SequencerNodeServers) {
-    // TODO(alonl): check if we can use create_servers instead of extending a new
+    // TODO(Tsabary): check if we can use create_servers instead of extending a new
     // FuturesUnordered.
     let mut all_servers = FuturesUnordered::new();
     all_servers.extend(servers.local_servers.run().await);
@@ -742,8 +774,8 @@ pub async fn run_component_servers(servers: SequencerNodeServers) {
     all_servers.extend(servers.wrapper_servers.run().await);
 
     if let Some(servers_type) = all_servers.next().await {
-        // TODO(alonl): check all tasks are exited properly in case of a server failure before
-        // panicing.
+        // TODO(Tsabary): check all tasks are exited properly in case of a server failure before
+        // panicking.
         panic!("{servers_type} Servers ended unexpectedly.");
     } else {
         unreachable!("all_servers is never empty");

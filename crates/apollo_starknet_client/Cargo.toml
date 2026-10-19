@@ -27,8 +27,7 @@ serde_json = { workspace = true, features = ["arbitrary_precision"] }
 serde_repr.workspace = true
 starknet-types-core = { workspace = true, features = ["serde"] }
 starknet_api.workspace = true
-strum.workspace = true
-strum_macros.workspace = true
+strum = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full", "sync"] }
 tokio-retry.workspace = true
@@ -40,8 +39,7 @@ apollo_test_utils.workspace = true
 assert_matches.workspace = true
 enum-iterator.workspace = true
 mockall.workspace = true
-# TODO(Dori): Upgrade to workspace-defined version.
-mockito = "0.31.0"
+mockito.workspace = true
 pretty_assertions.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
@@ -50,8 +48,7 @@ starknet_api = { workspace = true, features = ["testing"] }
 
 [package.metadata.cargo-machete]
 # The `rand` and `rand_chacha` crates are used in the `testing` feature, which is optional.
-# `strum` is used by `EnumIter` which is used in this crate.
-ignored = ["rand", "rand_chacha", "strum"]
+ignored = ["rand", "rand_chacha"]
 
 [lints]
 workspace = true

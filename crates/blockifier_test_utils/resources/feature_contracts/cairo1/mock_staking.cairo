@@ -1,37 +1,53 @@
+use starknet::ContractAddress;
+
+pub type BlockNumber = u64;
+pub type Epoch = u64;
+pub type PublicKey = felt252;
+pub type StakingPower = u128;
+
 #[derive(Drop, Serde, starknet::Store)]
 pub struct Staker {
-    pub address: felt252,
-    pub staked_amount: u128,
-    pub pubkey: felt252,
+    pub contract_address: ContractAddress,
+    pub staking_power: StakingPower,
+    pub pub_key: Option<PublicKey>,
 }
 
 #[derive(Drop, Serde, starknet::Store)]
 pub struct EpochInfo {
-    pub epoch: u64,
-    pub start_block: u64,
-    pub end_block: u64,
+    pub epoch_id: Epoch,
+    pub start_block: BlockNumber,
+    pub epoch_length: u32,
 }
 
 #[starknet::interface]
 pub trait IStaking<TContractState> {
     fn add_staker(ref self: TContractState, staker: Staker);
     fn set_stakers(ref self: TContractState, stakers: Array<Staker>);
-    fn get_stakers(self: @TContractState, epoch: u64) -> Array<Staker>;
     fn set_current_epoch(ref self: TContractState, epoch: EpochInfo);
-    fn get_current_epoch(self: @TContractState) -> EpochInfo;
+    fn set_previous_epoch(ref self: TContractState, epoch: EpochInfo);
+
+    // The following functions have exactly the same interface as the real Staking contract.
+    fn get_stakers(
+        self: @TContractState, epoch_id: Epoch,
+    ) -> Span<(ContractAddress, StakingPower, Option<PublicKey>)>;
+    fn get_current_epoch_data(self: @TContractState) -> (Epoch, BlockNumber, u32);
+    fn get_previous_epoch_data(self: @TContractState) -> Option<(Epoch, BlockNumber, u32)>;
 }
 
 #[starknet::contract]
 mod Staking {
+    use starknet::ContractAddress;
     use starknet::storage::{
         MutableVecTrait, StoragePointerReadAccess, StoragePointerWriteAccess, Vec, VecTrait,
     };
-    use super::{EpochInfo, Staker};
+    use super::{BlockNumber, Epoch, EpochInfo, PublicKey, Staker, StakingPower};
 
     #[storage]
     struct Storage {
         stakers: Vec<Staker>,
         current_epoch: EpochInfo,
+        has_previous_epoch: bool,
+        previous_epoch: EpochInfo,
     }
 
     #[abi(embed_v0)]
@@ -50,21 +66,38 @@ mod Staking {
             }
         }
 
-        // epoch is not used in this mock, but should be part of the interface.
-        fn get_stakers(self: @ContractState, epoch: u64) -> Array<Staker> {
-            let mut stakers = array![];
-            for i in 0..self.stakers.len() {
-                stakers.append(self.stakers.at(i).read());
-            }
-            stakers
-        }
-
         fn set_current_epoch(ref self: ContractState, epoch: EpochInfo) {
             self.current_epoch.write(epoch);
         }
 
-        fn get_current_epoch(self: @ContractState) -> EpochInfo {
-            self.current_epoch.read()
+        fn set_previous_epoch(ref self: ContractState, epoch: EpochInfo) {
+            self.has_previous_epoch.write(true);
+            self.previous_epoch.write(epoch);
+        }
+
+        // epoch_id is not used in this mock, but should be part of the interface.
+        fn get_stakers(
+            self: @ContractState, epoch_id: Epoch,
+        ) -> Span<(ContractAddress, StakingPower, Option<PublicKey>)> {
+            let mut stakers = array![];
+            for i in 0..self.stakers.len() {
+                let staker = self.stakers.at(i).read();
+                stakers.append((staker.contract_address, staker.staking_power, staker.pub_key));
+            }
+            stakers.span()
+        }
+
+        fn get_current_epoch_data(self: @ContractState) -> (Epoch, BlockNumber, u32) {
+            let epoch_info = self.current_epoch.read();
+            (epoch_info.epoch_id, epoch_info.start_block, epoch_info.epoch_length)
+        }
+
+        fn get_previous_epoch_data(self: @ContractState) -> Option<(Epoch, BlockNumber, u32)> {
+            if !self.has_previous_epoch.read() {
+                return Option::None;
+            }
+            let epoch_info = self.previous_epoch.read();
+            Option::Some((epoch_info.epoch_id, epoch_info.start_block, epoch_info.epoch_length))
         }
     }
 }

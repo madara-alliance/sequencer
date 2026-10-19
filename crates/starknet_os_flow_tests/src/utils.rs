@@ -1,17 +1,15 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use assert_matches::assert_matches;
 use blockifier::abi::constants::STORED_BLOCK_HASH_BUFFER;
 use blockifier::blockifier::config::TransactionExecutorConfig;
 use blockifier::blockifier::transaction_executor::{
-    BlockExecutionSummary,
     TransactionExecutionOutput,
     TransactionExecutor,
 };
 use blockifier::context::BlockContext;
-use blockifier::state::cached_state::{CachedState, CommitmentStateDiff, StateMaps};
+use blockifier::state::cached_state::{CachedState, StateMaps};
+use blockifier::state::state_api::StateReader;
 use blockifier::test_utils::contracts::FeatureContractTrait;
 use blockifier::transaction::transaction_execution::Transaction;
 use blockifier_test_utils::cairo_versions::CairoVersion;
@@ -19,87 +17,60 @@ use blockifier_test_utils::contracts::FeatureContract;
 use starknet_api::block::{BlockHash, BlockHashAndNumber, BlockNumber};
 use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::contract_class::{ClassInfo, ContractClass, SierraVersion};
-use starknet_api::core::{
-    ClassHash,
-    CompiledClassHash as StarknetAPICompiledClassHash,
-    ContractAddress,
-    Nonce,
-    PatriciaKey,
-};
+use starknet_api::core::{ClassHash, ContractAddress, Nonce, PatriciaKey};
 use starknet_api::declare_tx_args;
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::executable_transaction::{AccountTransaction, DeclareTransaction};
-use starknet_api::hash::{HashOutput, StateRoots};
-use starknet_api::state::StorageKey;
 use starknet_api::test_utils::declare::declare_tx;
-use starknet_api::test_utils::{NonceManager, CHAIN_ID_FOR_TESTS};
+use starknet_api::test_utils::{test_block_hash, NonceManager, CHAIN_ID_FOR_TESTS};
 use starknet_api::transaction::fields::{Fee, ValidResourceBounds};
 use starknet_api::transaction::TransactionVersion;
-use starknet_committer::block_committer::commit::commit_block;
-use starknet_committer::block_committer::input::{
-    try_node_index_into_contract_address,
-    try_node_index_into_patricia_key,
-    ConfigImpl,
-    FactsDbInitialRead,
-    Input,
-    StarknetStorageKey,
-    StarknetStorageValue,
-    StateDiff,
-};
-use starknet_committer::db::facts_db::create_facts_tree::get_leaves;
-use starknet_committer::db::facts_db::db::FactsDb;
-use starknet_committer::db::forest_trait::ForestWriter;
-use starknet_committer::patricia_merkle_tree::leaf::leaf_impl::ContractState;
-use starknet_committer::patricia_merkle_tree::tree::fetch_previous_and_new_patricia_paths;
-use starknet_committer::patricia_merkle_tree::types::{
-    CompiledClassHash,
-    RootHashes,
-    StarknetForestProofs,
-};
+use starknet_committer::block_committer::input::{StarknetStorageKey, StarknetStorageValue};
 use starknet_os::hints::hint_implementation::deprecated_compiled_class::class_hash::compute_deprecated_class_hash;
 use starknet_os::hints::vars::Const;
-use starknet_os::io::os_input::{CachedStateInput, CommitmentInfo};
-use starknet_patricia::patricia_merkle_tree::node_data::inner_node::flatten_preimages;
-use starknet_patricia::patricia_merkle_tree::types::{NodeIndex, SortedLeafIndices, SubTreeHeight};
-use starknet_patricia_storage::db_object::EmptyKeyContext;
-use starknet_patricia_storage::map_storage::MapStorage;
 use starknet_types_core::felt::Felt;
 
 use crate::initial_state::OsExecutionContracts;
-use crate::state_trait::FlowTestState;
 use crate::test_manager::FUNDED_ACCOUNT_ADDRESS;
 use crate::tests::NON_TRIVIAL_RESOURCE_BOUNDS;
 
-pub(crate) struct ExecutionOutput<S: FlowTestState> {
+pub(crate) struct ExecutionOutput<S: StateReader + Send> {
     pub(crate) execution_outputs: Vec<TransactionExecutionOutput>,
-    pub(crate) block_summary: BlockExecutionSummary,
     pub(crate) final_state: CachedState<S>,
 }
 
 /// Executes the given transactions on the given state and block context with default execution
 /// configuration.
-pub(crate) fn execute_transactions<S: FlowTestState>(
+pub(crate) fn execute_transactions<S: StateReader + Send>(
     initial_state: S,
     txs: &[Transaction],
     block_context: BlockContext,
+    virtual_os: bool,
 ) -> ExecutionOutput<S> {
     let block_number_hash_pair =
         maybe_dummy_block_hash_and_number(block_context.block_info().block_number);
     let config = TransactionExecutorConfig::default();
 
     // Execute.
-    let mut executor = TransactionExecutor::pre_process_and_create(
-        initial_state,
-        block_context,
-        block_number_hash_pair.map(|(number, hash)| BlockHashAndNumber { hash, number }),
-        config,
-    )
-    .expect("Failed to create transaction executor.");
+    let mut executor = if virtual_os {
+        // In virtual OS mode, the executor is created without preprocessing.
+        TransactionExecutor::new(CachedState::new(initial_state), block_context, config)
+    } else {
+        TransactionExecutor::pre_process_and_create(
+            initial_state,
+            block_context,
+            block_number_hash_pair.map(|(number, hash)| BlockHashAndNumber { hash, number }),
+            config,
+        )
+        .expect("Failed to create transaction executor.")
+    };
 
     // Execute the transactions and make sure none of them failed.
     let execution_deadline = None;
-    let execution_results =
-        executor.execute_txs(txs, execution_deadline).into_iter().collect::<Vec<Result<_, _>>>();
+    let execution_results = executor
+        .execute_txs_sequentially(txs, execution_deadline)
+        .into_iter()
+        .collect::<Vec<Result<_, _>>>();
     let mut execution_outputs = Vec::new();
     for (tx_index, result) in execution_results.into_iter().enumerate() {
         match result {
@@ -110,56 +81,13 @@ pub(crate) fn execute_transactions<S: FlowTestState>(
         }
     }
 
-    // Finalize the block to get the state diff.
-    let block_summary = executor.finalize().expect("Failed to finalize block.");
+    if !virtual_os {
+        // Finalize the block.
+        executor.finalize().expect("Failed to finalize block.");
+    }
+
     let final_state = executor.block_state.unwrap();
-    ExecutionOutput { execution_outputs, block_summary, final_state }
-}
-
-/// Creates a state diff input for the committer based on the execution state diff.
-pub(crate) fn create_committer_state_diff(state_diff: CommitmentStateDiff) -> StateDiff {
-    StateDiff {
-        address_to_class_hash: state_diff.address_to_class_hash.into_iter().collect(),
-        address_to_nonce: state_diff.address_to_nonce.into_iter().collect(),
-        class_hash_to_compiled_class_hash: state_diff
-            .class_hash_to_compiled_class_hash
-            .into_iter()
-            .map(|(k, v)| (k, CompiledClassHash(v.0)))
-            .collect(),
-        storage_updates: state_diff
-            .storage_updates
-            .into_iter()
-            .map(|(address, updates)| {
-                (
-                    address,
-                    updates
-                        .into_iter()
-                        .map(|(k, v)| (StarknetStorageKey(k), StarknetStorageValue(v)))
-                        .collect(),
-                )
-            })
-            .collect(),
-    }
-}
-
-/// Commits the state diff, saves the new commitments and returns the computed roots.
-pub(crate) async fn commit_state_diff(
-    facts_db: &mut FactsDb<MapStorage>,
-    contracts_trie_root_hash: HashOutput,
-    classes_trie_root_hash: HashOutput,
-    state_diff: StateDiff,
-) -> StateRoots {
-    let config = ConfigImpl::default();
-    let initial_read_context =
-        FactsDbInitialRead(StateRoots { contracts_trie_root_hash, classes_trie_root_hash });
-    let input = Input { state_diff, initial_read_context, config };
-    let filled_forest =
-        commit_block(input, facts_db, None).await.expect("Failed to commit the given block.");
-    facts_db.write(&filled_forest).await;
-    StateRoots {
-        contracts_trie_root_hash: filled_forest.get_contract_root_hash(),
-        classes_trie_root_hash: filled_forest.get_compiled_class_root_hash(),
-    }
+    ExecutionOutput { execution_outputs, final_state }
 }
 
 pub(crate) fn create_cairo1_bootstrap_declare_tx(
@@ -217,190 +145,26 @@ pub(crate) fn create_declare_tx(
     AccountTransaction::Declare(tx)
 }
 
-pub(crate) struct CommitmentInfos {
-    pub(crate) contracts_trie_commitment_info: CommitmentInfo,
-    pub(crate) classes_trie_commitment_info: CommitmentInfo,
-    pub(crate) storage_tries_commitment_infos: HashMap<ContractAddress, CommitmentInfo>,
-}
-
-/// Creates the commitment infos and the cached state input for the OS.
-pub(crate) async fn create_cached_state_input_and_commitment_infos(
-    previous_state_roots: &StateRoots,
-    new_state_roots: &StateRoots,
-    commitments: &mut MapStorage,
-    extended_state_diff: &StateMaps,
-) -> (CachedStateInput, CommitmentInfos) {
-    // TODO(Nimrod): Gather the keys from the state selector similarly to python.
-    let (previous_contract_states, new_storage_roots) = get_previous_states_and_new_storage_roots(
-        extended_state_diff.get_contract_addresses().into_iter(),
-        previous_state_roots.contracts_trie_root_hash,
-        new_state_roots.contracts_trie_root_hash,
-        commitments,
-    )
-    .await;
-    let mut address_to_previous_class_hash = HashMap::new();
-    let mut address_to_previous_nonce = HashMap::new();
-    let mut address_to_previous_storage_root_hash = HashMap::new();
-    for (address, contract_state) in previous_contract_states.into_iter() {
-        let address = try_node_index_into_contract_address(&address).unwrap();
-        address_to_previous_class_hash.insert(address, contract_state.class_hash);
-        address_to_previous_nonce.insert(address, contract_state.nonce);
-        address_to_previous_storage_root_hash.insert(address, contract_state.storage_root_hash);
+/// Gets the extended initial reads for the OS run.
+/// The extended initial reads are the initial reads with the class hash and nonce of each accessed
+/// contract.
+pub(crate) fn get_extended_initial_reads<S: StateReader>(state: &CachedState<S>) -> StateMaps {
+    let raw_initial_reads = state.get_initial_reads().unwrap();
+    // Populate the state initial reads with the class hash and nonce of each accessed contract.
+    for contract_address in raw_initial_reads.get_contract_addresses() {
+        state.get_class_hash_at(contract_address).unwrap();
+        state.get_nonce_at(contract_address).unwrap();
     }
 
-    // Get previous class leaves.
-    let mut class_leaf_indices: Vec<NodeIndex> = extended_state_diff
-        .compiled_class_hashes
-        .keys()
-        .chain(extended_state_diff.declared_contracts.keys())
-        .map(|address| NodeIndex::from_leaf_felt(&address.0))
-        .collect();
-
-    let sorted_class_leaf_indices = SortedLeafIndices::new(&mut class_leaf_indices);
-    let previous_class_leaves: HashMap<NodeIndex, CompiledClassHash> = get_leaves(
-        commitments,
-        previous_state_roots.classes_trie_root_hash,
-        sorted_class_leaf_indices,
-        &EmptyKeyContext,
-    )
-    .await
-    .unwrap();
-    let class_hash_to_compiled_class_hash = previous_class_leaves
-        .into_iter()
-        .map(|(idx, v)| {
-            (
-                ClassHash(*try_node_index_into_patricia_key(&idx).unwrap().key()),
-                StarknetAPICompiledClassHash(v.0),
-            )
-        })
-        .collect();
-
-    let mut storage = HashMap::new();
-    for address in extended_state_diff.get_contract_addresses() {
-        let mut storage_keys_indices: Vec<NodeIndex> = extended_state_diff
-            .storage
-            .keys()
-            .filter_map(|(add, key)| {
-                if add == &address { Some(NodeIndex::from_leaf_felt(&key.0)) } else { None }
-            })
-            .collect();
-        let sorted_leaf_indices = SortedLeafIndices::new(&mut storage_keys_indices);
-        let previous_storage_leaves: HashMap<NodeIndex, StarknetStorageValue> = get_leaves(
-            commitments,
-            address_to_previous_storage_root_hash[&address],
-            sorted_leaf_indices,
-            &EmptyKeyContext,
-        )
-        .await
-        .unwrap();
-        let previous_storage_leaves: HashMap<StorageKey, Felt> = previous_storage_leaves
-            .into_iter()
-            .map(|(idx, v)| (StorageKey(try_node_index_into_patricia_key(&idx).unwrap()), v.0))
-            .collect();
-        storage.insert(address, previous_storage_leaves);
+    for class_hash in raw_initial_reads.declared_contracts.keys() {
+        state.get_compiled_class_hash(*class_hash).unwrap();
     }
 
-    let storage_proofs = fetch_storage_proofs_from_state_maps(
-        extended_state_diff,
-        commitments,
-        RootHashes {
-            previous_root_hash: previous_state_roots.classes_trie_root_hash,
-            new_root_hash: new_state_roots.classes_trie_root_hash,
-        },
-        RootHashes {
-            previous_root_hash: previous_state_roots.contracts_trie_root_hash,
-            new_root_hash: new_state_roots.contracts_trie_root_hash,
-        },
-    )
-    .await;
-    let contracts_trie_commitment_info = CommitmentInfo {
-        previous_root: previous_state_roots.contracts_trie_root_hash,
-        updated_root: new_state_roots.contracts_trie_root_hash,
-        tree_height: SubTreeHeight::ACTUAL_HEIGHT,
-        commitment_facts: flatten_preimages(&storage_proofs.contracts_trie_proof.nodes),
-    };
-    let classes_trie_commitment_info = CommitmentInfo {
-        previous_root: previous_state_roots.classes_trie_root_hash,
-        updated_root: new_state_roots.classes_trie_root_hash,
-        tree_height: SubTreeHeight::ACTUAL_HEIGHT,
-        commitment_facts: flatten_preimages(&storage_proofs.classes_trie_proof),
-    };
-    let storage_tries_commitment_infos = address_to_previous_storage_root_hash
-        .iter()
-        .map(|(address, previous_root_hash)| {
-            // Not all contracts in `address_to_previous_storage_root_hash` are in
-            // `extended_state_diff`. For example a contract that only its Nonce was
-            // changed.
-            let storage_proof = flatten_preimages(
-                storage_proofs
-                    .contracts_trie_storage_proofs
-                    .get(address)
-                    .unwrap_or(&HashMap::new()),
-            );
-            (
-                *address,
-                CommitmentInfo {
-                    previous_root: *previous_root_hash,
-                    updated_root: new_storage_roots[address],
-                    tree_height: SubTreeHeight::ACTUAL_HEIGHT,
-                    commitment_facts: storage_proof,
-                },
-            )
-        })
-        .collect();
-
-    (
-        CachedStateInput {
-            storage,
-            address_to_class_hash: address_to_previous_class_hash,
-            address_to_nonce: address_to_previous_nonce,
-            class_hash_to_compiled_class_hash,
-        },
-        CommitmentInfos {
-            contracts_trie_commitment_info,
-            classes_trie_commitment_info,
-            storage_tries_commitment_infos,
-        },
-    )
-}
-
-pub(crate) async fn get_previous_states_and_new_storage_roots<
-    I: Iterator<Item = ContractAddress>,
->(
-    contract_addresses: I,
-    previous_contract_trie_root: HashOutput,
-    new_contract_trie_root: HashOutput,
-    commitments: &mut MapStorage,
-) -> (HashMap<NodeIndex, ContractState>, HashMap<ContractAddress, HashOutput>) {
-    let mut contract_leaf_indices: Vec<NodeIndex> =
-        contract_addresses.map(|address| NodeIndex::from_leaf_felt(&address.0)).collect();
-
-    // Get previous contract state leaves.
-    let sorted_contract_leaf_indices = SortedLeafIndices::new(&mut contract_leaf_indices);
-    // Get the previous and the new contract states.
-    let previous_contract_states = get_leaves(
-        commitments,
-        previous_contract_trie_root,
-        sorted_contract_leaf_indices,
-        &EmptyKeyContext,
-    )
-    .await
-    .unwrap();
-    let new_contract_states: HashMap<NodeIndex, ContractState> = get_leaves(
-        commitments,
-        new_contract_trie_root,
-        sorted_contract_leaf_indices,
-        &EmptyKeyContext,
-    )
-    .await
-    .unwrap();
-    let new_contract_roots: HashMap<ContractAddress, HashOutput> = new_contract_states
-        .into_iter()
-        .map(|(idx, contract_state)| {
-            (try_node_index_into_contract_address(&idx).unwrap(), contract_state.storage_root_hash)
-        })
-        .collect();
-    (previous_contract_states, new_contract_roots)
+    // Take the initial reads again to get the updated initial reads.
+    let mut extended_initial_reads = state.get_initial_reads().unwrap();
+    // This field is not used by the OS, so we clear it.
+    extended_initial_reads.declared_contracts.clear();
+    extended_initial_reads
 }
 
 pub(crate) fn maybe_dummy_block_hash_and_number(
@@ -409,9 +173,9 @@ pub(crate) fn maybe_dummy_block_hash_and_number(
     if block_number.0 < STORED_BLOCK_HASH_BUFFER {
         return None;
     }
-    let block_hash = BlockHash(Felt::from(block_number.0));
-    let block_number = BlockNumber(block_number.0 - STORED_BLOCK_HASH_BUFFER);
-    Some((block_number, block_hash))
+    let old_block_number = block_number.0 - STORED_BLOCK_HASH_BUFFER;
+    let block_hash = test_block_hash(old_block_number);
+    Some((BlockNumber(old_block_number), block_hash))
 }
 
 pub(crate) fn divide_vec_into_n_parts<T>(mut vec: Vec<T>, n: usize) -> Vec<Vec<T>> {
@@ -460,40 +224,6 @@ pub(crate) fn get_class_hash_of_feature_contract(feature_contract: FeatureContra
         ContractClass::V0(class) => ClassHash(compute_deprecated_class_hash(&class).unwrap()),
         ContractClass::V1(_) => feature_contract.get_sierra().calculate_class_hash(),
     }
-}
-
-async fn fetch_storage_proofs_from_state_maps(
-    state_maps: &StateMaps,
-    storage: &mut MapStorage,
-    classes_trie_root_hashes: RootHashes,
-    contracts_trie_root_hashes: RootHashes,
-) -> StarknetForestProofs {
-    let class_hashes: Vec<ClassHash> = state_maps
-        .compiled_class_hashes
-        .keys()
-        .cloned()
-        .chain(state_maps.class_hashes.values().cloned())
-        .collect();
-    let contract_addresses =
-        &state_maps.get_contract_addresses().iter().cloned().collect::<Vec<_>>();
-    let contract_storage_keys = state_maps.storage.keys().fold(
-        HashMap::<ContractAddress, Vec<StarknetStorageKey>>::new(),
-        |mut acc, (address, key)| {
-            acc.entry(*address).or_default().push(StarknetStorageKey(*key));
-            acc
-        },
-    );
-
-    fetch_previous_and_new_patricia_paths(
-        storage,
-        classes_trie_root_hashes,
-        contracts_trie_root_hashes,
-        &class_hashes,
-        contract_addresses,
-        &contract_storage_keys,
-    )
-    .await
-    .unwrap()
 }
 
 /// Utility method to update a map of expected storage updates.

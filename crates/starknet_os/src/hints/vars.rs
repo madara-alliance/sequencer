@@ -1,11 +1,7 @@
 use std::collections::HashMap;
 
 use apollo_starknet_os_program::OS_PROGRAM;
-use cairo_vm::hint_processor::builtin_hint_processor::hint_utils::get_integer_from_var_name;
-use cairo_vm::hint_processor::hint_processor_definition::HintReference;
-use cairo_vm::serde::deserialize_program::ApTracking;
 use cairo_vm::vm::errors::hint_errors::HintError;
-use cairo_vm::vm::vm_core::VirtualMachine;
 use starknet_api::core::ContractAddress;
 use starknet_api::state::StorageKey;
 use starknet_types_core::felt::Felt;
@@ -100,7 +96,6 @@ define_string_enum! {
         (DescentMap),
         (DictManager),
         (InitialDict),
-        (IsDeprecated),
         (LeftChild),
         (NSelectedBuiltins),
         (Node),
@@ -136,11 +131,18 @@ define_string_enum! {
         (AllEncodings),
         (ArrayPtr),
         (Bit),
+        (BlockHash),
+        (BlockInfo),
+        (BlockNumber),
+        (BlockTimestamp),
         (BucketIndex),
         (BuiltinCosts),
         (BuiltinParams),
         (BuiltinPtrs),
+        (Calldata),
+        (CalldataSize),
         (CallResponse),
+        (ChainId),
         (ChildBit),
         (ClassHash),
         (ClassHashPtr),
@@ -155,6 +157,7 @@ define_string_enum! {
         (ConstructorCalldata),
         (ConstructorCalldataSize),
         (ContractAddress),
+        (ContractAddressLeMaxForCompression),
         (ContractAddressSalt),
         (ContractClassComponentHashes),
         (ContractStateChanges),
@@ -172,16 +175,22 @@ define_string_enum! {
         (ElmSize),
         (End),
         (EntryPointReturnValues),
+        (EntryPointSelector),
         (Evals),
         (ExecutionContext),
         (Exists),
+        (FeeDataAvailabilityMode),
+        (FeeTokenAddress),
         (FinalContractStateRoot),
         (FinalRoot),
         (FinalSquashedContractStateChangesEnd),
         (FinalSquashedContractStateChangesStart),
         (FullContract),
+        (FullOutput),
+        (GasPricesHash),
         (Hash),
         (HashPtr),
+        (HeaderCommitments),
         (Height),
         (EncryptedStart),
         (ExpectedCasmHashV2),
@@ -189,23 +198,32 @@ define_string_enum! {
         (InitialCarriedOutputs),
         (InitialContractStateRoot),
         (InitialGas),
+        (InitialGeRequiredGas),
         (InnerRemainingGas),
         (InitialRoot),
+        (InitialTxsRangeCheckPtr),
+        (IsBlockNumberInBlockHashBuffer),
+        (IsDeprecated),
         (IsLeaf),
         (IsNUpdatesSmall),
         (IsOnCurve),
+        (IsRemainingGasLtInitialBudget),
+        (IsReverted),
         (IsSierraGasMode),
         (Key),
+        (KeyLtMinAliasAllocValue),
         (KzgCommitments),
         (Length),
         (IsLeafAndLoaded),
         (LoadSegment),
         (Low),
+        (LowActualFee),
         (MaxGas),
         (N),
         (NBlobs),
         (NBlocks),
         (NBuiltins),
+        (NClasses),
         (NClassesToMigrate),
         (NCompiledClassFacts),
         (NElms),
@@ -220,6 +238,8 @@ define_string_enum! {
         (NewStateEntry),
         (NKeys),
         (Node),
+        (Nonce),
+        (NonceDataAvailabilityMode),
         (NPublicKeys),
         (NotOnCurve),
         (OldBlockHash),
@@ -228,20 +248,27 @@ define_string_enum! {
         (OsProgramHash),
         (OsStateUpdate),
         (OutputPtr),
+        (Outputs),
         (PackedFelt),
         (PackedValue),
         (PackedValues),
         (PackedValuesLen),
+        (PreviousBlockHash),
         (Path),
+        (PaymasterDataLength),
+        (PaymasterData),
         (PrevOffset),
         (PrevAliasesStateEntry),
         (PrevRoot),
         (PrevValue),
+        (ProofFacts),
+        (ProofFactsSize),
         (PublicKeys),
         (SnPrivateKeys),
         (RangeCheck96Ptr, "range_check96_ptr"),
         (RangeCheckPtr),
         (RemainingGas),
+        (RemainingGasGtMax),
         (ResourceBounds),
         (ReturnBuiltinPtrs),
         (Request),
@@ -249,6 +276,7 @@ define_string_enum! {
         (RequiredGas),
         (Res),
         (Response),
+        (ResultPtr),
         (Retdata),
         (RetdataSize),
         (SegmentLength),
@@ -257,6 +285,7 @@ define_string_enum! {
         (SelectedPtrs),
         (Selector),
         (SenderAddress),
+        (SequencerAddress),
         (Sha256Ptr, "sha256_ptr"),
         (Sha256PtrEnd, "sha256_ptr_end"),
         (ShouldUseReadOptimized),
@@ -274,12 +303,15 @@ define_string_enum! {
         (StateChanges),
         (StateEntry),
         (StateUpdatesStart),
+        (StarknetVersion),
         (StorageKey),
         (SymmetricKey),
         (SyscallPtr),
+        (Tip),
         (TransactionHash),
         (TxInfo),
         (TxType),
+        (TxVersion),
         (UnpackedU32s),
         (UpdatePtr),
         (UseKzgDa),
@@ -288,28 +320,8 @@ define_string_enum! {
     }
 }
 
-impl Ids {
-    pub fn fetch_as<T: TryFrom<Felt>>(
-        &self,
-        vm: &mut VirtualMachine,
-        ids_data: &HashMap<String, HintReference>,
-        ap_tracking: &ApTracking,
-    ) -> Result<T, OsHintError>
-    where
-        <T as TryFrom<Felt>>::Error: std::fmt::Debug,
-    {
-        let self_felt = get_integer_from_var_name((*self).into(), vm, ids_data, ap_tracking)?;
-        T::try_from(self_felt).map_err(|error| OsHintError::IdsConversion {
-            variant: *self,
-            felt: self_felt,
-            ty: std::any::type_name::<T>().into(),
-            reason: format!("{error:?}"),
-        })
-    }
-}
-
 define_string_enum! {
-    #[cfg_attr(any(test, feature = "testing"), derive(strum_macros::EnumIter))]
+    #[cfg_attr(any(test, feature = "testing"), derive(strum::EnumIter))]
     #[derive(Clone, Copy, Debug)]
     pub enum Const {
         (AddrBound, "starkware.starknet.common.storage.ADDR_BOUND"),
@@ -352,6 +364,12 @@ define_string_enum! {
         (StarknetOsConfigVersion, "starkware.starknet.core.os.os_config.os_config.STARKNET_OS_CONFIG_VERSION"),
         (StoredBlockHashBuffer, "starkware.starknet.core.os.constants.STORED_BLOCK_HASH_BUFFER"),
         (Validated, "starkware.starknet.core.os.constants.VALIDATED"),
+        (
+            VirtualOsOutputVersion,
+            "starkware.starknet.core.os.virtual_os_output.VIRTUAL_OS_OUTPUT_VERSION"
+        ),
+        (VirtualSnos, "starkware.starknet.core.os.virtual_os_output.VIRTUAL_SNOS"),
+        (ProofVersion, "starkware.starknet.core.os.virtual_os_output.PROOF_VERSION"),
     }
 }
 
@@ -396,10 +414,11 @@ impl Const {
 }
 
 define_string_enum! {
-    #[cfg_attr(any(test, feature = "testing"), derive(strum_macros::EnumIter))]
+    #[cfg_attr(any(test, feature = "testing"), derive(strum::EnumIter))]
     #[derive(Copy, Clone)]
     pub enum CairoStruct {
         (BigInt3, "starkware.starknet.core.os.data_availability.bls_field.BigInt3"),
+        (BlockHeaderCommitments, "starkware.starknet.core.os.block_hash.BlockHeaderCommitments"),
         (BlockInfo, "starkware.starknet.common.new_syscalls.BlockInfo"),
         (BuiltinParamsPtr, "starkware.starknet.core.os.builtins.BuiltinParams*"),
         (BuiltinPointersPtr, "starkware.starknet.core.os.builtins.BuiltinPointers*"),
@@ -457,6 +476,7 @@ define_string_enum! {
         (L2ToL1MessageHeader, "starkware.starknet.core.os.output.MessageToL1Header"),
         (NodeEdge, "starkware.cairo.common.patricia_utils.NodeEdge"),
         (NonSelectableBuiltins, "starkware.starknet.core.os.builtins.NonSelectableBuiltins"),
+        (OsKzgCommitmentInfo, "starkware.starknet.core.os.data_availability.commitment.OsKzgCommitmentInfo"),
         (OsStateUpdate, "starkware.starknet.core.os.state.state.OsStateUpdate"),
         (ResourceBounds, "starkware.starknet.common.new_syscalls.ResourceBounds"),
         (SecpNewResponsePtr, "starkware.starknet.common.new_syscalls.SecpNewResponse*"),

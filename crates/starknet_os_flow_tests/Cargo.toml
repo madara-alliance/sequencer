@@ -4,15 +4,24 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license-file.workspace = true
+description = "Integration tests for Starknet OS execution and state commitment flow."
+
+[features]
+exhaustive_fuzz_test = []
+fuzz_test_debug = []
+long_fuzz_test = []
 
 [dev-dependencies]
 assert_matches.workspace = true
-blockifier = { workspace = true, features = ["testing"] }
+blockifier = { workspace = true, features = ["reexecution", "testing"] }
 blockifier_test_utils.workspace = true
 cairo-lang-starknet-classes.workspace = true
 cairo-vm.workspace = true
+chrono.workspace = true
 expect-test.workspace = true
 itertools.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 rstest.workspace = true
 serde_json.workspace = true
 starknet-core.workspace = true
@@ -23,6 +32,8 @@ starknet_committer = { workspace = true, features = ["testing"] }
 starknet_os = { workspace = true, features = ["include_program_output", "testing"] }
 starknet_patricia = { workspace = true, features = ["testing"] }
 starknet_patricia_storage = { workspace = true, features = ["testing"] }
+starknet_transaction_prover.workspace = true
+strum.workspace = true
 tokio.workspace = true
 
 [lints]

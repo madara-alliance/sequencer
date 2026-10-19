@@ -2,7 +2,12 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 
-use starknet_patricia_storage::db_object::{DBObject, Deserializable, HasStaticPrefix};
+use starknet_patricia_storage::db_object::{
+    DBObject,
+    EmptyDeserializationContext,
+    EmptyKeyContext,
+    HasStaticPrefix,
+};
 use starknet_types_core::felt::Felt;
 
 use crate::patricia_merkle_tree::node_data::errors::{LeafError, LeafResult};
@@ -11,7 +16,14 @@ use crate::patricia_merkle_tree::original_skeleton_tree::tree::OriginalSkeletonT
 use crate::patricia_merkle_tree::types::NodeIndex;
 
 pub trait Leaf:
-    Clone + Sync + Send + HasStaticPrefix + DBObject + Deserializable + Default + Debug + Eq
+    Clone
+    + Sync
+    + Send
+    + HasStaticPrefix
+    + DBObject<DeserializeContext = EmptyDeserializationContext>
+    + Default
+    + Debug
+    + Eq
 {
     // TODO(Amos, 1/1/2025): When default values for associated types are stable - use them, and
     // add a default implementation for `create`.
@@ -53,6 +65,10 @@ pub trait Leaf:
         Ok(new_leaf == previous_leaf)
     }
 }
+
+pub trait LeafWithEmptyKeyContext: Leaf + HasStaticPrefix<KeyContext = EmptyKeyContext> {}
+
+impl<L: Leaf + HasStaticPrefix<KeyContext = EmptyKeyContext>> LeafWithEmptyKeyContext for L {}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SkeletonLeaf {

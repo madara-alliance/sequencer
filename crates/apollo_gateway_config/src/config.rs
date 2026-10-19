@@ -7,6 +7,7 @@ use apollo_config::converters::{
 use apollo_config::dumping::{
     prepend_sub_config_name,
     ser_optional_param,
+    ser_optional_sub_config,
     ser_param,
     SerializeConfig,
 };
@@ -21,20 +22,24 @@ use validator::Validate;
 
 use crate::compiler_version::VersionId;
 
-const JSON_RPC_VERSION: &str = "2.0";
+const DEFAULT_BUCKET_NAME: &str = "proof-archive";
 
-#[derive(Clone, Debug, Serialize, Deserialize, Validate, PartialEq)]
-pub struct GatewayConfig {
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Validate)]
+pub struct GatewayStaticConfig {
+    #[validate(nested)]
     pub stateless_tx_validator_config: StatelessTransactionValidatorConfig,
+    #[validate(nested)]
     pub stateful_tx_validator_config: StatefulTransactionValidatorConfig,
+    #[validate(nested)]
     pub contract_class_manager_config: ContractClassManagerConfig,
     pub chain_info: ChainInfo,
     pub block_declare: bool,
     #[serde(default, deserialize_with = "deserialize_comma_separated_str")]
     pub authorized_declarer_accounts: Option<Vec<ContractAddress>>,
+    pub proof_archive_writer_config: ProofArchiveWriterConfig,
 }
 
-impl Default for GatewayConfig {
+impl Default for GatewayStaticConfig {
     fn default() -> Self {
         Self {
             stateless_tx_validator_config: StatelessTransactionValidatorConfig::default(),
@@ -46,11 +51,12 @@ impl Default for GatewayConfig {
             chain_info: ChainInfo::default(),
             block_declare: false,
             authorized_declarer_accounts: None,
+            proof_archive_writer_config: ProofArchiveWriterConfig::default(),
         }
     }
 }
 
-impl SerializeConfig for GatewayConfig {
+impl SerializeConfig for GatewayStaticConfig {
     fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
         let mut dump = BTreeMap::from_iter([ser_param(
             "block_declare",
@@ -79,20 +85,36 @@ impl SerializeConfig for GatewayConfig {
              Addresses are in hex format and separated by a comma with no space.",
             ParamPrivacyInput::Public,
         ));
+        dump.extend(prepend_sub_config_name(
+            self.proof_archive_writer_config.dump(),
+            "proof_archive_writer_config",
+        ));
         dump
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, Validate)]
+pub struct GatewayConfig {
+    #[validate(nested)]
+    pub static_config: GatewayStaticConfig,
+}
+
+impl SerializeConfig for GatewayConfig {
+    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
+        prepend_sub_config_name(self.static_config.dump(), "static_config")
     }
 }
 
 impl GatewayConfig {
     pub fn is_authorized_declarer(&self, declarer_address: &ContractAddress) -> bool {
-        match &self.authorized_declarer_accounts {
+        match &self.static_config.authorized_declarer_accounts {
             Some(allowed_accounts) => allowed_accounts.contains(declarer_address),
             None => true,
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Validate, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Validate)]
 pub struct StatelessTransactionValidatorConfig {
     // If true, ensures that at least one resource bound (L1, L2, or L1 data) is greater than zero.
     pub validate_resource_bounds: bool,
@@ -102,12 +124,16 @@ pub struct StatelessTransactionValidatorConfig {
     pub max_l2_gas_amount: u64,
     pub max_calldata_length: usize,
     pub max_signature_length: usize,
+    pub max_proof_size: usize,
 
     // Declare txs specific config.
     pub max_contract_bytecode_size: usize,
     pub max_contract_class_object_size: usize,
     pub min_sierra_version: VersionId,
     pub max_sierra_version: VersionId,
+
+    // If true, allows transactions with non-empty proof_facts or proof fields.
+    pub allow_client_side_proving: bool,
 }
 
 impl Default for StatelessTransactionValidatorConfig {
@@ -116,12 +142,14 @@ impl Default for StatelessTransactionValidatorConfig {
             validate_resource_bounds: true,
             min_gas_price: 8_000_000_000,
             max_l2_gas_amount: 1_200_000_000,
-            max_calldata_length: 4000,
+            max_calldata_length: 5000,
             max_signature_length: 4000,
             max_contract_bytecode_size: 81920,
             max_contract_class_object_size: 4089446,
             min_sierra_version: VersionId::new(1, 1, 0),
-            max_sierra_version: VersionId::new(1, 7, usize::MAX),
+            max_sierra_version: VersionId::new(1, 8, usize::MAX),
+            allow_client_side_proving: false,
+            max_proof_size: 480000,
         }
     }
 }
@@ -172,6 +200,18 @@ impl SerializeConfig for StatelessTransactionValidatorConfig {
                 "Maximum allowed L2 gas amount for transactions.",
                 ParamPrivacyInput::Public,
             ),
+            ser_param(
+                "allow_client_side_proving",
+                &self.allow_client_side_proving,
+                "If true, allows transactions with non-empty proof_facts or proof fields.",
+                ParamPrivacyInput::Public,
+            ),
+            ser_param(
+                "max_proof_size",
+                &self.max_proof_size,
+                "Limitation of proof size.",
+                ParamPrivacyInput::Public,
+            ),
         ]);
         vec![
             members,
@@ -181,45 +221,6 @@ impl SerializeConfig for StatelessTransactionValidatorConfig {
         .into_iter()
         .flatten()
         .collect()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Validate, PartialEq)]
-pub struct RpcStateReaderConfig {
-    pub url: String,
-    pub json_rpc_version: String,
-}
-
-impl RpcStateReaderConfig {
-    pub fn from_url(url: String) -> Self {
-        Self { url, ..Default::default() }
-    }
-}
-
-impl Default for RpcStateReaderConfig {
-    fn default() -> Self {
-        Self { url: Default::default(), json_rpc_version: JSON_RPC_VERSION.to_string() }
-    }
-}
-
-#[cfg(any(feature = "testing", test))]
-impl RpcStateReaderConfig {
-    pub fn create_for_testing() -> Self {
-        Self::from_url("http://localhost:8080".to_string())
-    }
-}
-
-impl SerializeConfig for RpcStateReaderConfig {
-    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
-        BTreeMap::from_iter([
-            ser_param("url", &self.url, "The url of the rpc server.", ParamPrivacyInput::Public),
-            ser_param(
-                "json_rpc_version",
-                &self.json_rpc_version,
-                "The json rpc version.",
-                ParamPrivacyInput::Public,
-            ),
-        ])
     }
 }
 
@@ -244,9 +245,7 @@ impl Default for StatefulTransactionValidatorConfig {
             reject_future_declare_txs: true,
             max_nonce_for_validation_skip: Nonce(Felt::ONE),
             min_gas_price_percentage: 100,
-            // TODO(Itamar): Change to None once the versioned constants overrides are optional in
-            // the config schema.
-            versioned_constants_overrides: Some(VersionedConstantsOverrides::default()),
+            versioned_constants_overrides: None,
         }
     }
 }
@@ -286,10 +285,41 @@ impl SerializeConfig for StatefulTransactionValidatorConfig {
                 ParamPrivacyInput::Public,
             ),
         ]);
-        dump.append(&mut prepend_sub_config_name(
-            self.versioned_constants_overrides.clone().unwrap_or_default().dump(),
+        dump.append(&mut ser_optional_sub_config(
+            &self.versioned_constants_overrides,
             "versioned_constants_overrides",
         ));
         dump
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProofArchiveWriterConfig {
+    pub bucket_name: String,
+}
+
+impl Default for ProofArchiveWriterConfig {
+    fn default() -> Self {
+        Self { bucket_name: DEFAULT_BUCKET_NAME.to_string() }
+    }
+}
+
+#[cfg(any(feature = "testing", test))]
+impl ProofArchiveWriterConfig {
+    pub fn create_for_testing() -> Self {
+        // Use empty bucket name for tests to trigger mock proof writer.
+        Self { bucket_name: String::new() }
+    }
+}
+
+impl SerializeConfig for ProofArchiveWriterConfig {
+    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
+        BTreeMap::from_iter([ser_param(
+            "bucket_name",
+            &self.bucket_name,
+            "The name of the bucket to write proofs to. An empty string indicates a test \
+             environment that does not connect to GCS.",
+            ParamPrivacyInput::Public,
+        )])
     }
 }

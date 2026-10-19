@@ -5,11 +5,11 @@ mod central_objects;
 use std::sync::Arc;
 
 use apollo_class_manager_types::{ClassManagerClientError, SharedClassManagerClient};
-use apollo_config::secrets::Sensitive;
 use apollo_consensus::types::ProposalCommitment;
 use apollo_consensus_orchestrator_config::config::CendeConfig;
 use apollo_proc_macros::sequencer_latency_histogram;
 use async_trait::async_trait;
+use blockifier::abi::constants::STORED_BLOCK_HASH_BUFFER;
 use blockifier::blockifier::transaction_executor::CompiledClassHashesForMigration;
 use blockifier::bouncer::{BouncerWeights, CasmHashComputationData};
 use blockifier::state::cached_state::CommitmentStateDiff;
@@ -33,15 +33,15 @@ use reqwest::Response;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::{Jitter, RetryTransientMiddleware};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use shared_execution_objects::central_objects::CentralTransactionExecutionInfo;
-use starknet_api::block::{BlockInfo, BlockNumber, StarknetVersion};
+use starknet_api::block::{BlockHashAndNumber, BlockInfo, BlockNumber, StarknetVersion};
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::core::ClassHash;
 use starknet_api::state::ThinStateDiff;
 use tokio::sync::Mutex;
 use tokio::task::{self, JoinHandle};
-use tracing::{error, info, warn, Instrument};
+use tracing::{info, warn, Instrument};
 use url::Url;
 
 use crate::fee_market::FeeMarketInfo;
@@ -64,6 +64,9 @@ pub enum CendeAmbassadorError {
     StarknetApiError(#[from] starknet_api::StarknetApiError),
 }
 
+/// Number of recent block hashes to include in the blob.
+pub(crate) const N_BLOCK_HASHES_BACK_IN_BLOB: u64 = STORED_BLOCK_HASH_BUFFER;
+
 pub type CendeAmbassadorResult<T> = Result<T, CendeAmbassadorError>;
 
 /// A chunk of all the data to write to Aersopike.
@@ -85,6 +88,7 @@ pub(crate) struct AerospikeBlob {
     compiled_class_hashes_for_migration: CentralCompiledClassHashesForMigration,
     proposal_commitment: ProposalCommitment,
     parent_proposal_commitment: Option<ProposalCommitment>,
+    recent_block_hashes: Vec<BlockHashAndNumber>,
 }
 
 #[cfg_attr(test, automock)]
@@ -109,13 +113,23 @@ pub struct CendeAmbassador {
     // `None` indicates that there is no blob to write, and therefore, the node can't be the
     // proposer.
     prev_height_blob: Arc<Mutex<Option<AerospikeBlob>>>,
-    url: Sensitive<Url>,
+    write_blob_url: Url,
+    get_latest_received_block_url: Url,
     client: ClientWithMiddleware,
     class_manager: SharedClassManagerClient,
 }
 
 /// The path to write blob in the Recorder.
 pub const RECORDER_WRITE_BLOB_PATH: &str = "/cende_recorder/write_blob";
+/// The path to get the latest received block from the Recorder (the next block that will be written
+/// to DB. returns null when no blocks exist).
+pub const RECORDER_GET_LATEST_RECEIVED_BLOCK_PATH: &str =
+    "/cende_recorder/get_latest_received_block";
+
+#[derive(Debug, Deserialize)]
+struct GetLatestReceivedBlockResponse {
+    block_number: Option<u64>,
+}
 
 impl CendeAmbassador {
     pub fn new(cende_config: CendeConfig, class_manager: SharedClassManagerClient) -> Self {
@@ -126,15 +140,93 @@ impl CendeAmbassador {
 
         CendeAmbassador {
             prev_height_blob: Arc::new(Mutex::new(None)),
-            url: {
-                let mut recorder_url = cende_config.recorder_url;
-                recorder_url.append_route(RECORDER_WRITE_BLOB_PATH);
-                recorder_url
-            },
+            write_blob_url: cende_config
+                .recorder_url
+                .join(RECORDER_WRITE_BLOB_PATH)
+                .expect("Failed to construct write blob URL"),
+            get_latest_received_block_url: cende_config
+                .recorder_url
+                .join(RECORDER_GET_LATEST_RECEIVED_BLOCK_PATH)
+                .expect("Failed to construct get latest received block URL"),
             client: ClientBuilder::new(reqwest::Client::new())
                 .with(RetryTransientMiddleware::new_with_policy(retry_policy))
                 .build(),
             class_manager,
+        }
+    }
+}
+
+/// Returns whether the previous block exists at cende for  the current height.
+async fn previous_height_exists_at_cende_recorder(
+    client: ClientWithMiddleware,
+    url: Url,
+    current_height: BlockNumber,
+) -> bool {
+    // No previous block needed for height 0.
+    if current_height == BlockNumber(0) {
+        info!("Block 0 has no previous block. Proceeding.");
+        return true;
+    }
+
+    let latest_received_block = fetch_latest_received_block(&client, &url).await;
+
+    // No latest received block, so no previous block.
+    let Some(latest) = latest_received_block else {
+        warn!("CENDE_FAILURE: Cende does not have previous block for height {current_height}.");
+        record_write_failure(CendeWriteFailureReason::NoLatestBlockFromRecorder);
+        return false;
+    };
+
+    // Cende has a block at or above the current height, fail the round.
+    if latest >= current_height {
+        warn!(
+            "Cende ahead of proposal height {current_height} (cende at {latest}). Cannot proceed \
+             with this round."
+        );
+        record_write_failure(CendeWriteFailureReason::RecorderAheadOfProposalHeight);
+        return false;
+    }
+
+    // Has previous block.
+    let prev = current_height.prev().unwrap();
+    if latest >= prev {
+        info!("Cende already has previous block for height {current_height}. Skipping write.");
+        return true;
+    }
+
+    // Highly unlikely: Cende behind previous block. Warn for debugging, no metric.
+    warn!(
+        "CENDE_FAILURE: Cende behind prev for height {current_height} (cende latest={latest}). \
+         Cannot proceed."
+    );
+    false
+}
+
+async fn fetch_latest_received_block(
+    client: &ClientWithMiddleware,
+    url: &Url,
+) -> Option<BlockNumber> {
+    match client.get(url.as_str()).send().await {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<GetLatestReceivedBlockResponse>().await {
+                Ok(resp) => resp.block_number.map(BlockNumber),
+                Err(e) => {
+                    warn!("Failed to parse recorder get_latest_received_block response: {e}");
+                    None
+                }
+            }
+        }
+        Ok(response) => {
+            warn!(
+                "Recorder get_latest_received_block returned error status {}: {}",
+                response.status(),
+                response.text().await.unwrap_or_else(|_| "unparseable".to_string())
+            );
+            None
+        }
+        Err(e) => {
+            warn!("Failed to request recorder get_latest_received_block: {e}");
+            None
         }
     }
 }
@@ -145,17 +237,19 @@ impl CendeContext for CendeAmbassador {
         info!("Start writing to Aerospike previous height blob for height {current_height}.");
 
         let prev_height_blob = self.prev_height_blob.clone();
-        let request_builder = self.client.post(self.url.as_ref().clone()); // TODO(victork): make sure we're allowed to expose the URL here
+        let request_builder = self.client.post(self.write_blob_url.clone());
+        let client = self.client.clone();
+        let get_latest_url = self.get_latest_received_block_url.clone();
 
         task::spawn(
             async move {
-                // TODO(dvir): consider extracting the "should write blob" logic to a function.
                 let Some(ref blob): Option<AerospikeBlob> = *prev_height_blob.lock().await else {
-                    // This case happens when restarting the node, `prev_height_blob` initial value
-                    // is `None`.
-                    warn!("CENDE_FAILURE: No blob to write to Aerospike.");
-                    record_write_failure(CendeWriteFailureReason::BlobNotAvailable);
-                    return false;
+                    return previous_height_exists_at_cende_recorder(
+                        client,
+                        get_latest_url,
+                        current_height,
+                    )
+                    .await;
                 };
 
                 if blob.block_number.0 >= current_height.0 {
@@ -270,6 +364,7 @@ pub struct BlobParameters {
     pub(crate) compiled_class_hashes_for_migration: CompiledClassHashesForMigration,
     pub(crate) proposal_commitment: ProposalCommitment,
     pub(crate) parent_proposal_commitment: Option<ProposalCommitment>,
+    pub(crate) recent_block_hashes: Vec<BlockHashAndNumber>,
 }
 
 impl AerospikeBlob {
@@ -309,7 +404,7 @@ impl AerospikeBlob {
             block_number,
             state_diff,
             compressed_state_diff,
-            bouncer_weights: blob_parameters.bouncer_weights,
+            bouncer_weights: blob_parameters.bouncer_weights.into(),
             fee_market_info: blob_parameters.fee_market_info,
             transactions: central_transactions,
             execution_infos,
@@ -323,6 +418,7 @@ impl AerospikeBlob {
                 .compiled_class_hashes_for_migration,
             proposal_commitment: blob_parameters.proposal_commitment,
             parent_proposal_commitment: blob_parameters.parent_proposal_commitment,
+            recent_block_hashes: blob_parameters.recent_block_hashes,
         })
     }
 }

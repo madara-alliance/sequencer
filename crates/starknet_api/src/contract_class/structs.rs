@@ -44,6 +44,7 @@ pub type VersionedCasm = (CasmContractClass, SierraVersion);
 
 /// Represents a raw Starknet contract class.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, derive_more::From)]
+#[allow(clippy::large_enum_variant)]
 pub enum ContractClass {
     V0(DeprecatedContractClass),
     V1(VersionedCasm),
@@ -77,7 +78,7 @@ impl SierraVersion {
     /// Version of deprecated contract class (Cairo 0).
     pub const DEPRECATED: Self = Self(Version::new(0, 0, 0));
 
-    pub const LATEST: Self = Self(Version::new(1, 7, 0));
+    pub const LATEST: Self = Self(Version::new(1, 8, 0));
 
     pub fn new(major: u64, minor: u64, patch: u64) -> Self {
         Self(Version::new(major, minor, patch))

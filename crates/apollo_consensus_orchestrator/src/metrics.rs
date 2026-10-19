@@ -1,6 +1,6 @@
 use apollo_metrics::{define_metrics, generate_permutation_labels};
-use strum::{EnumVariantNames, VariantNames};
-use strum_macros::{EnumIter, IntoStaticStr};
+use apollo_transaction_converter::metrics::CONSENSUS_PROOF_MANAGER_STORE_LATENCY;
+use strum::{EnumIter, IntoStaticStr, VariantNames};
 
 use crate::build_proposal::BuildProposalFailureReasonLabelValue;
 use crate::validate_proposal::ValidateProposalFailureReasonLabelValue;
@@ -10,11 +10,14 @@ define_metrics!(
         MetricGauge { CONSENSUS_NUM_BATCHES_IN_PROPOSAL, "consensus_num_batches_in_proposal", "The number of transaction batches in a valid proposal received" },
         MetricGauge { CONSENSUS_NUM_TXS_IN_PROPOSAL, "consensus_num_txs_in_proposal", "The total number of individual transactions in a valid proposal received" },
         MetricCounter { CONSENSUS_PROPOSAL_FIN_MISMATCH, "consensus_proposal_fin_mismatch", "The number of times the proposal fin commitment mismatched the batcher-built commitment", init = 0 },
+        // TODO(guyn): remove these 3 metrics.
         MetricCounter { CONSENSUS_ETH_TO_FRI_RATE_MISMATCH, "consensus_eth_to_fri_rate_mismatch", "The number of times the eth to fri rate in a proposal does not match the value expected by this validator", init = 0 },
         MetricCounter { CONSENSUS_L1_GAS_MISMATCH, "consensus_l1_gas_mismatch", "The number of times the L1 gas in a proposal does not match the value expected by this validator", init = 0 },
         MetricCounter { CONSENSUS_L1_DATA_GAS_MISMATCH, "consensus_l1_data_gas_mismatch", "The number of times the L1 data gas in a proposal does not match the value expected by this validator", init = 0 },
         MetricGauge { CONSENSUS_L2_GAS_PRICE, "consensus_l2_gas_price", "The L2 gas price calculated in an accepted proposal" },
         MetricCounter { CONSENSUS_L1_GAS_PRICE_PROVIDER_ERROR, "consensus_l1_gas_price_provider_error", "Number of times the context got an error when querying the L1 gas price provider", init=0},
+        MetricCounter { CONSENSUS_RETROSPECTIVE_BLOCK_HASH_MISMATCH, "consensus_retrospective_block_hash_mismatch", "Number of times the retrospective block hashes of the state sync and the batcher mismatched", init=0},
+
 
         // Cende metrics
         MetricGauge { CENDE_LAST_PREPARED_BLOB_BLOCK_NUMBER, "cende_last_prepared_blob_block_number", "The blob block number that cende knows. That means the sequencer can be the proposer only if the current height is greater by one than this value." },
@@ -34,12 +37,13 @@ define_metrics!(
 
 pub const LABEL_CENDE_FAILURE_REASON: &str = "cende_write_failure_reason";
 
-#[derive(IntoStaticStr, EnumIter, EnumVariantNames)]
+#[derive(IntoStaticStr, EnumIter, VariantNames)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum CendeWriteFailureReason {
     CommunicationError,
     CendeRecorderError,
-    BlobNotAvailable,
+    NoLatestBlockFromRecorder,
+    RecorderAheadOfProposalHeight,
     HeightMismatch,
 }
 
@@ -87,6 +91,7 @@ pub(crate) fn register_metrics() {
     CONSENSUS_L1_DATA_GAS_MISMATCH.register();
     CONSENSUS_L2_GAS_PRICE.register();
     CONSENSUS_L1_GAS_PRICE_PROVIDER_ERROR.register();
+    CONSENSUS_RETROSPECTIVE_BLOCK_HASH_MISMATCH.register();
     CENDE_LAST_PREPARED_BLOB_BLOCK_NUMBER.register();
     CENDE_PREPARE_BLOB_FOR_NEXT_HEIGHT_LATENCY.register();
     CENDE_WRITE_PREV_HEIGHT_BLOB_LATENCY.register();
@@ -94,4 +99,5 @@ pub(crate) fn register_metrics() {
     CENDE_WRITE_BLOB_FAILURE.register();
     CONSENSUS_BUILD_PROPOSAL_FAILURE.register();
     CONSENSUS_VALIDATE_PROPOSAL_FAILURE.register();
+    CONSENSUS_PROOF_MANAGER_STORE_LATENCY.register();
 }

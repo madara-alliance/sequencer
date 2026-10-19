@@ -20,6 +20,7 @@ use crate::transaction::fields::{
     Calldata,
     Fee,
     PaymasterData,
+    Proof,
     ProofFacts,
     Tip,
     TransactionSignature,
@@ -51,6 +52,7 @@ pub struct InvokeTxArgs {
     pub only_query: bool,
     pub tx_hash: TransactionHash,
     pub proof_facts: ProofFacts,
+    pub proof: Proof,
 }
 
 impl Default for InvokeTxArgs {
@@ -71,6 +73,7 @@ impl Default for InvokeTxArgs {
             only_query: false,
             tx_hash: TransactionHash::default(),
             proof_facts: ProofFacts::default(),
+            proof: Proof::default(),
         }
     }
 }
@@ -159,6 +162,7 @@ pub fn rpc_invoke_tx(invoke_args: InvokeTxArgs) -> RpcTransaction {
         paymaster_data: invoke_args.paymaster_data,
         account_deployment_data: invoke_args.account_deployment_data,
         proof_facts: invoke_args.proof_facts,
+        proof: invoke_args.proof,
     }))
 }
 
@@ -171,7 +175,7 @@ pub fn internal_invoke_tx(invoke_args: InvokeTxArgs) -> InternalRpcTransaction {
         panic!("Expected RpcTransaction::Invoke");
     };
 
-    let invoke_tx = InternalRpcTransactionWithoutTxHash::Invoke(tx);
+    let invoke_tx = InternalRpcTransactionWithoutTxHash::Invoke(tx.into());
 
     InternalRpcTransaction { tx: invoke_tx, tx_hash }
 }

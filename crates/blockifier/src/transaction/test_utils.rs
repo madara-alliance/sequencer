@@ -33,6 +33,7 @@ use starknet_api::transaction::fields::{
     Fee,
     GasVectorComputationMode,
     PaymasterData,
+    ProofFacts,
     Resource,
     ResourceBounds,
     TransactionSignature,
@@ -462,20 +463,30 @@ pub fn emit_n_events_tx(
     AccountTransaction::new_for_sequencing(tx)
 }
 
+pub fn proof_facts_as_cairo_array(proof_facts: ProofFacts) -> Vec<Felt> {
+    let mut proof_facts: Vec<Felt> = proof_facts.0.to_vec();
+    // Cairo array ABI expects the first element to be the array length.
+    let len: u128 = proof_facts.len().try_into().expect("proof_facts length is too large");
+    proof_facts.insert(0, felt!(len));
+    proof_facts
+}
+
 /// Utility struct to test the execution info syscall.
 /// For simplicity, some fields are not included in the struct, and assumed empty.
+#[derive(Default)]
 pub struct ExpectedExecutionInfo {
     pub version: TransactionVersion,
     pub account_address: ContractAddress,
     pub max_fee: Fee,
     pub transaction_hash: TransactionHash,
-    pub chain_id: ChainId,
+    pub chain_id: Option<ChainId>,
     pub nonce: Nonce,
     pub resource_bounds: ValidResourceBounds,
     pub paymaster_data: PaymasterData,
     pub nonce_data_availability_mode: DataAvailabilityMode,
     pub fee_data_availability_mode: DataAvailabilityMode,
     pub account_deployment_data: AccountDeploymentData,
+    pub proof_facts: ProofFacts,
     pub caller_address: ContractAddress,
     pub contract_address: ContractAddress,
     pub entry_point_selector: EntryPointSelector,
@@ -498,6 +509,7 @@ impl ExpectedExecutionInfo {
         sequencer_address: ContractAddress,
         resource_bounds: ValidResourceBounds,
         nonce: Nonce,
+        proof_facts: ProofFacts,
     ) -> Self {
         let mut version = Felt::THREE;
         if only_query {
@@ -508,13 +520,14 @@ impl ExpectedExecutionInfo {
             account_address,
             caller_address,
             contract_address,
-            chain_id,
+            chain_id: Some(chain_id),
             entry_point_selector,
             block_number,
             block_timestamp,
             sequencer_address,
             resource_bounds,
             nonce,
+            proof_facts,
             max_fee: Fee::default(),
             transaction_hash: TransactionHash::default(),
             paymaster_data: PaymasterData::default(),
@@ -525,13 +538,22 @@ impl ExpectedExecutionInfo {
     }
 
     pub fn to_syscall_result(self) -> Vec<Felt> {
+        let expected_block_info = vec![
+            felt!(self.block_number.0),
+            felt!(self.block_timestamp.0),
+            **self.sequencer_address,
+        ];
+
+        let expected_call_info =
+            vec![**self.caller_address, **self.contract_address, self.entry_point_selector.0];
+
         let expected_tx_info = vec![
             self.version.0,
             **self.account_address,
             self.max_fee.0.into(),
             Felt::ZERO,
             self.transaction_hash.0,
-            Felt::from_hex_unchecked(&self.chain_id.as_hex()),
+            Felt::from_hex_unchecked(&self.chain_id.unwrap_or(ChainId::Mainnet).as_hex()),
             self.nonce.0,
         ];
 
@@ -565,20 +587,14 @@ impl ExpectedExecutionInfo {
         // Tip, Paymaster data, Nonce DA, Fee DA, Account data.
         let expected_unsupported_fields = vec![Felt::ZERO; 5];
 
-        let expected_call_info =
-            vec![**self.caller_address, **self.contract_address, self.entry_point_selector.0];
-        let expected_block_info = vec![
-            felt!(self.block_number.0),
-            felt!(self.block_timestamp.0),
-            **self.sequencer_address,
-        ];
-
+        let expected_proof_facts = proof_facts_as_cairo_array(self.proof_facts);
         [
             expected_block_info,
+            expected_call_info,
             expected_tx_info,
             expected_resource_bounds,
             expected_unsupported_fields,
-            expected_call_info,
+            expected_proof_facts,
         ]
         .concat()
     }

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use apollo_gateway::rpc_objects::BlockHeader;
 use assert_matches::assert_matches;
 use blockifier::state::cached_state::StateMaps;
 use pretty_assertions::assert_eq;
@@ -18,7 +17,7 @@ use starknet_core::types::ContractClass;
 
 use crate::compile::legacy_to_contract_class_v0;
 use crate::serde_utils::deserialize_transaction_json_to_starknet_api_tx;
-use crate::utils::ReexecutionStateMaps;
+use crate::state_reader::rpc_objects::BlockHeader;
 
 #[fixture]
 fn block_header() -> BlockHeader {
@@ -153,15 +152,11 @@ fn serialize_state_maps() {
     let original_state_maps =
         StateMaps { nonces, class_hashes, storage, compiled_class_hashes, declared_contracts };
 
-    let serializable_state_maps = ReexecutionStateMaps::from(original_state_maps.clone());
+    let json =
+        serde_json::to_string_pretty(&original_state_maps).expect("Failed to serialize state maps");
 
-    // Check that the created statemaps can be serialized.
-    let json = serde_json::to_string_pretty(&serializable_state_maps)
-        .expect("Failed to serialize state maps");
-
-    let deserialized_state_maps: ReexecutionStateMaps =
+    let deserialized_state_maps: StateMaps =
         serde_json::from_str(&json).expect("Failed to deserialize state maps");
 
-    assert_eq!(serializable_state_maps, deserialized_state_maps);
-    assert_eq!(original_state_maps, deserialized_state_maps.try_into().unwrap());
+    assert_eq!(original_state_maps, deserialized_state_maps);
 }

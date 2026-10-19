@@ -1,4 +1,6 @@
 pub mod cairo0_compiler;
+#[cfg(any(feature = "testing", test))]
+pub mod cairo0_compiler_test_utils;
 pub mod cairo_compiler_version;
 pub mod command;
 pub mod dumping;
@@ -12,5 +14,6 @@ pub mod test_utils;
 pub mod tracing;
 pub mod tracing_utils;
 pub mod type_name;
+pub mod url;
 
 pub extern crate apollo_proc_macros as _apollo_proc_macros;

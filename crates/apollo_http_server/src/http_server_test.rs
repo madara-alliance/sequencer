@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use apollo_gateway_types::communication::{GatewayClientError, MockGatewayClient};
 use apollo_gateway_types::deprecated_gateway_error::{
     KnownStarknetErrorCode,
@@ -12,9 +14,12 @@ use apollo_gateway_types::gateway_types::{
     InvokeGatewayOutput,
 };
 use apollo_infra::component_client::ClientError;
-use axum::body::{Bytes, HttpBody};
+use apollo_proc_macros::unique_u16;
+use axum::body::Bytes;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use http::StatusCode;
+use http_body_util::BodyExt;
 use rstest::rstest;
 use serde_json::Value;
 use starknet_api::test_utils::read_json_file;
@@ -26,12 +31,14 @@ use tracing_test::traced_test;
 use crate::errors::HttpServerError;
 use crate::http_server::CLIENT_REGION_HEADER;
 use crate::test_utils::{
-    add_tx_http_client,
     deprecated_gateway_declare_tx,
     deprecated_gateway_deploy_account_tx,
     deprecated_gateway_invoke_tx,
+    deprecated_gateway_invoke_tx_client_side_proving,
+    get_mock_config_manager_client,
     rpc_invoke_tx,
     GatewayTransaction,
+    HttpClientServerSetupBuilder,
     TransactionSerialization,
 };
 
@@ -45,7 +52,7 @@ const DEPRECATED_GATEWAY_DEPLOY_ACCOUNT_TX_RESPONSE_JSON_PATH: &str =
 const EXPECTED_TX_HASH: TransactionHash = TransactionHash(Felt::ONE);
 
 // The http_server is oblivious to the GateWayOutput type, so we always return invoke.
-pub fn default_gateway_output() -> GatewayOutput {
+fn default_gateway_output() -> GatewayOutput {
     GatewayOutput::Invoke(InvokeGatewayOutput::new(EXPECTED_TX_HASH))
 }
 
@@ -76,7 +83,7 @@ async fn gateway_output_json_conversion(
     let status_code = response.status();
     let response_bytes = &to_bytes(response).await;
 
-    assert_eq!(status_code, hyper::StatusCode::OK, "{response_bytes:?}");
+    assert_eq!(status_code, StatusCode::OK, "{response_bytes:?}");
     let gateway_response: GatewayOutput = serde_json::from_slice(response_bytes).unwrap();
 
     let expected_gateway_response = read_json_file(expected_serialized_response_path);
@@ -85,6 +92,23 @@ async fn gateway_output_json_conversion(
 
 async fn to_bytes(res: Response) -> Bytes {
     res.into_body().collect().await.unwrap().to_bytes()
+}
+
+/// Test that an HTTP server with a `allow_new_txs = false` config rejects new transactions.
+#[rstest]
+#[tokio::test]
+async fn allow_new_txs() {
+    let tx = rpc_invoke_tx();
+
+    let http_client = HttpClientServerSetupBuilder::new(unique_u16!())
+        .with_mock_config_manager_client(get_mock_config_manager_client(false))
+        .build()
+        .await;
+
+    // Send a transaction to the server.
+    let response = http_client.add_tx(tx.clone()).await;
+    let status = response.status();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{status:?}");
 }
 
 #[tokio::test]
@@ -107,8 +131,8 @@ async fn error_into_response() {
 
 #[traced_test]
 #[rstest]
-#[case::add_deprecated_gateway_tx(0, deprecated_gateway_invoke_tx())]
-#[case::add_rpc_tx(1, rpc_invoke_tx())]
+#[case::add_deprecated_gateway_tx(unique_u16!(), deprecated_gateway_invoke_tx())]
+#[case::add_rpc_tx(unique_u16!(), rpc_invoke_tx())]
 #[tokio::test]
 /// Test that when an add transaction HTTP request is sent to the server, the region of the http
 /// request is recorded to the info log.
@@ -127,7 +151,10 @@ async fn record_region_test(#[case] index: u16, #[case] tx: impl GatewayTransact
         .return_const(Ok(GatewayOutput::Invoke(InvokeGatewayOutput::new(tx_hash_2))));
 
     // TODO(Yael): avoid the hardcoded node offset index, consider dynamic allocation.
-    let http_client = add_tx_http_client(mock_gateway_client, 1 + index).await;
+    let http_client = HttpClientServerSetupBuilder::new(index)
+        .with_mock_gateway_client(mock_gateway_client)
+        .build()
+        .await;
 
     // Send a transaction to the server, without a region.
     http_client.add_tx(tx.clone()).await;
@@ -145,8 +172,8 @@ async fn record_region_test(#[case] index: u16, #[case] tx: impl GatewayTransact
 
 #[traced_test]
 #[rstest]
-#[case::add_deprecated_gateway_tx(0, deprecated_gateway_invoke_tx())]
-#[case::add_rpc_tx(1, rpc_invoke_tx())]
+#[case::add_deprecated_gateway_tx(unique_u16!(), deprecated_gateway_invoke_tx())]
+#[case::add_rpc_tx(unique_u16!(), rpc_invoke_tx())]
 #[tokio::test]
 /// Test that when an "add_tx" HTTP request is sent to the server, and it fails in the Gateway, no
 /// record of the region is logged.
@@ -159,7 +186,10 @@ async fn record_region_gateway_failing_tx(#[case] index: u16, #[case] tx: impl G
         )),
     ));
 
-    let http_client = add_tx_http_client(mock_gateway_client, 3 + index).await;
+    let http_client = HttpClientServerSetupBuilder::new(index)
+        .with_mock_gateway_client(mock_gateway_client)
+        .build()
+        .await;
 
     // Send a transaction to the server.
     http_client.add_tx(tx).await;
@@ -167,10 +197,14 @@ async fn record_region_gateway_failing_tx(#[case] index: u16, #[case] tx: impl G
 }
 
 #[rstest]
-#[case::add_deprecated_gateway_invoke(0, deprecated_gateway_invoke_tx())]
-#[case::add_deprecated_gateway_deploy_account(1, deprecated_gateway_deploy_account_tx())]
-#[case::add_deprecated_gateway_declare(2, deprecated_gateway_declare_tx())]
-#[case::add_rpc_invoke(3, rpc_invoke_tx())]
+#[case::add_deprecated_gateway_invoke(unique_u16!(), deprecated_gateway_invoke_tx())]
+#[case::add_deprecated_gateway_invoke_client_side_proving(
+    unique_u16!(),
+    deprecated_gateway_invoke_tx_client_side_proving()
+)]
+#[case::add_deprecated_gateway_deploy_account(unique_u16!(), deprecated_gateway_deploy_account_tx())]
+#[case::add_deprecated_gateway_declare(unique_u16!(), deprecated_gateway_declare_tx())]
+#[case::add_rpc_invoke(unique_u16!(), rpc_invoke_tx())]
 #[tokio::test]
 async fn test_response(#[case] index: u16, #[case] tx: impl GatewayTransaction) {
     let mut mock_gateway_client = MockGatewayClient::new();
@@ -207,26 +241,27 @@ async fn test_response(#[case] index: u16, #[case] tx: impl GatewayTransaction) 
         expected_internal_err,
     ));
 
-    let http_client = add_tx_http_client(mock_gateway_client, 5 + index).await;
+    let http_client = HttpClientServerSetupBuilder::new(index)
+        .with_mock_gateway_client(mock_gateway_client)
+        .build()
+        .await;
 
     // Test a successful response.
     let tx_hash = http_client.assert_add_tx_success(tx.clone()).await;
     assert_eq!(tx_hash, EXPECTED_TX_HASH);
 
     // Test a failed bad request response.
-    let error_str =
-        http_client.assert_add_tx_error(tx.clone(), reqwest::StatusCode::BAD_REQUEST).await;
+    let error_str = http_client.assert_add_tx_error(tx.clone(), StatusCode::BAD_REQUEST).await;
     assert_eq!(error_str, expected_err_str);
 
     // Test a failed internal server error response.
-    let error_str =
-        http_client.assert_add_tx_error(tx, reqwest::StatusCode::INTERNAL_SERVER_ERROR).await;
+    let error_str = http_client.assert_add_tx_error(tx, StatusCode::INTERNAL_SERVER_ERROR).await;
     assert_eq!(error_str, expected_gateway_client_err_str);
 }
 
 #[rstest]
 #[case::missing_version(
-    0,
+    unique_u16!(),
     None,
     StarknetError {
         code: StarknetErrorCode::KnownErrorCode(KnownStarknetErrorCode::MalformedRequest),
@@ -234,28 +269,33 @@ async fn test_response(#[case] index: u16, #[case] tx: impl GatewayTransaction) 
     }
 )]
 #[case::bad_version(
-    1,
+    unique_u16!(),
     Some("bad version"),
     StarknetError {
         code: StarknetErrorCode::KnownErrorCode(KnownStarknetErrorCode::MalformedRequest),
-        message: "Version field is not a valid hex string: badversion".to_string(), //Note: whitespaces are removed when parsing malformed tx jsons
+        //Note: whitespaces are removed when parsing malformed tx jsons
+        message: "Version field is not a valid hex string: badversion".to_string(),
     }
 )]
-#[case::old_version(2, Some("0x1"), StarknetError {
-            code: StarknetErrorCode::KnownErrorCode(
-                KnownStarknetErrorCode::InvalidTransactionVersion,
-            ),
-            message: "Transaction version 1 is not supported. Supported versions: [3]."
-                .to_string(),
-        },
+#[case::old_version(
+    unique_u16!(),
+    Some("0x1"),
+    StarknetError {
+        code: StarknetErrorCode::KnownErrorCode(
+            KnownStarknetErrorCode::InvalidTransactionVersion,
+        ),
+        message: "Transaction version 1 is not supported. Supported versions: [3].".to_string(),
+    },
 )]
-#[case::newer_version(3, Some("0x4"), StarknetError {
-                code: StarknetErrorCode::KnownErrorCode(
-                    KnownStarknetErrorCode::InvalidTransactionVersion,
-                ),
-                message: "Transaction version 4 is not supported. Supported versions: [3]."
-                    .to_string(),
-            }
+#[case::newer_version(
+    unique_u16!(),
+    Some("0x4"),
+    StarknetError {
+        code: StarknetErrorCode::KnownErrorCode(
+            KnownStarknetErrorCode::InvalidTransactionVersion,
+        ),
+        message: "Transaction version 4 is not supported. Supported versions: [3].".to_string(),
+    }
 )]
 #[tokio::test]
 async fn test_unsupported_tx_version(
@@ -273,11 +313,9 @@ async fn test_unsupported_tx_version(
         as_object.remove("version").unwrap();
     }
 
-    let mock_gateway_client = MockGatewayClient::new();
-    let http_client = add_tx_http_client(mock_gateway_client, 9 + index).await;
+    let http_client = HttpClientServerSetupBuilder::new(index).build().await;
 
-    let serialized_err =
-        http_client.assert_add_tx_error(tx_json, reqwest::StatusCode::BAD_REQUEST).await;
+    let serialized_err = http_client.assert_add_tx_error(tx_json, StatusCode::BAD_REQUEST).await;
     let starknet_error = serde_json::from_str::<StarknetError>(&serialized_err).unwrap();
     assert_eq!(starknet_error, expected_err);
 }
@@ -292,11 +330,9 @@ async fn sanitizing_error_message() {
         "<script>alert(1)\n</script>'`[](){}_!@#$%^&*+=~\"'`[](){}_!@#$%^&*+=~";
     tx_object.insert("version".to_string(), Value::String(malicious_version.to_string())).unwrap();
 
-    let mock_gateway_client = MockGatewayClient::new();
-    let http_client = add_tx_http_client(mock_gateway_client, 13).await;
+    let http_client = HttpClientServerSetupBuilder::new(unique_u16!()).build().await;
 
-    let serialized_err =
-        http_client.assert_add_tx_error(tx_json, reqwest::StatusCode::BAD_REQUEST).await;
+    let serialized_err = http_client.assert_add_tx_error(tx_json, StatusCode::BAD_REQUEST).await;
     let starknet_error: StarknetError =
         serde_json::from_str(&serialized_err).expect("Expected valid StarknetError JSON");
 
@@ -317,4 +353,101 @@ async fn sanitizing_error_message() {
         "Escaped message not found. This is the returned error message: {}",
         starknet_error.message
     );
+}
+
+#[rstest]
+#[case::add_deprecated_gateway_tx_happy_flow(
+    unique_u16!(), deprecated_gateway_invoke_tx(), 1024, StatusCode::OK
+)]
+#[case::add_rpc_tx_happy_flow(
+    unique_u16!(), rpc_invoke_tx(), 1024, StatusCode::OK
+)]
+#[case::add_deprecated_gateway_tx_too_large(
+    unique_u16!(), deprecated_gateway_invoke_tx(), 16, StatusCode::PAYLOAD_TOO_LARGE
+)]
+#[case::add_rpc_tx_too_large(
+    unique_u16!(), rpc_invoke_tx(), 16, StatusCode::PAYLOAD_TOO_LARGE
+)]
+#[tokio::test]
+async fn request_body_size_limit_enforced(
+    #[case] index: u16,
+    #[case] tx: impl GatewayTransaction,
+    #[case] max_request_body_size: usize,
+    #[case] expected_status: StatusCode,
+) {
+    let mut mock_gateway_client = MockGatewayClient::new();
+    if expected_status == StatusCode::OK {
+        mock_gateway_client.expect_add_tx().times(1).return_const(Ok(default_gateway_output()));
+    }
+    let http_client = HttpClientServerSetupBuilder::new(index)
+        .with_max_request_body_size(max_request_body_size)
+        .with_mock_gateway_client(mock_gateway_client)
+        .build()
+        .await;
+    let response = http_client.add_tx(tx).await;
+    assert_eq!(response.status(), expected_status, "Unexpected status: {}", response.status());
+}
+
+#[tokio::test]
+async fn zstd_compressed_request_decompression() {
+    let mut mock_gateway_client = MockGatewayClient::new();
+    mock_gateway_client.expect_add_tx().times(1).return_const(Ok(default_gateway_output()));
+
+    let http_client = HttpClientServerSetupBuilder::new(unique_u16!())
+        .with_mock_gateway_client(mock_gateway_client)
+        .build()
+        .await;
+
+    let tx_json = serde_json::to_string(&rpc_invoke_tx()).unwrap();
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.write_all(tx_json.as_bytes()).unwrap();
+    let compressed_body = encoder.finish().unwrap();
+
+    let response = http_client.add_rpc_tx_with_zstd(compressed_body).await;
+
+    assert_eq!(response.status(), StatusCode::OK, "Request should be decompressed and handled");
+    let response_body = response.text().await.unwrap();
+    let gateway_output: GatewayOutput =
+        serde_json::from_str(&response_body).expect("Response should be valid GatewayOutput");
+    assert_eq!(gateway_output.transaction_hash(), EXPECTED_TX_HASH);
+}
+
+#[tokio::test]
+async fn zstd_compressed_request_too_large() {
+    let tx_json = serde_json::to_string(&rpc_invoke_tx()).unwrap();
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.write_all(tx_json.as_bytes()).unwrap();
+    let compressed_body = encoder.finish().unwrap();
+
+    let http_client = HttpClientServerSetupBuilder::new(unique_u16!())
+        .with_max_request_body_size(compressed_body.len() - 1)
+        .build()
+        .await;
+
+    let response = http_client.add_rpc_tx_with_zstd(compressed_body).await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn zstd_decompressed_request_too_large() {
+    // 10 KB of repeated bytes — compresses to ~50 bytes with zstd.
+    let large_body = vec![b'a'; 10 * 1024];
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.write_all(&large_body).unwrap();
+    let compressed_body = encoder.finish().unwrap();
+
+    // Limit between compressed size and decompressed size.
+    // compressed_body is ~50 bytes; decompressed is 10240 bytes.
+    let max_request_body_size = large_body.len() - 1;
+    assert!(compressed_body.len() < max_request_body_size);
+
+    let http_client = HttpClientServerSetupBuilder::new(unique_u16!())
+        .with_max_request_body_size(max_request_body_size)
+        .build()
+        .await;
+
+    let response = http_client.add_rpc_tx_with_zstd(compressed_body).await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

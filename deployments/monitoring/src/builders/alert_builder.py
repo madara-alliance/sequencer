@@ -3,16 +3,22 @@
 import argparse
 import json
 import os
+import sys
 from typing import Optional
 
 from common import const
+from common.config_overrides import apply_config_overrides as apply_config_overrides_generic
+from common.config_overrides import (
+    load_config_file,
+    validate_config_overrides,
+)
 from common.grafana10_objects import (
     alert_expression_model_object,
     alert_query_model_object,
     alert_query_object,
     alert_rule_object,
 )
-from common.helpers import EnvironmentName, alert_env_filename_suffix, get_logger
+from common.logger import get_logger
 from grafana_client import GrafanaApi
 from grafana_client.client import (
     GrafanaBadInputError,
@@ -21,6 +27,9 @@ from grafana_client.client import (
     GrafanaServerError,
 )
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_fixed
+
+# Global logger (initialized in alert_builder function)
+logger = None
 
 
 def create_alert_expression_model(conditions: list[dict[str, any]]):
@@ -122,9 +131,13 @@ def create_folder_return_uid(client: GrafanaApi, title: str) -> str:
 def dump_alert(output_dir: str, alert: dict[str, any]) -> None:
     alert_full_path = f"{output_dir}/{alert['name']}.json".lower().replace(" ", "_")
     os.makedirs(output_dir, exist_ok=True)
+    ordered = {"title": alert["title"], **{k: v for k, v in alert.items() if k != "title"}}
     with open(alert_full_path, "w") as f:
-        json.dump(alert, f, indent=2)
-    logger.info(f'Alert "{alert["name"]}" saved to {alert_full_path}')
+        json.dump(ordered, f, indent=2)
+    # Format with professional colors: Alert (white bold), name (cyan), saved to (white bold), path (dim cyan)
+    logger.info(
+        f'[bold white]Alert[/bold white] "[blue]{alert["name"]}[/blue]" [bold white]saved to[/bold white] [dim white]{alert_full_path}[/dim white]'
+    )
 
 
 def get_alert_rule_group(client: GrafanaApi, folder_uid: str, group_uid: str) -> str:
@@ -174,38 +187,89 @@ def remove_expr_placeholder(expr: str) -> str:
     return expr.replace(const.ALERT_RULE_EXPRESSION_PLACEHOLDER, "")
 
 
-# TODO(Tsabary): remove the vanilla path option once we transition to per-env file.
-def resolve_dev_alerts_file_path(path: str, suffix: str) -> str:
+def _convert_numeric_strings_in_conditions(conditions: list[dict[str, any]]) -> None:
+    """
+    Recursively convert numeric strings back to numbers in conditions structure.
+    This handles placeholders that were replaced in numeric fields like evaluator.params.
+    """
+    for condition in conditions:
+        if isinstance(condition, dict):
+            # Handle evaluator.params and reducer.params in a single loop
+            for key in ["evaluator", "reducer"]:
+                params = condition.get(key, {}).get("params", [])
+                for i, param in enumerate(params):
+                    if isinstance(param, str):
+                        # Try to convert to float first (handles decimals), then int if whole number
+                        try:
+                            float_val = float(param)
+                            # If it's a whole number, convert to int, otherwise keep as float
+                            params[i] = int(float_val) if float_val.is_integer() else float_val
+                        except ValueError:
+                            # Keep as string if conversion fails
+                            pass
+
+
+def post_process_alert(alert: dict[str, any]) -> dict[str, any]:
+    """
+    Post-process alert after placeholder replacement.
+    Handles alert-specific field conversions (e.g., intervalSec string to int,
+    conditions.params numeric strings to numbers).
+
+    Args:
+        alert: The alert dictionary
+
+    Returns:
+        The alert dictionary with post-processing applied
+    """
+    # Special handling for intervalSec: if it was a placeholder string that got replaced,
+    # try to convert it to int if it's now numeric
+    val = alert.get("intervalSec")
+    if isinstance(val, str):
+        try:
+            # Try to convert to int if it's a numeric string
+            alert["intervalSec"] = int(val)
+        except ValueError:
+            # Keep as string if conversion fails
+            pass
+
+    # Convert numeric strings in conditions.params back to numbers
+    conds = alert.get("conditions")
+    if isinstance(conds, list):
+        _convert_numeric_strings_in_conditions(conds)
+
+    return alert
+
+
+def resolve_dev_alerts_file_path(path: str) -> str:
     """
     Resolve a JSON path:
-    - If the original file exists, return it.
-    - Otherwise, check for `<name>_<suffix>.json`.
+    - If the file exists, return it.
     - Raise an error if neither exists.
     """
     if os.path.isfile(path):
         return path
 
-    # Insert suffix before `.json`
-    base, ext = os.path.splitext(path)
-    if ext.lower() != ".json":
-        raise ValueError(f"Expected a .json file, got: {path}")
-
-    alternative_path = f"{base}_{suffix}{ext}"
-    if os.path.isfile(alternative_path):
-        return alternative_path
-
-    raise FileNotFoundError(f"Neither '{path}' nor '{alternative_path}' exists.")
+    raise FileNotFoundError(f"'{path}' does not exist.")
 
 
 def alert_builder(args: argparse.Namespace):
     global logger
     logger = get_logger(name="alert_builder", debug=args.debug)
 
-    suffix = alert_env_filename_suffix(env=EnvironmentName(args.env))
-    alert_file_path = resolve_dev_alerts_file_path(path=args.dev_alerts_file, suffix=suffix)
+    alert_file_path = resolve_dev_alerts_file_path(path=args.dev_alerts_file)
 
     with open(alert_file_path, "r") as f:
         dev_alerts = json.load(f)
+
+    # Load config overrides if provided
+    args_dict = vars(args)
+    config = (
+        load_config_file(args_dict.get("alert_rules_overrides_config_file"), logger_instance=logger)
+        if args_dict.get("alert_rules_overrides_config_file")
+        else {}
+    )
+    if config:
+        logger.info(f"Loaded {len(config)} override(s) from alert rules overrides config file")
 
     if not args.dry_run:
         client = GrafanaApi.from_url(args.grafana_url)
@@ -213,9 +277,38 @@ def alert_builder(args: argparse.Namespace):
     else:
         folder_uid = args.folder_uid
 
+    # Get config file path for error messages
+    alert_rules_overrides_config_file_path = args_dict.get("alert_rules_overrides_config_file", "")
+
+    # Validate all placeholders from all alerts first (before processing any)
+    # Always validate, even if config is empty, to catch missing placeholders
+    try:
+        validate_config_overrides(
+            dev_alerts["alerts"],
+            config,
+            source_json_path=alert_file_path,
+            config_override_path=alert_rules_overrides_config_file_path,
+            logger_instance=logger,
+            item_type_name="alert",
+        )
+    except ValueError:
+        # Error message already printed by validate_config_overrides with Rich formatting
+        # Exit cleanly without traceback
+        sys.exit(1)
+
     alerts = []
 
     for dev_alert in dev_alerts["alerts"]:
+        # Apply config overrides to replace placeholders
+        if config:
+            dev_alert = apply_config_overrides_generic(
+                dev_alert,
+                config,
+                logger_instance=logger,
+                item_name=dev_alert["name"],
+                post_process=post_process_alert,
+            )
+
         if args.namespace and args.cluster:
             expr = inject_expr_placeholders(
                 expr=dev_alert["expr"], namespace=args.namespace, cluster=args.cluster
@@ -235,26 +328,30 @@ def alert_builder(args: argparse.Namespace):
                 datasource_uid=args.datasource_uid,
                 labels={
                     "og_priority": dev_alert["severity"],
-                    "environment": args.env,
                     "observer_applicable": dev_alert["observer_applicable"],
                 },
             )
         )
 
+    alerts.sort(key=lambda a: a["title"])
+
     for alert in alerts:
         if args.debug:
             logger.debug(json.dumps(alert))
         if not args.dry_run:
+            alert_created_or_exists = False
             try:
                 client.alertingprovisioning.create_alertrule(
                     alertrule=alert,
                     disable_provenance=True,
                 )
                 logger.info(f'Alert "{alert["name"]}" uploaded to Grafana successfully')
+                alert_created_or_exists = True
 
             except GrafanaBadInputError as e:
                 if "alerting.alert-rule.conflict" in e.message:
                     logger.info(f'Alert "{alert["name"]}" already exists. Skipping creation.')
+                    alert_created_or_exists = True
                 else:
                     # Handle other bad input errors
                     logger.error(
@@ -275,22 +372,24 @@ def alert_builder(args: argparse.Namespace):
                 # Catch any other exceptions (non-Grafana-related)
                 logger.error(f'Failed to create alert "{alert["name"]}". Unexpected error: {e}')
 
-            try:
-                group_uid = alert["ruleGroup"]
-                rule_group = get_alert_rule_group(
-                    client=client, folder_uid=folder_uid, group_uid=group_uid
-                )
-                if rule_group["interval"] != alert["intervalSec"]:
-                    rule_group["interval"] = alert["intervalSec"]
-                    update_alert_rule_group(
-                        client=client,
-                        folder_uid=folder_uid,
-                        group_uid=group_uid,
-                        alertrule_group=rule_group,
+            # Only update rule group interval if alert was successfully created or already exists
+            if alert_created_or_exists:
+                try:
+                    group_uid = alert["ruleGroup"]
+                    rule_group = get_alert_rule_group(
+                        client=client, folder_uid=folder_uid, group_uid=group_uid
                     )
-                    logger.info(f'Alert rule group "{group_uid}" updated successfully')
-            except Exception as e:
-                logger.error(f'Failed to update alert rule group "{alert["ruleGroup"]}". {e}')
+                    if rule_group["interval"] != alert["intervalSec"]:
+                        rule_group["interval"] = alert["intervalSec"]
+                        update_alert_rule_group(
+                            client=client,
+                            folder_uid=folder_uid,
+                            group_uid=group_uid,
+                            alertrule_group=rule_group,
+                        )
+                        logger.info(f'Alert rule group "{group_uid}" updated successfully')
+                except Exception as e:
+                    logger.error(f'Failed to update alert rule group "{alert["ruleGroup"]}". {e}')
 
         if args.out_dir:
             output_dir = f"{args.out_dir}/alerts"

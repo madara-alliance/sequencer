@@ -11,7 +11,7 @@ use cairo_vm::vm::errors::memory_errors::MemoryError;
 use shared_execution_objects::central_objects::CentralTransactionExecutionInfo;
 use starknet_api::block::BlockHash;
 use starknet_api::contract_class::EntryPointType;
-use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress};
+use starknet_api::core::{ClassHash, ContractAddress};
 use starknet_api::executable_transaction::{AccountTransaction, Transaction, TransactionType};
 use starknet_types_core::felt::Felt;
 
@@ -21,15 +21,13 @@ use crate::hint_processor::snos_hint_processor::{
     DeprecatedSyscallHintProcessor,
     SyscallHintProcessor,
 };
-use crate::io::os_input::{CachedStateInput, OsBlockInput};
+use crate::io::os_input::OsBlockInput;
 use crate::vm_utils::VmUtilsError;
 
 /// A helper struct that provides access to the OS state and commitments.
 pub struct OsExecutionHelper<'a, S: StateReader> {
     pub(crate) cached_state: CachedState<S>,
     pub(crate) os_block_input: &'a OsBlockInput,
-    pub(crate) class_hashes_to_migrate_iterator:
-        Box<dyn Iterator<Item = (ClassHash, CompiledClassHash)> + 'a>,
     pub(crate) os_logger: OsLogger,
     pub(crate) tx_execution_iter: TransactionExecutionIter<'a>,
     pub(crate) tx_tracker: TransactionTracker<'a>,
@@ -41,15 +39,12 @@ impl<'a, S: StateReader> OsExecutionHelper<'a, S> {
     pub fn new(
         os_block_input: &'a OsBlockInput,
         state_reader: S,
-        state_input: CachedStateInput,
+        state_input: &StateMaps,
         debug_mode: bool,
     ) -> Result<Self, StarknetOsError> {
         Ok(Self {
             cached_state: Self::initialize_cached_state(state_reader, state_input)?,
             os_block_input,
-            class_hashes_to_migrate_iterator: Box::new(
-                os_block_input.class_hashes_to_migrate.iter().map(|(k, v)| (*k, *v)),
-            ),
             os_logger: OsLogger::new(debug_mode),
             tx_execution_iter: TransactionExecutionIter::new(&os_block_input.tx_execution_infos),
             tx_tracker: TransactionTracker::new(&os_block_input.transactions),
@@ -60,28 +55,13 @@ impl<'a, S: StateReader> OsExecutionHelper<'a, S> {
 
     fn initialize_cached_state(
         state_reader: S,
-        state_input: CachedStateInput,
+        state_input: &StateMaps,
     ) -> Result<CachedState<S>, StarknetOsError> {
         let mut empty_cached_state = CachedState::new(state_reader);
-        let mut state_maps = StateMaps::default();
-
-        // Insert storage.
-        for (contract_address, storage) in state_input.storage.into_iter() {
-            for (key, value) in storage.into_iter() {
-                state_maps.storage.insert((contract_address, key), value);
-            }
-        }
-        // Insert nonces.
-        state_maps.nonces = state_input.address_to_nonce;
-
-        // Insert class hashes.
-        state_maps.class_hashes = state_input.address_to_class_hash;
-
-        // Insert compiled class hashes.
-        state_maps.compiled_class_hashes = state_input.class_hash_to_compiled_class_hash;
 
         // Update the cached state.
-        empty_cached_state.update_cache(&state_maps, HashMap::new());
+        // TODO(Yoni): avoid the implicit clone inside update_cache.
+        empty_cached_state.update_cache(state_input, HashMap::new());
 
         Ok(empty_cached_state)
     }
@@ -96,9 +76,6 @@ impl<'a> OsExecutionHelper<'a, DictStateReader> {
         Self {
             cached_state: CachedState::from(state_reader),
             os_block_input,
-            class_hashes_to_migrate_iterator: Box::new(
-                os_block_input.class_hashes_to_migrate.iter().map(|(k, v)| (*k, *v)),
-            ),
             os_logger: OsLogger::new(true),
             tx_execution_iter: TransactionExecutionIter::new(&os_block_input.tx_execution_infos),
             tx_tracker: TransactionTracker::new(&os_block_input.transactions),
@@ -115,13 +92,10 @@ pub struct TransactionExecutionInfoReference<'a> {
 }
 
 impl<'a> TransactionExecutionInfoReference<'a> {
-    pub fn new(
-        tx_execution_info: &'a CentralTransactionExecutionInfo,
-        tx_type: TransactionType,
-    ) -> Self {
+    pub fn new(tx_execution_info: &'a CentralTransactionExecutionInfo) -> Self {
         Self {
             tx_execution_info,
-            call_info_iter: tx_execution_info.call_info_iter(tx_type),
+            call_info_iter: tx_execution_info.call_info_iter(),
             call_info_tracker: None,
         }
     }
@@ -172,7 +146,7 @@ impl<'a> TransactionExecutionIter<'a> {
         Self { tx_execution_info_iter: tx_execution_infos.iter(), tx_execution_info_ref: None }
     }
 
-    pub fn start_tx(&mut self, tx_type: TransactionType) -> Result<(), ExecutionHelperError> {
+    pub fn start_tx(&mut self) -> Result<(), ExecutionHelperError> {
         if self.tx_execution_info_ref.is_some() {
             return Err(ExecutionHelperError::ContextOverwrite {
                 context: "transaction execution info".to_string(),
@@ -183,7 +157,7 @@ impl<'a> TransactionExecutionIter<'a> {
             .next()
             .ok_or(ExecutionHelperError::MissingTxExecutionInfo)?;
         self.tx_execution_info_ref =
-            Some(TransactionExecutionInfoReference::new(next_tx_execution_info, tx_type));
+            Some(TransactionExecutionInfoReference::new(next_tx_execution_info));
         Ok(())
     }
 
@@ -208,10 +182,7 @@ impl<'a> TransactionExecutionIter<'a> {
     }
 
     pub fn skip_tx(&mut self) -> Result<(), ExecutionHelperError> {
-        // The transaction type determines in which order the inner calls were executed.
-        // Since the transaction is skipped, the transaction's type doesn't matter.
-        let dummy_tx_type = TransactionType::Declare;
-        self.start_tx(dummy_tx_type)?;
+        self.start_tx()?;
         self.end_tx()?;
         Ok(())
     }

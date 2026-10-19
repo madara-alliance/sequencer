@@ -136,14 +136,12 @@ impl<'state> SyscallHandlerBase<'state> {
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn get_block_hash(&mut self, requested_block_number: u64) -> SyscallResult<Felt> {
+    pub fn get_block_hash(&mut self, requested_block_number: BlockNumber) -> SyscallResult<Felt> {
         // Note: we take the actual block number (and not the rounded one for validate)
         // in any case; it is consistent with the OS implementation and safe (see `Validate` arm).
-        let current_block_number = self.context.tx_context.block_context.block_info.block_number.0;
+        let current_block_number = self.context.tx_context.block_context.block_info.block_number;
 
-        if current_block_number < constants::STORED_BLOCK_HASH_BUFFER
-            || requested_block_number > current_block_number - constants::STORED_BLOCK_HASH_BUFFER
-        {
+        if !block_number_in_range(requested_block_number, current_block_number) {
             // Requested block is too recent.
             match self.context.execution_mode {
                 ExecutionMode::Execute => {
@@ -164,8 +162,8 @@ impl<'state> SyscallHandlerBase<'state> {
             }
         }
 
-        self.storage_access_tracker.accessed_blocks.insert(BlockNumber(requested_block_number));
-        let key = StorageKey::try_from(Felt::from(requested_block_number))?;
+        self.storage_access_tracker.accessed_blocks.insert(requested_block_number);
+        let key = StorageKey::try_from(Felt::from(requested_block_number.0))?;
         let block_hash_contract_address = self
             .context
             .tx_context
@@ -191,7 +189,25 @@ impl<'state> SyscallHandlerBase<'state> {
 
         match self.original_values.entry(key) {
             hash_map::Entry::Vacant(entry) => {
-                entry.insert(self.state.get_storage_at(contract_address, key)?);
+                // Check if any inner call (entries created after this handler's entry) already
+                // captured an original value for this key. If so, use that value instead of the
+                // current state, because the inner call captured the true original before any
+                // writes in this execution scope.
+                let original_value = self
+                    .context
+                    .revert_infos
+                    .0
+                    .iter()
+                    .skip(self.revert_info_idx + 1)
+                    .find_map(|info| {
+                        if info.contract_address == contract_address {
+                            info.original_values.get(&key).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .map_or_else(|| self.state.get_storage_at(contract_address, key), Ok)?;
+                entry.insert(original_value);
             }
             hash_map::Entry::Occupied(_) => {}
         }
@@ -431,9 +447,9 @@ impl<'state> SyscallHandlerBase<'state> {
         let call_info = call.execute(self.state, self.context, remaining_gas)?;
 
         let mut raw_retdata = call_info.execution.retdata.0.clone();
-        let failed = call_info.execution.failed;
+        let call_failed = call_info.execution.failed;
         self.inner_calls.push(call_info);
-        if failed {
+        if call_failed {
             self.context.revert(revert_idx, self.state)?;
 
             // Delete events and l2_to_l1_messages from the reverted call.
@@ -494,4 +510,16 @@ pub(crate) fn should_reject_deploy(
     execution_mode: ExecutionMode,
 ) -> bool {
     disable_deploy_in_validation_mode && execution_mode == ExecutionMode::Validate
+}
+
+/// Returns whether the given block number is within the range of stored block hashes
+/// relative to the current block number.
+pub fn block_number_in_range(
+    requested_block_number: BlockNumber,
+    current_block_number: BlockNumber,
+) -> bool {
+    current_block_number
+        .0
+        .checked_sub(constants::STORED_BLOCK_HASH_BUFFER)
+        .is_some_and(|oldest_allowed| requested_block_number.0 <= oldest_allowed)
 }

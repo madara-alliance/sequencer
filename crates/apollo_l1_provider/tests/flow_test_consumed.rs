@@ -1,3 +1,4 @@
+#![cfg(any(test, feature = "testing"))]
 mod utils;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,18 +14,20 @@ use papyrus_base_layer::{
     MockBaseLayerContract,
 };
 use starknet_api::block::{BlockNumber, BlockTimestamp};
-use starknet_api::core::{EntryPointSelector, Nonce};
+use starknet_api::core::{ContractAddress, EntryPointSelector, Nonce};
 use starknet_api::transaction::fields::{Calldata, Fee};
 use starknet_api::transaction::{L1HandlerTransaction, TransactionVersion};
 use starknet_types_core::felt::Felt;
-use utils::{setup_scraper_and_provider, TARGET_L2_HEIGHT, TIMELOCK_DURATION};
-
-use crate::utils::{
+use utils::{
+    setup_scraper_and_provider,
     TokioLinkedClock,
     CALL_DATA,
     L1_CONTRACT_ADDRESS,
     L2_ENTRY_POINT,
     POLLING_INTERVAL_DURATION,
+    ROUND_TO_SEC_MARGIN_DURATION,
+    TARGET_L2_HEIGHT,
+    TIMELOCK_DURATION,
 };
 
 fn block_from_number(number: L1BlockNumber) -> L1BlockReference {
@@ -45,8 +48,8 @@ async fn l1_handler_tx_consumed_txs() {
     let l1_handler_tx = L1HandlerTransaction {
         version: TransactionVersion::default(),
         nonce: Nonce::default(),
-        contract_address: L1_CONTRACT_ADDRESS.parse().unwrap(),
-        entry_point_selector: EntryPointSelector(Felt::from_hex_unchecked(L2_ENTRY_POINT)),
+        contract_address: ContractAddress::from(L1_CONTRACT_ADDRESS),
+        entry_point_selector: EntryPointSelector(Felt::from(L2_ENTRY_POINT)),
         calldata: Calldata(call_data.into()),
     };
 
@@ -96,7 +99,7 @@ async fn l1_handler_tx_consumed_txs() {
         Ok(all_events[start..end_exclusive].to_vec())
     });
 
-    let l1_provider_client = setup_scraper_and_provider(base_layer).await;
+    let l1_provider_client = setup_scraper_and_provider(base_layer, None).await;
 
     tokio::time::pause();
     let snapshot = l1_provider_client.get_l1_provider_snapshot().await.unwrap();
@@ -119,7 +122,7 @@ async fn l1_handler_tx_consumed_txs() {
     // Sleep at least one second more than the polling interval to make sure we are not failing due
     // to fractional seconds. After the polling interval passes, the transaction should be
     // consumed.
-    tokio::time::advance(POLLING_INTERVAL_DURATION + Duration::from_secs(1)).await;
+    tokio::time::advance(POLLING_INTERVAL_DURATION + ROUND_TO_SEC_MARGIN_DURATION).await;
 
     for _i in 0..100 {
         let snapshot = l1_provider_client.get_l1_provider_snapshot().await.unwrap();
@@ -138,7 +141,7 @@ async fn l1_handler_tx_consumed_txs() {
     // Block number 3 is created.
     current_l1_block_number.store(3, Ordering::Relaxed);
     // Wait again to make sure the consumption timelock has passed, allowing a deletion to occur.
-    tokio::time::advance(TIMELOCK_DURATION + Duration::from_secs(1)).await;
+    tokio::time::advance(TIMELOCK_DURATION + ROUND_TO_SEC_MARGIN_DURATION).await;
 
     // Scraping the second consumed event triggers a deletion of the transaction from the records.
     for _i in 0..100 {

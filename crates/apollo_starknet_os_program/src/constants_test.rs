@@ -1,14 +1,15 @@
 use std::path::PathBuf;
 
-use apollo_infra_utils::cairo0_compiler::cairo0_format;
+use apollo_infra_utils::cairo0_compiler_test_utils::cairo0_format;
 use apollo_infra_utils::compile_time_cargo_manifest_dir;
 use blockifier::blockifier_versioned_constants::{OsConstants, VersionedConstants};
 use blockifier::execution::syscalls::vm_syscall_utils::SyscallSelector;
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
+use expect_test::expect_file;
+use starknet_api::core::{ContractAddress, EntryPointSelector};
 use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_types_core::felt::Felt;
 
-const CONSTANTS_CONTENTS: &str = include_str!("cairo/starkware/starknet/core/os/constants.cairo");
+use crate::CONSTANTS_CAIRO_PATH;
 
 fn selector_to_hex(selector: &EntryPointSelector) -> String {
     format!("{:#?}", selector.0)
@@ -30,32 +31,49 @@ fn base_only_syscall_cost(selector: SyscallSelector, os_constants: &OsConstants)
 fn quote_string(s: &str) -> String {
     format!("'{s}'")
 }
-
-/// Create constants from a list of class hashes. Example:
+/// Create Rust `const` definitions from a list of hashes (rendered as `Felt`s).
+///
+/// Example:
 /// ```
-/// let expected = #"
-/// X_0 = 0x1;
-/// X_1 = 0x2;
-/// X_LEN = 2;
-/// "#;
-/// assert_eq!(stringify_class_hash_list("X", &[ClassHash(1), ClassHash(2)]), expected);
+/// let hashes = [ClassHash(1), ClassHash(2)];
+///
+/// let s = format_hash_consts("X", &hashes, |h| &h.0);
+///
+/// let expected = "\
+/// const X_0 = 0x0000000000000000000000000000000000000000000000000000000000000001;\n
+/// const X_1 = 0x0000000000000000000000000000000000000000000000000000000000000002;\n
+/// const X_LEN = 2;";
+///
+/// assert_eq!(s, expected);
 /// ```
-fn stringify_class_hash_list(name: &str, class_hashes: &[ClassHash]) -> String {
-    class_hashes
+///
+/// Conceptual output (simplified for readability):
+/// ```text
+/// const X_0 = 0x1;
+/// const X_1 = 0x2;
+/// const X_LEN = 2;
+/// ```
+fn format_hash_consts<T, F>(name: &str, hash_list: &[T], to_felt: F) -> String
+where
+    F: Fn(&T) -> &Felt,
+{
+    hash_list
         .iter()
         .enumerate()
-        .map(|(i, class_hash)| {
-            // If the line ends up longer than 100 chars, wrap the value in parenthesis, so the
-            // formatter can split the lines.
-            let line = format!("const {name}_{i} = {:#066x};", class_hash.0);
-            if line.len() > 100 {
-                format!("const {name}_{i} = ({:#066x});", class_hash.0)
+        .map(|(i, hash)| {
+            let felt = to_felt(hash);
+
+            // If the line ends up longer than 100 chars, wrap the value in parentheses so the
+            // formatter can split the line.
+            let const_def = format!("const {name}_{i} = {:#066x};", felt);
+            if const_def.len() > 100 {
+                format!("const {name}_{i} = ({:#066x});", felt)
             } else {
-                line
+                const_def
             }
         })
-        .chain(std::iter::once(format!("const {name}_LEN = {};", class_hashes.len())))
-        .collect::<Vec<String>>()
+        .chain(std::iter::once(format!("const {name}_LEN = {};", hash_list.len())))
+        .collect::<Vec<_>>()
         .join("\n")
 }
 
@@ -97,6 +115,11 @@ fn generate_constants_file() -> String {
         RESERVED_CONTRACT_ADDRESS = contract_address_to_hex(
             &os_constants.os_contract_addresses.reserved_contract_address()
         ),
+        ALLOWED_VIRTUAL_OS_PROGRAM_HASHES = format_hash_consts(
+            "ALLOWED_VIRTUAL_OS_PROGRAM_HASHES",
+            &os_constants.allowed_virtual_os_program_hashes,
+            |felt| felt
+        ),
         // Base costs.
         STEP_GAS_COST = os_constants.gas_costs.base.step_gas_cost,
         MEMORY_HOLE_GAS_COST = os_constants.gas_costs.base.memory_hole_gas_cost,
@@ -111,6 +134,7 @@ fn generate_constants_file() -> String {
         ADD_MOD_GAS_COST = os_constants.gas_costs.builtins.add_mod,
         MUL_MOD_GAS_COST = os_constants.gas_costs.builtins.mul_mod,
         ECDSA_GAS_COST = os_constants.gas_costs.builtins.ecdsa,
+        BLAKE_GAS_COST = os_constants.gas_costs.builtins.blake,
         // Initial costs and gas limits.
         DEFAULT_INITIAL_GAS_COST = os_constants.default_initial_gas_cost,
         VALIDATE_MAX_SIERRA_GAS = os_constants.validate_max_sierra_gas,
@@ -191,18 +215,23 @@ fn generate_constants_file() -> String {
         VALIDATE_TIMESTAMP_ROUNDING =
             os_constants.validate_rounding_consts.validate_timestamp_rounding,
         // Backward compatibility accounts.
-        V1_BOUND_ACCOUNTS_CAIRO0 = stringify_class_hash_list(
+        V1_BOUND_ACCOUNTS_CAIRO0 = format_hash_consts(
             "V1_BOUND_ACCOUNTS_CAIRO0",
-            &os_constants.v1_bound_accounts_cairo0
+            &os_constants.v1_bound_accounts_cairo0,
+            |class_hash| &class_hash.0
         ),
-        V1_BOUND_ACCOUNTS_CAIRO1 = stringify_class_hash_list(
+        V1_BOUND_ACCOUNTS_CAIRO1 = format_hash_consts(
             "V1_BOUND_ACCOUNTS_CAIRO1",
-            &os_constants.v1_bound_accounts_cairo1
+            &os_constants.v1_bound_accounts_cairo1,
+            |class_hash| &class_hash.0
         ),
         V1_BOUND_ACCOUNTS_MAX_TIP =
             format!("{:#?}", Felt::from(os_constants.v1_bound_accounts_max_tip)),
-        DATA_GAS_ACCOUNTS =
-            stringify_class_hash_list("DATA_GAS_ACCOUNTS", &os_constants.data_gas_accounts),
+        DATA_GAS_ACCOUNTS = format_hash_consts(
+            "DATA_GAS_ACCOUNTS",
+            &os_constants.data_gas_accounts,
+            |class_hash| &class_hash.0
+        ),
     );
 
     // Format and return.
@@ -210,26 +239,13 @@ fn generate_constants_file() -> String {
 }
 
 /// Test that `constants.cairo` generated from the values in the versioned constants matches the
-/// existing file. To fix this test, run:
-/// ```bash
-/// FIX_OS_CONSTANTS=1 cargo test -p apollo_starknet_os_program test_os_constants
-/// ```
+/// existing file.
 #[test]
 fn test_os_constants() {
     // Generate `constants.cairo` from the current OS constants.
     let generated = generate_constants_file();
-    let fix = std::env::var("FIX_OS_CONSTANTS").is_ok();
-    if fix {
-        // Write the generated contents to the file.
-        let path = PathBuf::from(compile_time_cargo_manifest_dir!())
-            .join("src/cairo/starkware/starknet/core/os/constants.cairo");
-        std::fs::write(path, &generated).expect("Failed to write generated constants file.");
-    } else {
-        assert_eq!(
-            CONSTANTS_CONTENTS, generated,
-            "Generated constants file does not match the expected contents. Please run \
-             `FIX_OS_CONSTANTS=1 cargo test -p apollo_starknet_os_program test_os_constants` to \
-             fix the test."
-        );
-    }
+    let path = PathBuf::from(compile_time_cargo_manifest_dir!())
+        .join("src/cairo")
+        .join(CONSTANTS_CAIRO_PATH);
+    expect_file![path].assert_eq(&generated);
 }

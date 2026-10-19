@@ -9,6 +9,7 @@ use starknet_api::executable_transaction::L1HandlerTransaction;
 use starknet_api::transaction::TransactionHash;
 use tracing::{debug, info, warn};
 
+use crate::metrics::L1_PROVIDER_NUM_PENDING_TXS;
 use crate::transaction_record::{
     Records,
     TransactionPayload,
@@ -177,7 +178,7 @@ impl TransactionManager {
         // If exists, return false and do nothing. If not, create the record as a HashOnly payload.
         let is_new_record = self.create_record_if_not_exist(tx_hash);
         // Replace a HashOnly payload with a Full payload. Do not update a Full payload.
-        // A hash only payload can come from bootstrapping from state sync, and then updated by
+        // A hash only payload can come from catching up from state sync, and then updated by
         // add_events from the scraper. However, if we get the same full tx twice (from the scraper)
         // it could indicate a double-scrape, and may cause the tx to be re-added to the proposable
         // index.
@@ -210,6 +211,32 @@ impl TransactionManager {
         self.with_record(tx_hash, |r| r.mark_cancellation_request(block_timestamp)).expect(
             "Should not be possible to request cancellation for non-existent transaction {tx_hash}",
         )
+    }
+
+    pub fn finalize_cancellation(&mut self, tx_hash: TransactionHash) {
+        let Some(record) = self.records.get(&tx_hash) else {
+            info!(
+                "Attempted to finalize cancellation for non-existent transaction: {tx_hash}. This \
+                 can happen if the transaction was too old to be scraped (e.g. it was created \
+                 before we started scraping)."
+            );
+            return;
+        };
+
+        // Regardless of the state of the tx in the record, if we get the cancellation event from
+        // the L1 contract, we delete this tx from the records and from the proposable index, even
+        // if it was Pending and ready to be proposed (which is not supposed to happen, hence the
+        // warning).
+        if record.state != TransactionState::CancellationStartedOnL2 {
+            warn!(
+                "Attempted to finalize cancellation for transaction {tx_hash} that is not in the \
+                 cancellation started on L2 state, but in the {:?} state.",
+                record.state
+            );
+        }
+        // This will also call maintain_indices to remove the tx from the proposable index.
+        self.with_record(tx_hash, |r| r.mark_cancellation_finalized_on_l1());
+        self.records.remove(&tx_hash);
     }
 
     pub fn consume_tx(
@@ -289,13 +316,20 @@ impl TransactionManager {
                 TransactionState::CancelledOnL2 => {
                     snapshot.cancelled_on_l2.push(tx_hash);
                 }
-                // TODO(guyn): add a CancellationFinalizedOnL1 state.
+                // This should never happen, fully cancelled txs are removed from the transaction
+                // manager.
+                TransactionState::CancellationFinalizedOnL1 => {
+                    panic!(
+                        "This should never happen, fully cancelled txs are removed from the \
+                         transaction manager."
+                    );
+                }
                 TransactionState::Consumed => {
                     snapshot.consumed.push(tx_hash);
                 }
             }
         }
-
+        snapshot.proposable_index = self.proposable_index.clone();
         snapshot
     }
 
@@ -357,6 +391,9 @@ impl TransactionManager {
                 }
             }
 
+            let num_pending_txs = self.proposable_index.len();
+            L1_PROVIDER_NUM_PENDING_TXS.set_lossy(num_pending_txs);
+
             // If this tx was consumed, add it to the consumed queue.
             if let Some(consumed_at) = record.get_consumed_at_timestamp() {
                 self.consumed_queue.entry(consumed_at).or_default().push(tx_hash);
@@ -403,6 +440,7 @@ pub(crate) struct TransactionManagerSnapshot {
     // NOTE: consumed transactions are removed from the transaction manager LAZILY only when the
     // next consume_tx request is processed (and the timelock has passed).
     pub consumed: Vec<TransactionHash>,
+    pub proposable_index: BTreeMap<UnixTimestamp, Vec<TransactionHash>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -416,6 +454,7 @@ impl TransactionManagerSnapshot {
             && self.cancellation_started_on_l2.is_empty()
             && self.cancelled_on_l2.is_empty()
             && self.consumed.is_empty()
+            && self.proposable_index.is_empty()
     }
 }
 

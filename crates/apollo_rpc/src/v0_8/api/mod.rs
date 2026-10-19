@@ -620,7 +620,6 @@ impl From<InvokeTransaction> for starknet_api::transaction::InvokeTransaction {
                 nonce_data_availability_mode,
                 fee_data_availability_mode,
                 proof_facts,
-                proof: _,
             }) => Self::V3(starknet_api::transaction::InvokeTransactionV3 {
                 resource_bounds: resource_bounds.into(),
                 tip,
@@ -689,6 +688,7 @@ pub struct TransactionTraceWithHash {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum CompiledContractClass {
     V0(StarknetApiDeprecatedContractClass),
     V1(CasmContractClass),

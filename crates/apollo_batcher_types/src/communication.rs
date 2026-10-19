@@ -3,16 +3,19 @@ use std::sync::Arc;
 use apollo_infra::component_client::{ClientError, LocalComponentClient, RemoteComponentClient};
 use apollo_infra::component_definitions::{ComponentClient, PrioritizedRequest, RequestWrapper};
 use apollo_infra::requests::LABEL_NAME_REQUEST_VARIANT;
-use apollo_infra::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
+use apollo_infra::{
+    handle_all_response_variants,
+    impl_debug_for_infra_requests_and_responses,
+    impl_labeled_request,
+};
 use apollo_metrics::generate_permutation_labels;
-use apollo_proc_macros::handle_all_response_variants;
 use apollo_state_sync_types::state_sync_types::SyncBlock;
 use async_trait::async_trait;
 #[cfg(any(feature = "testing", test))]
 use mockall::automock;
 use serde::{Deserialize, Serialize};
-use strum::{EnumVariantNames, VariantNames};
-use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
+use starknet_api::block::{BlockHash, BlockNumber, UnixTimestamp};
+use strum::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr, VariantNames};
 use thiserror::Error;
 
 use crate::batcher_types::{
@@ -44,6 +47,8 @@ pub type SharedBatcherClient = Arc<dyn BatcherClient>;
 pub trait BatcherClient: Send + Sync {
     /// Starts the process of building a proposal.
     async fn propose_block(&self, input: ProposeBlockInput) -> BatcherClientResult<()>;
+    /// Gets the block hash for a given block number.
+    async fn get_block_hash(&self, block_number: BlockNumber) -> BatcherClientResult<BlockHash>;
     /// Gets the first height that is not written in the storage yet.
     async fn get_height(&self) -> BatcherClientResult<GetHeightResponse>;
     /// Gets the next available content from the proposal stream (only relevant when building a
@@ -79,17 +84,19 @@ pub trait BatcherClient: Send + Sync {
     ) -> BatcherClientResult<DecisionReachedResponse>;
     /// Reverts the block with the given block number, only if it is the last in the storage.
     async fn revert_block(&self, input: RevertBlockInput) -> BatcherClientResult<()>;
+    async fn get_timestamp(&self) -> BatcherClientResult<UnixTimestamp>;
 }
 
 #[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
 #[strum_discriminants(
     name(BatcherRequestLabelValue),
-    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    derive(IntoStaticStr, EnumIter, VariantNames),
     strum(serialize_all = "snake_case")
 )]
 #[allow(clippy::large_enum_variant)]
 pub enum BatcherRequest {
     ProposeBlock(ProposeBlockInput),
+    GetBlockHash(BlockNumber),
     GetProposalContent(GetProposalContentInput),
     ValidateBlock(ValidateBlockInput),
     SendProposalContent(SendProposalContentInput),
@@ -98,6 +105,7 @@ pub enum BatcherRequest {
     DecisionReached(DecisionReachedInput),
     AddSyncBlock(SyncBlock),
     RevertBlock(RevertBlockInput),
+    GetTimestamp,
 }
 impl_debug_for_infra_requests_and_responses!(BatcherRequest);
 impl_labeled_request!(BatcherRequest, BatcherRequestLabelValue);
@@ -111,6 +119,7 @@ generate_permutation_labels! {
 #[derive(Serialize, Deserialize, AsRefStr)]
 pub enum BatcherResponse {
     ProposeBlock(BatcherResult<()>),
+    GetBlockHash(BatcherResult<BlockHash>),
     GetCurrentHeight(BatcherResult<GetHeightResponse>),
     GetProposalContent(BatcherResult<GetProposalContentResponse>),
     ValidateBlock(BatcherResult<()>),
@@ -119,10 +128,11 @@ pub enum BatcherResponse {
     DecisionReached(BatcherResult<Box<DecisionReachedResponse>>),
     AddSyncBlock(BatcherResult<()>),
     RevertBlock(BatcherResult<()>),
+    GetTimestamp(BatcherResult<u64>),
 }
 impl_debug_for_infra_requests_and_responses!(BatcherResponse);
 
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum BatcherClientError {
     #[error(transparent)]
     ClientError(#[from] ClientError),
@@ -138,8 +148,23 @@ where
     async fn propose_block(&self, input: ProposeBlockInput) -> BatcherClientResult<()> {
         let request = BatcherRequest::ProposeBlock(input);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             ProposeBlock,
+            BatcherClientError,
+            BatcherError,
+            Direct
+        )
+    }
+
+    async fn get_block_hash(&self, block_number: BlockNumber) -> BatcherClientResult<BlockHash> {
+        let request = BatcherRequest::GetBlockHash(block_number);
+        handle_all_response_variants!(
+            self,
+            request,
+            BatcherResponse,
+            GetBlockHash,
             BatcherClientError,
             BatcherError,
             Direct
@@ -152,6 +177,8 @@ where
     ) -> BatcherClientResult<GetProposalContentResponse> {
         let request = BatcherRequest::GetProposalContent(input);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             GetProposalContent,
             BatcherClientError,
@@ -163,6 +190,8 @@ where
     async fn validate_block(&self, input: ValidateBlockInput) -> BatcherClientResult<()> {
         let request = BatcherRequest::ValidateBlock(input);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             ValidateBlock,
             BatcherClientError,
@@ -177,6 +206,8 @@ where
     ) -> BatcherClientResult<SendProposalContentResponse> {
         let request = BatcherRequest::SendProposalContent(input);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             SendProposalContent,
             BatcherClientError,
@@ -188,6 +219,8 @@ where
     async fn start_height(&self, input: StartHeightInput) -> BatcherClientResult<()> {
         let request = BatcherRequest::StartHeight(input);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             StartHeight,
             BatcherClientError,
@@ -199,6 +232,8 @@ where
     async fn get_height(&self) -> BatcherClientResult<GetHeightResponse> {
         let request = BatcherRequest::GetCurrentHeight;
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             GetCurrentHeight,
             BatcherClientError,
@@ -213,6 +248,8 @@ where
     ) -> BatcherClientResult<DecisionReachedResponse> {
         let request = BatcherRequest::DecisionReached(input);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             DecisionReached,
             BatcherClientError,
@@ -224,6 +261,8 @@ where
     async fn add_sync_block(&self, sync_block: SyncBlock) -> BatcherClientResult<()> {
         let request = BatcherRequest::AddSyncBlock(sync_block);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             AddSyncBlock,
             BatcherClientError,
@@ -235,8 +274,23 @@ where
     async fn revert_block(&self, input: RevertBlockInput) -> BatcherClientResult<()> {
         let request = BatcherRequest::RevertBlock(input);
         handle_all_response_variants!(
+            self,
+            request,
             BatcherResponse,
             RevertBlock,
+            BatcherClientError,
+            BatcherError,
+            Direct
+        )
+    }
+
+    async fn get_timestamp(&self) -> BatcherClientResult<UnixTimestamp> {
+        let request = BatcherRequest::GetTimestamp;
+        handle_all_response_variants!(
+            self,
+            request,
+            BatcherResponse,
+            GetTimestamp,
             BatcherClientError,
             BatcherError,
             Direct

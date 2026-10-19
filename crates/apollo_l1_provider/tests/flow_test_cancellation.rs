@@ -1,5 +1,5 @@
+#![cfg(any(test, feature = "testing"))]
 mod utils;
-use std::time::Duration;
 
 use apollo_l1_provider_types::{
     InvalidValidationStatus,
@@ -17,6 +17,7 @@ use utils::{
     CALL_DATA,
     CALL_DATA_2,
     POLLING_INTERVAL_DURATION,
+    ROUND_TO_SEC_MARGIN_DURATION,
     TARGET_L2_HEIGHT,
     TIMELOCK_DURATION,
 };
@@ -32,7 +33,7 @@ async fn new_l1_handler_tx_propose_validate_cancellation_timelock() {
     let (l2_hash, nonce) = send_message_from_l1_to_l2(&mut base_layer, CALL_DATA).await;
 
     let l1_provider_client =
-        setup_scraper_and_provider(base_layer.ethereum_base_layer.clone()).await;
+        setup_scraper_and_provider(base_layer.ethereum_base_layer.clone(), None).await;
 
     // Test.
     tokio::time::pause();
@@ -48,7 +49,7 @@ async fn new_l1_handler_tx_propose_validate_cancellation_timelock() {
     send_cancellation_request(&base_layer, CALL_DATA, nonce).await;
 
     // Wait for another scraping.
-    tokio::time::advance(POLLING_INTERVAL_DURATION + Duration::from_secs(1)).await;
+    tokio::time::advance(POLLING_INTERVAL_DURATION + ROUND_TO_SEC_MARGIN_DURATION).await;
 
     // Keep trying to get the snapshot showing the cancellation
     for _i in 0..1000 {
@@ -79,7 +80,7 @@ async fn new_l1_handler_tx_propose_validate_cancellation_timelock() {
 
     // Sleep at least one second more than the timelock to make sure we are not failing due to
     // fractional seconds.
-    tokio::time::advance(TIMELOCK_DURATION + Duration::from_secs(1)).await;
+    tokio::time::advance(TIMELOCK_DURATION + ROUND_TO_SEC_MARGIN_DURATION).await;
 
     // Should no longer be able to validate.
     l1_provider_client.start_block(SessionState::Validate, next_block_height).await.unwrap();
@@ -105,9 +106,7 @@ async fn new_l1_handler_tx_propose_validate_cancellation_timelock() {
 
     // Sleep at least one second more than the cooldown to make sure we are not failing due to
     // fractional seconds.
-    tokio::time::advance(POLLING_INTERVAL_DURATION + Duration::from_secs(1)).await;
-
-    // TODO(guyn): check that the event gets deleted, after we add that functionality.
+    tokio::time::advance(POLLING_INTERVAL_DURATION + ROUND_TO_SEC_MARGIN_DURATION).await;
 
     // Check that the scraper and provider are still working.
     let (new_l2_hash, _nonce) = send_message_from_l1_to_l2(&mut base_layer, CALL_DATA_2).await;
@@ -115,7 +114,7 @@ async fn new_l1_handler_tx_propose_validate_cancellation_timelock() {
     assert_ne!(new_l2_hash, l2_hash);
 
     // Wait for another scraping.
-    tokio::time::advance(POLLING_INTERVAL_DURATION + Duration::from_secs(1)).await;
+    tokio::time::advance(POLLING_INTERVAL_DURATION + ROUND_TO_SEC_MARGIN_DURATION).await;
 
     for _i in 0..100 {
         let snapshot = l1_provider_client.get_l1_provider_snapshot().await.unwrap();
@@ -132,9 +131,8 @@ async fn new_l1_handler_tx_propose_validate_cancellation_timelock() {
     );
 
     // The first tx is still cancelled.
-    // TODO(guyn): after we implement cancellation deletion we should update this to "not found".
     assert_eq!(
         l1_provider_client.validate(l2_hash, next_block_height).await.unwrap(),
-        ValidationStatus::Invalid(InvalidValidationStatus::CancelledOnL2)
+        ValidationStatus::Invalid(InvalidValidationStatus::NotFound)
     );
 }

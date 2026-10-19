@@ -3,9 +3,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use apollo_base_layer_tests::anvil_base_layer::AnvilBaseLayer;
+use apollo_config::secrets::Sensitive;
 use apollo_consensus_manager_config::config::ConsensusManagerConfig;
 use apollo_http_server::test_utils::HttpTestClient;
-use apollo_http_server_config::config::HttpServerConfig;
 use apollo_infra::metrics::{metrics_recorder, MetricsConfig};
 use apollo_infra_utils::test_utils::AvailablePorts;
 use apollo_l1_gas_price_provider_config::config::EthToStrkOracleConfig;
@@ -25,7 +25,9 @@ use apollo_node_config::component_config::ComponentConfig;
 use apollo_node_config::node_config::SequencerNodeConfig;
 use apollo_protobuf::consensus::{HeightAndRound, ProposalPart, StreamMessage, StreamMessageBody};
 use apollo_state_sync_config::config::StateSyncConfig;
-use apollo_storage::StorageConfig;
+use apollo_storage::storage_reader_server_test_utils::send_storage_reader_http_request;
+use apollo_storage::storage_reader_types::{StorageReaderRequest, StorageReaderResponse};
+use apollo_storage::{MarkerKind, StorageConfig};
 use blockifier::context::ChainInfo;
 use futures::StreamExt;
 use mempool_test_utils::starknet_api_test_utils::{
@@ -39,7 +41,7 @@ use papyrus_base_layer::test_utils::{
     OTHER_ARBITRARY_ANVIL_L1_ACCOUNT_ADDRESS,
 };
 use papyrus_base_layer::BaseLayerContract;
-use starknet_api::block::BlockNumber;
+use starknet_api::block::{BlockHash, BlockNumber};
 use starknet_api::consensus_transaction::ConsensusTransaction;
 use starknet_api::core::{ChainId, ContractAddress};
 use starknet_api::execution_resources::GasAmount;
@@ -95,9 +97,12 @@ impl FlowTestSetup {
         test_unique_index: u16,
         block_max_capacity_gas: GasAmount,
         allow_bootstrap_txs: bool,
+        instance_indices: [u16; 3],
     ) -> Self {
         let chain_info = ChainInfo::create_for_testing();
-        let mut available_ports = AvailablePorts::new(test_unique_index, 0);
+        let [shared_instance_index, sequencer_0_instance_index, sequencer_1_instance_index] =
+            instance_indices;
+        let mut available_ports = AvailablePorts::new(test_unique_index, shared_instance_index);
 
         let accounts = tx_generator.accounts();
         let (consensus_manager_configs, consensus_proposals_channels) =
@@ -122,7 +127,7 @@ impl FlowTestSetup {
             .try_into()
             .unwrap();
 
-        let anvil_base_layer = AnvilBaseLayer::new(None).await;
+        let anvil_base_layer = AnvilBaseLayer::new(None, None).await;
         let base_layer_url = anvil_base_layer.get_url().await.unwrap();
         let base_layer_config = anvil_base_layer.ethereum_base_layer.config.clone();
 
@@ -157,7 +162,7 @@ impl FlowTestSetup {
             base_layer_url.clone(),
             sequencer_0_consensus_manager_config,
             sequencer_0_mempool_p2p_config,
-            AvailablePorts::new(test_unique_index, 1),
+            AvailablePorts::new(test_unique_index, sequencer_0_instance_index),
             sequencer_0_state_sync_config,
             block_max_capacity_gas,
             allow_bootstrap_txs,
@@ -172,7 +177,7 @@ impl FlowTestSetup {
             base_layer_url,
             sequencer_1_consensus_manager_config,
             sequencer_1_mempool_p2p_config,
-            AvailablePorts::new(test_unique_index, 2),
+            AvailablePorts::new(test_unique_index, sequencer_1_instance_index),
             sequencer_1_state_sync_config,
             block_max_capacity_gas,
             allow_bootstrap_txs,
@@ -190,6 +195,7 @@ impl FlowTestSetup {
             .batcher_config
             .as_ref()
             .unwrap()
+            .static_config
             .block_builder_config
             .chain_info
             .chain_id
@@ -232,7 +238,7 @@ impl FlowSequencerSetup {
         node_index: usize,
         chain_info: ChainInfo,
         base_layer_config: EthereumBaseLayerConfig,
-        base_layer_url: Url,
+        base_layer_url: Sensitive<Url>,
         mut consensus_manager_config: ConsensusManagerConfig,
         mempool_p2p_config: MempoolP2pConfig,
         mut available_ports: AvailablePorts,
@@ -246,7 +252,7 @@ impl FlowSequencerSetup {
 
         let (recorder_url, _join_handle) =
             spawn_local_success_recorder(available_ports.get_next_port());
-        consensus_manager_config.cende_config.recorder_url = recorder_url.into();
+        consensus_manager_config.cende_config.recorder_url = recorder_url;
 
         let (eth_to_strk_oracle_url_headers, _join_handle) =
             spawn_local_eth_to_strk_oracle(available_ports.get_next_port());
@@ -276,7 +282,6 @@ impl FlowSequencerSetup {
             monitoring_endpoint_config,
             component_config,
             base_layer_config,
-            base_layer_url,
             block_max_capacity_gas,
             validator_id,
             allow_bootstrap_txs,
@@ -295,8 +300,7 @@ impl FlowSequencerSetup {
             node_config.monitoring_endpoint_config.as_ref().unwrap().to_owned();
         let monitoring_client = MonitoringClient::new(SocketAddr::from((ip, port)));
 
-        let HttpServerConfig { ip, port, .. } =
-            node_config.http_server_config.as_ref().unwrap().to_owned();
+        let (ip, port) = node_config.http_server_config.as_ref().unwrap().ip_and_port();
         let add_tx_http_client = HttpTestClient::new(SocketAddr::from((ip, port)));
 
         // Run the sequencer node.
@@ -319,6 +323,42 @@ impl FlowSequencerSetup {
     pub async fn batcher_height(&self) -> BlockNumber {
         self.clients.get_batcher_shared_client().unwrap().get_height().await.unwrap().height
     }
+
+    pub async fn get_block_hash(&self, block_number: BlockNumber) -> BlockHash {
+        let response = self
+            .send_batcher_storage_reader_request(StorageReaderRequest::BlockHash(block_number))
+            .await;
+        match response {
+            StorageReaderResponse::BlockHash(block_hash) => block_hash,
+            other => panic!("Expected BlockHash response, got: {other:?}"),
+        }
+    }
+
+    fn batcher_storage_reader_server_addr(&self) -> SocketAddr {
+        let batcher_config = self.node_config.batcher_config.as_ref().unwrap();
+        let storage_reader_static_config =
+            &batcher_config.static_config.storage_reader_server_static_config;
+        SocketAddr::from((storage_reader_static_config.ip, storage_reader_static_config.port))
+    }
+
+    pub async fn send_batcher_storage_reader_request(
+        &self,
+        request: StorageReaderRequest,
+    ) -> StorageReaderResponse {
+        send_storage_reader_http_request(self.batcher_storage_reader_server_addr(), &request).await
+    }
+
+    pub async fn get_global_root_height(&self) -> BlockNumber {
+        let response = self
+            .send_batcher_storage_reader_request(StorageReaderRequest::Markers(
+                MarkerKind::GlobalRoot,
+            ))
+            .await;
+        match response {
+            StorageReaderResponse::Markers(block_number) => block_number,
+            other => panic!("Expected Markers response, got: {other:?}"),
+        }
+    }
 }
 
 pub fn create_consensus_manager_configs_and_channels(
@@ -340,7 +380,7 @@ pub fn create_consensus_manager_configs_and_channels(
     );
 
     for (i, config) in consensus_manager_configs.iter_mut().enumerate() {
-        config.context_config.builder_address =
+        config.context_config.static_config.builder_address =
             ContractAddress::try_from(BUILDER_BASE_ADDRESS + Felt::from(i)).unwrap();
     }
 
@@ -400,15 +440,11 @@ impl TxCollector {
             incoming_message_id, 0,
             "Expected the first message in the stream to have id 0, got {incoming_message_id}"
         );
-        let StreamMessageBody::Content(ProposalPart::Init(incoming_proposal_init)) = init_message
-        else {
-            panic!("Expected an init message. Got: {init_message:?}")
+        let StreamMessageBody::Content(ProposalPart::Init(incoming_init)) = init_message else {
+            panic!("Expected a init message. Got: {init_message:?}")
         };
 
-        self.accumulated_txs
-            .lock()
-            .await
-            .start_round(incoming_proposal_init.height, incoming_proposal_init.round);
+        self.accumulated_txs.lock().await.start_round(incoming_init.height, incoming_init.round);
 
         let mut got_proposal_fin = false;
         let mut got_channel_fin = false;
@@ -417,14 +453,11 @@ impl TxCollector {
                 messages_cache.remove(&i).expect("Stream should have all consecutive messages");
             assert_eq!(stream_id, first_stream_id, "Expected the same stream id for all messages");
             match message {
-                StreamMessageBody::Content(ProposalPart::Init(init)) => {
-                    panic!("Unexpected init: {init:?}")
+                StreamMessageBody::Content(ProposalPart::Init(incoming_init)) => {
+                    panic!("Unexpected init: {incoming_init:?}")
                 }
                 StreamMessageBody::Content(ProposalPart::Fin(..)) => {
                     got_proposal_fin = true;
-                }
-                StreamMessageBody::Content(ProposalPart::BlockInfo(_)) => {
-                    // TODO(Asmaa): Add validation for block info.
                 }
                 StreamMessageBody::Content(ProposalPart::Transactions(transactions)) => {
                     // TODO(Arni): add calculate_transaction_hash to consensus transaction and use
@@ -447,9 +480,6 @@ impl TxCollector {
                         })
                         .collect();
                     self.accumulated_txs.lock().await.add_transactions(&received_tx_hashes);
-                }
-                StreamMessageBody::Content(ProposalPart::ExecutedTransactionCount(_)) => {
-                    // TODO(Asmaa): Add validation for executed transaction count when implemented.
                 }
                 StreamMessageBody::Fin => {
                     got_channel_fin = true;

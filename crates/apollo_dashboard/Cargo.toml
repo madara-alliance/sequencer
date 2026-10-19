@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+description = "Dashboard and monitoring interface for the Starknet sequencer."
 
 
 [features]
@@ -15,6 +16,7 @@ workspace = true
 [dependencies]
 apollo_batcher.workspace = true
 apollo_class_manager.workspace = true
+apollo_committer.workspace = true
 apollo_compile_to_casm.workspace = true
 apollo_config_manager.workspace = true
 apollo_consensus.workspace = true
@@ -24,7 +26,6 @@ apollo_gateway.workspace = true
 apollo_http_server.workspace = true
 apollo_infra.workspace = true
 apollo_infra_utils.workspace = true
-apollo_l1_endpoint_monitor_types.workspace = true
 apollo_l1_gas_price.workspace = true
 apollo_l1_gas_price_types.workspace = true
 apollo_l1_provider.workspace = true
@@ -32,20 +33,24 @@ apollo_mempool.workspace = true
 apollo_mempool_p2p.workspace = true
 apollo_metrics.workspace = true
 apollo_network.workspace = true
+apollo_proof_manager.workspace = true
+apollo_signature_manager.workspace = true
+apollo_staking.workspace = true
 apollo_state_sync_metrics.workspace = true
 apollo_storage.workspace = true
+apollo_transaction_converter.workspace = true
 blockifier.workspace = true
 indexmap = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 serde_with.workspace = true
-strum.workspace = true
-strum_macros.workspace = true
 
 [dev-dependencies]
 apollo_batcher = { workspace = true, features = ["testing"] }
 apollo_class_manager = { workspace = true, features = ["testing"] }
+apollo_committer = { workspace = true, features = ["testing"] }
 apollo_compile_to_casm = { workspace = true, features = ["testing"] }
+apollo_config_manager = { workspace = true, features = ["testing"] }
 apollo_consensus = { workspace = true, features = ["testing"] }
 apollo_consensus_manager = { workspace = true, features = ["testing"] }
 apollo_consensus_orchestrator = { workspace = true, features = ["testing"] }
@@ -53,10 +58,13 @@ apollo_gateway = { workspace = true, features = ["testing"] }
 apollo_http_server = { workspace = true, features = ["testing"] }
 apollo_infra = { workspace = true, features = ["testing"] }
 apollo_infra_utils = { workspace = true, features = ["testing"] }
-apollo_l1_endpoint_monitor_types = { workspace = true, features = ["testing"] }
 apollo_l1_gas_price = { workspace = true, features = ["testing"] }
 apollo_l1_provider = { workspace = true, features = ["testing"] }
 apollo_mempool = { workspace = true, features = ["testing"] }
 apollo_mempool_p2p = { workspace = true, features = ["testing"] }
+apollo_proof_manager = { workspace = true, features = ["testing"] }
+apollo_staking = { workspace = true, features = ["testing"] }
 apollo_state_sync_metrics = { workspace = true, features = ["testing"] }
+apollo_storage = { workspace = true, features = ["testing"] }
+apollo_transaction_converter = { workspace = true, features = ["testing"] }
 rstest.workspace = true

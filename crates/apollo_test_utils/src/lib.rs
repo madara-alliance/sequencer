@@ -70,7 +70,7 @@ use starknet_api::core::{
     StateDiffCommitment,
     TransactionCommitment,
 };
-use starknet_api::crypto::utils::Signature;
+use starknet_api::crypto::utils::{RawSignature, Signature};
 use starknet_api::data_availability::{DataAvailabilityMode, L1DataAvailabilityMode};
 use starknet_api::deprecated_contract_class::{
     ConstructorType,
@@ -97,6 +97,7 @@ use starknet_api::rpc_transaction::{
     EntryPointByType,
     InternalRpcDeclareTransactionV3,
     InternalRpcDeployAccountTransaction,
+    InternalRpcInvokeTransactionV3,
     InternalRpcTransaction,
     InternalRpcTransactionWithoutTxHash,
     RpcDeclareTransaction,
@@ -522,7 +523,7 @@ auto_impl_get_test_instance! {
         V0_13_6 = 22,
         V0_14_0 = 23,
         V0_14_1 = 24,
-        V0_15_0 = 25,
+        V0_14_2 = 25,
     }
 
     pub struct Calldata(pub Arc<Vec<Felt>>);
@@ -787,8 +788,6 @@ auto_impl_get_test_instance! {
         pub prime: serde_json::Value,
         pub reference_manager: serde_json::Value,
     }
-    pub struct Proof(pub Arc<Vec<u32>>);
-    pub struct ProofFacts(pub Vec<Felt>);
     pub struct ReceiptCommitment(pub StarkHash);
     pub enum Resource {
         L1Gas = 0,
@@ -801,7 +800,7 @@ auto_impl_get_test_instance! {
     pub enum InternalRpcTransactionWithoutTxHash {
         Declare(InternalRpcDeclareTransactionV3) = 0,
         DeployAccount(InternalRpcDeployAccountTransaction) = 1,
-        Invoke(RpcInvokeTransaction) = 2,
+        Invoke(InternalRpcInvokeTransactionV3) = 2,
     }
     pub struct InternalRpcDeclareTransactionV3 {
         pub sender_address: ContractAddress,
@@ -819,6 +818,19 @@ auto_impl_get_test_instance! {
     pub struct InternalRpcDeployAccountTransaction {
         pub tx: RpcDeployAccountTransaction,
         pub contract_address: ContractAddress,
+    }
+    pub struct InternalRpcInvokeTransactionV3 {
+        pub sender_address: ContractAddress,
+        pub calldata: Calldata,
+        pub signature: TransactionSignature,
+        pub nonce: Nonce,
+        pub resource_bounds: AllResourceBounds,
+        pub tip: Tip,
+        pub paymaster_data: PaymasterData,
+        pub account_deployment_data: AccountDeploymentData,
+        pub nonce_data_availability_mode: DataAvailabilityMode,
+        pub fee_data_availability_mode: DataAvailabilityMode,
+        pub proof_facts: ProofFacts,
     }
     pub enum RpcTransaction {
         Declare(RpcDeclareTransaction) = 0,
@@ -876,6 +888,7 @@ auto_impl_get_test_instance! {
         pub paymaster_data: PaymasterData,
         pub account_deployment_data: AccountDeploymentData,
         pub proof_facts: ProofFacts,
+        pub proof: Proof,
     }
     pub struct SequencerContractAddress(pub ContractAddress);
     pub struct Signature {
@@ -1146,6 +1159,11 @@ default_impl_get_test_instance!(ContractAddress);
 default_impl_get_test_instance!(StarkHash);
 default_impl_get_test_instance!(StorageKey);
 default_impl_get_test_instance!(BigUint);
+// Most transactions do not use client-side proving, so these fields default to empty.
+// Use the explicit testing helpers when testing client-side proving.
+default_impl_get_test_instance!(starknet_api::transaction::fields::Proof);
+default_impl_get_test_instance!(starknet_api::transaction::fields::ProofFacts);
+default_impl_get_test_instance!(RawSignature);
 
 impl GetTestInstance for StructAbiEntry {
     fn get_test_instance(rng: &mut ChaCha8Rng) -> Self {

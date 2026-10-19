@@ -1,20 +1,10 @@
-from starkware.cairo.common.alloc import alloc
-from starkware.cairo.common.bool import FALSE, TRUE
+from starkware.cairo.common.bool import FALSE
 from starkware.cairo.common.cairo_builtins import PoseidonBuiltin
-from starkware.cairo.common.hash_state_poseidon import (
-    HashState,
-    hash_finalize,
-    hash_init,
-    hash_update_single,
-    hash_update_with_nested_hash,
-    poseidon_hash_many,
-)
 from starkware.cairo.common.math import assert_lt_felt
-from starkware.cairo.common.poseidon_state import PoseidonBuiltinState
-from starkware.cairo.common.registers import get_fp_and_pc
 from starkware.starknet.core.os.constants import (
     ADD_MOD_GAS_COST,
     BITWISE_BUILTIN_GAS_COST,
+    BLAKE_GAS_COST,
     ECOP_GAS_COST,
     MUL_MOD_GAS_COST,
     PEDERSEN_GAS_COST,
@@ -24,8 +14,6 @@ from starkware.starknet.core.os.contract_class.blake_compiled_class_hash import 
     compiled_class_hash as blake_compiled_class_hash,
 )
 from starkware.starknet.core.os.contract_class.compiled_class_struct import (
-    COMPILED_CLASS_VERSION,
-    CompiledClass,
     CompiledClassEntryPoint,
     CompiledClassFact,
 )
@@ -79,6 +67,7 @@ func guess_compiled_class_facts{poseidon_ptr: PoseidonBuiltin*, range_check_ptr}
         POSEIDON_GAS_COST,
         ADD_MOD_GAS_COST,
         MUL_MOD_GAS_COST,
+        BLAKE_GAS_COST,
     );
     local n_compiled_class_facts;
     local compiled_class_facts: CompiledClassFact*;
@@ -137,15 +126,7 @@ func validate_compiled_class_facts{poseidon_ptr: PoseidonBuiltin*, range_check_p
     // This hint enters a new scope that contains the bytecode segment structure of the class.
     %{ EnterScopeWithBytecodeSegmentStructure %}
     let (hash) = blake_compiled_class_hash(compiled_class, full_contract=FALSE);
-    %{
-        vm_exit_scope()
-
-        computed_hash = ids.hash
-        expected_hash = ids.compiled_class_fact.hash
-        assert computed_hash == expected_hash, (
-            "Computed compiled_class_hash is inconsistent with the hash in the os_input. "
-            f"Computed hash = {computed_hash}, Expected hash = {expected_hash}.")
-    %}
+    %{ LoadClass %}
 
     assert compiled_class_fact.hash = hash;
 

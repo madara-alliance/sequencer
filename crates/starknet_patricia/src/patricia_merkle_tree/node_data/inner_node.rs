@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use ethnum::U256;
 use starknet_api::hash::HashOutput;
+use starknet_rust_core::types::MerkleNode;
 use starknet_types_core::felt::Felt;
 
 use crate::patricia_merkle_tree::node_data::errors::{
@@ -17,24 +18,24 @@ use crate::patricia_merkle_tree::types::{NodeIndex, SubTreeHeight};
 pub mod inner_node_test;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(strum_macros::EnumDiscriminants))]
-#[cfg_attr(any(test, feature = "testing"), strum_discriminants(derive(strum_macros::EnumIter)))]
-// A Patricia-Merkle tree node's data, i.e., the pre-image of its hash.
-pub enum NodeData<L: Leaf> {
-    Binary(BinaryData),
-    Edge(EdgeData),
+#[cfg_attr(any(test, feature = "testing"), derive(strum::EnumDiscriminants))]
+#[cfg_attr(any(test, feature = "testing"), strum_discriminants(derive(strum::EnumIter)))]
+// A Patricia-Merkle tree node's data.
+pub enum NodeData<L: Leaf, ChildData> {
+    Binary(BinaryData<ChildData>),
+    Edge(EdgeData<ChildData>),
     Leaf(L),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BinaryData {
-    pub left_hash: HashOutput,
-    pub right_hash: HashOutput,
+pub struct BinaryData<ChildData> {
+    pub left_data: ChildData,
+    pub right_data: ChildData,
 }
 
-impl BinaryData {
+impl BinaryData<HashOutput> {
     pub fn flatten(&self) -> Vec<Felt> {
-        vec![self.left_hash.0, self.right_hash.0]
+        vec![self.left_data.0, self.right_data.0]
     }
 }
 
@@ -141,17 +142,17 @@ impl PathToBottom {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct EdgeData {
-    pub bottom_hash: HashOutput,
+pub struct EdgeData<ChildData> {
+    pub bottom_data: ChildData,
     pub path_to_bottom: PathToBottom,
 }
 
-impl EdgeData {
+impl EdgeData<HashOutput> {
     pub fn flatten(&self) -> Vec<Felt> {
         vec![
             self.path_to_bottom.length.into(),
             (&self.path_to_bottom.path).into(),
-            self.bottom_hash.0,
+            self.bottom_data.0,
         ]
     }
 }
@@ -200,10 +201,12 @@ impl PathToBottom {
     }
 }
 
+// TODO(Ariel): Move Preimage to the fact_db module in starknet_committer (add a flatten
+// trait to be implemented in starknet_committer for BinaryData and EdgeData).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Preimage {
-    Binary(BinaryData),
-    Edge(EdgeData),
+    Binary(BinaryData<HashOutput>),
+    Edge(EdgeData<HashOutput>),
 }
 
 pub type PreimageMap = HashMap<HashOutput, Preimage>;
@@ -223,7 +226,7 @@ impl Preimage {
         }
     }
 
-    pub fn get_binary(&self) -> Result<&BinaryData, PreimageError> {
+    pub fn get_binary(&self) -> Result<&BinaryData<HashOutput>, PreimageError> {
         match self {
             Self::Binary(binary) => Ok(binary),
             Self::Edge(_) => Err(PreimageError::ExpectedBinary(self.clone())),
@@ -238,18 +241,60 @@ impl Preimage {
     }
 }
 
+impl From<&MerkleNode> for Preimage {
+    fn from(node: &MerkleNode) -> Self {
+        match node {
+            MerkleNode::BinaryNode(binary_node) => Preimage::Binary(BinaryData {
+                left_data: HashOutput(binary_node.left),
+                right_data: HashOutput(binary_node.right),
+            }),
+            MerkleNode::EdgeNode(edge_node) => {
+                let length = u8::try_from(edge_node.length).unwrap_or_else(|_| {
+                    panic!(
+                        "EdgeNode length {} exceeds u8::MAX when converting to Preimage",
+                        edge_node.length
+                    )
+                });
+                Preimage::Edge(EdgeData {
+                    bottom_data: HashOutput(edge_node.child),
+                    path_to_bottom: PathToBottom::new(
+                        EdgePath(U256::from_be_bytes(edge_node.path.to_bytes_be())),
+                        EdgePathLength(length),
+                    )
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "Failed to create PathToBottom from MerkleNode edge: path={:?}, \
+                             length={}",
+                            edge_node.path, edge_node.length
+                        )
+                    }),
+                })
+            }
+        }
+    }
+}
+
+impl<L: Leaf> From<&MerkleNode> for NodeData<L, HashOutput> {
+    fn from(node: &MerkleNode) -> Self {
+        match Preimage::from(node) {
+            Preimage::Binary(data) => NodeData::Binary(data),
+            Preimage::Edge(data) => NodeData::Edge(data),
+        }
+    }
+}
+
 impl TryFrom<&Vec<Felt>> for Preimage {
     type Error = PreimageError;
 
     fn try_from(raw_preimage: &Vec<Felt>) -> Result<Self, Self::Error> {
         match raw_preimage.as_slice() {
             [left, right] => Ok(Preimage::Binary(BinaryData {
-                left_hash: HashOutput(*left),
-                right_hash: HashOutput(*right),
+                left_data: HashOutput(*left),
+                right_data: HashOutput(*right),
             })),
             [length, path, bottom] => {
                 Ok(Preimage::Edge(EdgeData {
-                    bottom_hash: HashOutput(*bottom),
+                    bottom_data: HashOutput(*bottom),
                     path_to_bottom: PathToBottom::new(
                         (*path).into(),
                         EdgePathLength::new((*length).try_into().map_err(|_| {

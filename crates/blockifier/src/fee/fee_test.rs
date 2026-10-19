@@ -3,7 +3,7 @@ use blockifier_test_utils::cairo_versions::CairoVersion;
 use blockifier_test_utils::contracts::FeatureContract;
 use cairo_vm::types::builtin_name::BuiltinName;
 use rstest::rstest;
-use starknet_api::block::{FeeType, GasPrice, NonzeroGasPrice};
+use starknet_api::block::{FeeType, GasPrice, GasPriceVector, GasPrices, NonzeroGasPrice};
 use starknet_api::execution_resources::{GasAmount, GasVector};
 use starknet_api::invoke_tx_args;
 use starknet_api::test_utils::{
@@ -25,14 +25,13 @@ use starknet_api::transaction::fields::{
 };
 use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 
-use crate::blockifier::block::validated_gas_prices;
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::context::BlockContext;
 use crate::fee::fee_checks::{FeeCheckError, FeeCheckReportFields, PostExecutionReport};
-use crate::fee::fee_utils::{get_fee_by_gas_vector, get_vm_resources_cost};
+use crate::fee::fee_utils::{get_extended_vm_resources_cost, get_fee_by_gas_vector};
 use crate::fee::receipt::TransactionReceipt;
 use crate::test_utils::initial_test_state::test_state;
-use crate::test_utils::{gas_vector_from_vm_usage, get_vm_resource_usage, BALANCE};
+use crate::test_utils::{gas_vector_from_vm_usage, get_extended_vm_resource_usage, BALANCE};
 use crate::transaction::test_utils::{
     all_resource_bounds,
     block_context,
@@ -47,13 +46,13 @@ fn test_simple_get_vm_resource_usage(
     gas_vector_computation_mode: GasVectorComputationMode,
 ) {
     let versioned_constants = VersionedConstants::create_for_account_testing();
-    let mut vm_resource_usage = get_vm_resource_usage();
+    let mut vm_resource_usage = get_extended_vm_resource_usage();
     let n_reverted_steps = 15;
 
     // Positive flow.
     // Verify calculation - in our case, n_steps is the heaviest resource.
     let vm_usage_in_l1_gas = (versioned_constants.vm_resource_fee_cost().n_steps
-        * (u64_from_usize(vm_resource_usage.n_steps + n_reverted_steps)))
+        * (u64_from_usize(vm_resource_usage.vm_resources.n_steps + n_reverted_steps)))
     .ceil()
     .to_integer()
     .into();
@@ -64,7 +63,7 @@ fn test_simple_get_vm_resource_usage(
     );
     assert_eq!(
         expected_gas_vector,
-        get_vm_resources_cost(
+        get_extended_vm_resources_cost(
             &versioned_constants,
             &vm_resource_usage,
             n_reverted_steps,
@@ -74,10 +73,18 @@ fn test_simple_get_vm_resource_usage(
 
     // Another positive flow, this time the heaviest resource is range_check_builtin.
     let n_reverted_steps = 0;
-    vm_resource_usage.n_steps =
-        vm_resource_usage.builtin_instance_counter.get(&BuiltinName::range_check).unwrap() - 1;
+    vm_resource_usage.vm_resources.n_steps = vm_resource_usage
+        .vm_resources
+        .builtin_instance_counter
+        .get(&BuiltinName::range_check)
+        .unwrap()
+        - 1;
     let vm_usage_in_l1_gas = u64_from_usize(
-        *vm_resource_usage.builtin_instance_counter.get(&BuiltinName::range_check).unwrap(),
+        *vm_resource_usage
+            .vm_resources
+            .builtin_instance_counter
+            .get(&BuiltinName::range_check)
+            .unwrap(),
     )
     .into();
     let expected_gas_vector = gas_vector_from_vm_usage(
@@ -87,7 +94,7 @@ fn test_simple_get_vm_resource_usage(
     );
     assert_eq!(
         expected_gas_vector,
-        get_vm_resources_cost(
+        get_extended_vm_resources_cost(
             &versioned_constants,
             &vm_resource_usage,
             n_reverted_steps,
@@ -102,13 +109,13 @@ fn test_float_get_vm_resource_usage(
     gas_vector_computation_mode: GasVectorComputationMode,
 ) {
     let versioned_constants = VersionedConstants::create_for_testing();
-    let mut vm_resource_usage = get_vm_resource_usage();
+    let mut vm_resource_usage = get_extended_vm_resource_usage();
 
     // Positive flow.
     // Verify calculation - in our case, n_steps is the heaviest resource.
     let n_reverted_steps = 300;
     let vm_usage_in_l1_gas = (versioned_constants.vm_resource_fee_cost().n_steps
-        * u64_from_usize(vm_resource_usage.n_steps + n_reverted_steps))
+        * u64_from_usize(vm_resource_usage.vm_resources.n_steps + n_reverted_steps))
     .ceil()
     .to_integer()
     .into();
@@ -119,7 +126,7 @@ fn test_float_get_vm_resource_usage(
     );
     assert_eq!(
         expected_gas_vector,
-        get_vm_resources_cost(
+        get_extended_vm_resources_cost(
             &versioned_constants,
             &vm_resource_usage,
             n_reverted_steps,
@@ -128,11 +135,15 @@ fn test_float_get_vm_resource_usage(
     );
 
     // Another positive flow, this time the heaviest resource is ecdsa_builtin.
-    vm_resource_usage.n_steps = 200;
+    vm_resource_usage.vm_resources.n_steps = 200;
     let vm_usage_in_l1_gas =
         ((*versioned_constants.vm_resource_fee_cost().builtins.get(&BuiltinName::ecdsa).unwrap())
             * u64_from_usize(
-                *vm_resource_usage.builtin_instance_counter.get(&BuiltinName::ecdsa).unwrap(),
+                *vm_resource_usage
+                    .vm_resources
+                    .builtin_instance_counter
+                    .get(&BuiltinName::ecdsa)
+                    .unwrap(),
             ))
         .ceil()
         .to_integer()
@@ -144,7 +155,7 @@ fn test_float_get_vm_resource_usage(
     );
     assert_eq!(
         expected_gas_vector,
-        get_vm_resources_cost(
+        get_extended_vm_resources_cost(
             &versioned_constants,
             &vm_resource_usage,
             n_reverted_steps,
@@ -177,21 +188,24 @@ fn test_discounted_gas_overdraft(
         NonzeroGasPrice::try_from(data_gas_price).unwrap(),
     );
     let mut block_context = BlockContext::create_for_account_testing();
-    block_context.block_info.gas_prices = validated_gas_prices(
-        DEFAULT_ETH_L1_GAS_PRICE,
-        gas_price,
-        DEFAULT_ETH_L1_DATA_GAS_PRICE,
-        data_gas_price,
-        VersionedConstants::latest_constants()
-            .convert_l1_to_l2_gas_price_round_up(DEFAULT_ETH_L1_GAS_PRICE.into())
-            .try_into()
-            .unwrap(),
-        // TODO(Aner): fix test parameters to allow using `gas_price` here.
-        VersionedConstants::latest_constants()
-            .convert_l1_to_l2_gas_price_round_up(DEFAULT_STRK_L1_GAS_PRICE.into())
-            .try_into()
-            .unwrap(),
-    );
+    block_context.block_info.gas_prices = GasPrices {
+        eth_gas_prices: GasPriceVector {
+            l1_gas_price: DEFAULT_ETH_L1_GAS_PRICE,
+            l1_data_gas_price: DEFAULT_ETH_L1_DATA_GAS_PRICE,
+            l2_gas_price: VersionedConstants::latest_constants()
+                .convert_l1_to_l2_gas_price_round_up(DEFAULT_ETH_L1_GAS_PRICE.into())
+                .try_into()
+                .unwrap(),
+        },
+        strk_gas_prices: GasPriceVector {
+            l1_gas_price: gas_price,
+            l1_data_gas_price: data_gas_price,
+            l2_gas_price: VersionedConstants::latest_constants()
+                .convert_l1_to_l2_gas_price_round_up(DEFAULT_STRK_L1_GAS_PRICE.into())
+                .try_into()
+                .unwrap(),
+        },
+    };
 
     let account = FeatureContract::AccountWithoutValidations(CairoVersion::Cairo0);
     let mut state = test_state(&block_context.chain_info, BALANCE, &[(account, 1)]);
@@ -313,14 +327,18 @@ fn test_get_fee_by_gas_vector_regression(
     #[case] expected_fee_strk: u128,
 ) {
     let mut block_info = BlockContext::create_for_account_testing().block_info;
-    block_info.gas_prices = validated_gas_prices(
-        1_u8.try_into().unwrap(),
-        2_u8.try_into().unwrap(),
-        3_u8.try_into().unwrap(),
-        4_u8.try_into().unwrap(),
-        5_u8.try_into().unwrap(),
-        6_u8.try_into().unwrap(),
-    );
+    block_info.gas_prices = GasPrices {
+        eth_gas_prices: GasPriceVector {
+            l1_gas_price: 1_u8.try_into().unwrap(),
+            l1_data_gas_price: 3_u8.try_into().unwrap(),
+            l2_gas_price: 5_u8.try_into().unwrap(),
+        },
+        strk_gas_prices: GasPriceVector {
+            l1_gas_price: 2_u8.try_into().unwrap(),
+            l1_data_gas_price: 4_u8.try_into().unwrap(),
+            l2_gas_price: 6_u8.try_into().unwrap(),
+        },
+    };
     let gas_vector =
         GasVector { l1_gas: l1_gas.into(), l1_data_gas: l1_data_gas.into(), l2_gas: l2_gas.into() };
     assert_eq!(
@@ -347,14 +365,18 @@ fn test_get_fee_by_gas_vector_overflow(
 ) {
     let huge_gas_price = NonzeroGasPrice::try_from(2_u128 * u128::from(u64::MAX)).unwrap();
     let mut block_info = BlockContext::create_for_account_testing().block_info;
-    block_info.gas_prices = validated_gas_prices(
-        huge_gas_price,
-        huge_gas_price,
-        huge_gas_price,
-        huge_gas_price,
-        huge_gas_price,
-        huge_gas_price,
-    );
+    block_info.gas_prices = GasPrices {
+        eth_gas_prices: GasPriceVector {
+            l1_gas_price: huge_gas_price,
+            l1_data_gas_price: huge_gas_price,
+            l2_gas_price: huge_gas_price,
+        },
+        strk_gas_prices: GasPriceVector {
+            l1_gas_price: huge_gas_price,
+            l1_data_gas_price: huge_gas_price,
+            l2_gas_price: huge_gas_price,
+        },
+    };
     let gas_vector =
         GasVector { l1_gas: l1_gas.into(), l1_data_gas: l1_data_gas.into(), l2_gas: l2_gas.into() };
     assert_eq!(

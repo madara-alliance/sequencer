@@ -9,8 +9,10 @@ use cairo_lang_utils::bigint::BigUintAsHex;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
+use starknet_types_core::hash::{Pedersen, StarkHash as StarkHashTrait};
 
 use crate::block::{
+    BlockHash,
     BlockInfo,
     BlockNumber,
     BlockTimestamp,
@@ -20,15 +22,33 @@ use crate::block::{
     NonzeroGasPrice,
     StarknetVersion,
 };
-use crate::contract_address;
 use crate::contract_class::{ContractClass, SierraVersion};
-use crate::core::{ChainId, ContractAddress, Nonce};
+use crate::core::{ChainId, ContractAddress, Nonce, STARKNET_OS_CONFIG_HASH_VERSION};
 use crate::deprecated_contract_class::{ContractClass as DeprecatedContractClass, Program};
 use crate::executable_transaction::AccountTransaction;
 use crate::execution_resources::GasAmount;
 use crate::rpc_transaction::{InternalRpcTransaction, RpcTransaction};
-use crate::transaction::fields::{AllResourceBounds, Fee, ResourceBounds, ValidResourceBounds};
+use crate::transaction::fields::{
+    AllResourceBounds,
+    Fee,
+    Proof,
+    ProofFacts,
+    ResourceBounds,
+    ValidResourceBounds,
+    PROOF_VERSION,
+    VIRTUAL_OS_OUTPUT_VERSION,
+    VIRTUAL_SNOS,
+};
 use crate::transaction::{Transaction, TransactionHash};
+
+/// OS config hash for testing.
+/// This is the Pedersen hash of [STARKNET_OS_CONFIG_HASH_VERSION, chain_id, strk_fee_token_address]
+pub static TEST_OS_CONFIG_HASH: LazyLock<Felt> = LazyLock::new(|| {
+    let chain_id_felt: Felt = (&*CHAIN_ID_FOR_TESTS).try_into().unwrap();
+    let strk_fee_token_address: Felt = contract_address!(TEST_ERC20_CONTRACT_ADDRESS2).into();
+    Pedersen::hash_array(&[STARKNET_OS_CONFIG_HASH_VERSION, chain_id_felt, strk_fee_token_address])
+});
+use crate::{contract_address, felt};
 
 pub mod declare;
 pub mod deploy_account;
@@ -45,6 +65,10 @@ pub const TEST_ERC20_CONTRACT_ADDRESS2: &str = "0x1002";
 // The block number of the BlockContext being used for testing.
 pub const CURRENT_BLOCK_NUMBER: u64 = 2001;
 pub const CURRENT_BLOCK_NUMBER_FOR_VALIDATE: u64 = 2000;
+
+// Offset (in blocks) from the current block number that determines the oldest
+// block number whose block hash will be populated in the block-hash contract.
+pub const BLOCK_HASH_HISTORY_RANGE: u64 = 51;
 
 // The block timestamp of the BlockContext being used for testing.
 pub const CURRENT_BLOCK_TIMESTAMP: u64 = 1072023;
@@ -103,9 +127,9 @@ impl NonceManager {
 
     /// Decrements the nonce of the account, unless it is zero.
     pub fn rollback(&mut self, account_address: ContractAddress) {
-        let current = *self.next_nonce.get(&account_address).unwrap_or(&Felt::default());
-        if current != Felt::ZERO {
-            self.next_nonce.insert(account_address, current - 1);
+        let current_nonce = *self.next_nonce.get(&account_address).unwrap_or(&Felt::default());
+        if current_nonce != Felt::ZERO {
+            self.next_nonce.insert(account_address, current_nonce - 1);
         }
     }
 }
@@ -134,6 +158,24 @@ macro_rules! storage_key {
 macro_rules! compiled_class_hash {
     ($s:expr) => {
         $crate::core::CompiledClassHash(starknet_types_core::felt::Felt::from($s))
+    };
+}
+
+/// A utility macro to create a [`ProofFacts`] from a list
+/// of felt values.
+#[macro_export]
+macro_rules! proof_facts {
+    ( $( $x:expr ),* ) => {
+        $crate::transaction::fields::ProofFacts(vec![$($x),*].into())
+    };
+}
+
+/// A utility macro to create a [`Proof`] from a list of u8
+/// values.
+#[macro_export]
+macro_rules! proof {
+    ( $( $x:expr ),* ) => {
+        $crate::transaction::fields::Proof(vec![$($x),*].into())
     };
 }
 
@@ -185,6 +227,14 @@ pub const DEFAULT_GAS_PRICES: GasPrices = GasPrices {
 
 // Deprecated transactions:
 pub const MAX_FEE: Fee = DEFAULT_L1_GAS_AMOUNT.nonzero_saturating_mul(DEFAULT_ETH_L1_GAS_PRICE);
+
+// Dummy virtual OS program hash for testing.
+pub const VIRTUAL_OS_PROGRAM_HASH: Felt = Felt::from_hex_unchecked("0x1");
+
+/// Computes a deterministic block hash for testing purposes.
+pub fn test_block_hash(block_number: u64) -> BlockHash {
+    BlockHash(Felt::from(block_number * 100))
+}
 
 impl BlockInfo {
     pub fn create_for_testing() -> Self {
@@ -338,4 +388,46 @@ pub(crate) fn py_json_dumps<T: ?Sized + Serialize>(value: &T) -> Result<String, 
     let mut ser = serde_json::Serializer::with_formatter(&mut string_buffer, PyJsonFormatter);
     value.serialize(&mut ser)?;
     Ok(String::from_utf8(string_buffer).expect("serialized JSON should be valid UTF-8"))
+}
+
+impl ProofFacts {
+    /// Returns a ProofFacts instance for testing with dummy program hash.
+    /// For tests requiring validation, use a custom program hash.
+    pub fn snos_proof_facts_for_testing() -> Self {
+        Self::custom_proof_facts_for_testing(VIRTUAL_OS_PROGRAM_HASH, *TEST_OS_CONFIG_HASH)
+    }
+
+    /// Returns a ProofFacts instance for testing with custom fields.
+    pub fn custom_proof_facts_for_testing(program_hash: Felt, config_hash: Felt) -> Self {
+        let block_hash_history_start = CURRENT_BLOCK_NUMBER - BLOCK_HASH_HISTORY_RANGE;
+        let block_number_u64 = block_hash_history_start + 2;
+        let block_number = felt!(block_number_u64);
+        let block_hash = test_block_hash(block_number_u64).0;
+        assert!(
+            block_number < felt!(CURRENT_BLOCK_NUMBER)
+                && block_number >= felt!(block_hash_history_start),
+            "To have a matching block hash stored in tests, the block number must be one whose \
+             block hash is populated in the block-hash contract. block_number: {block_number}, \
+             block_hash_history_start: {block_hash_history_start}"
+        );
+        // These fields are not verified by the OS (they are application-related).
+        let l2_to_l1_messages_segment_size = Felt::ZERO;
+        proof_facts![
+            PROOF_VERSION,
+            VIRTUAL_SNOS,
+            program_hash,
+            VIRTUAL_OS_OUTPUT_VERSION,
+            block_number,
+            block_hash,
+            config_hash,
+            l2_to_l1_messages_segment_size
+        ]
+    }
+}
+
+impl Proof {
+    pub fn proof_for_testing() -> Self {
+        // Arbitrary values for testing.
+        proof!(1, 2, 3, 4, 5, 6)
+    }
 }

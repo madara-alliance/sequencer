@@ -13,15 +13,29 @@ pub mod os_code_snippets;
 pub mod program_hash;
 #[cfg(feature = "test_programs")]
 pub mod test_programs;
+#[cfg(test)]
+mod virtual_os_test;
+
+/// Path to `constants.cairo` relative to the `src/cairo` directory (i.e., a key in
+/// [`CAIRO_FILES_MAP`]).
+#[cfg(test)]
+const CONSTANTS_CAIRO_PATH: &str = "starkware/starknet/core/os/constants.cairo";
 
 pub static CAIRO_FILES_MAP: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
     serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/cairo_files_map.json")))
         .unwrap_or_else(|error| panic!("Failed to deserialize cairo_files_map.json: {error:?}."))
 });
 
+pub static VIRTUAL_OS_SWAPPED_FILES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/virtual_os_swapped_files.json")))
+        .expect("Failed to deserialize virtual_os_swapped_files.json")
+});
+
 pub const OS_PROGRAM_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/starknet_os_bytes"));
 pub const AGGREGATOR_PROGRAM_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/starknet_aggregator_bytes"));
+pub const VIRTUAL_OS_PROGRAM_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/virtual_os_bytes"));
 
 pub static OS_PROGRAM: LazyLock<Program> = LazyLock::new(|| {
     Program::from_bytes(OS_PROGRAM_BYTES, Some("main")).expect("Failed to load the OS bytes.")
@@ -29,6 +43,10 @@ pub static OS_PROGRAM: LazyLock<Program> = LazyLock::new(|| {
 pub static AGGREGATOR_PROGRAM: LazyLock<Program> = LazyLock::new(|| {
     Program::from_bytes(AGGREGATOR_PROGRAM_BYTES, Some("main"))
         .expect("Failed to load the aggregator bytes.")
+});
+pub static VIRTUAL_OS_PROGRAM: LazyLock<Program> = LazyLock::new(|| {
+    Program::from_bytes(VIRTUAL_OS_PROGRAM_BYTES, Some("main"))
+        .expect("Failed to load the virtual OS bytes.")
 });
 
 pub static PROGRAM_HASHES: LazyLock<ProgramHashes> = LazyLock::new(|| {

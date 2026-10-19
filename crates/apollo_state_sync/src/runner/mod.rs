@@ -5,11 +5,7 @@ use std::sync::Arc;
 
 use apollo_central_sync::sources::central::{CentralError, CentralSource};
 use apollo_central_sync::sources::pending::PendingSource;
-use apollo_central_sync::{
-    StateSync as CentralStateSync,
-    StateSyncError as CentralStateSyncError,
-    GENESIS_HASH,
-};
+use apollo_central_sync::{StateSync as CentralStateSync, StateSyncError as CentralStateSyncError};
 use apollo_class_manager_types::SharedClassManagerClient;
 use apollo_infra::component_definitions::ComponentStarter;
 use apollo_infra::component_server::WrapperServer;
@@ -26,7 +22,11 @@ use apollo_starknet_client::reader::objects::pending_data::{
     PendingBlockOrDeprecated,
 };
 use apollo_starknet_client::reader::PendingData;
-use apollo_state_sync_config::config::{CentralSyncClientConfig, StateSyncConfig};
+use apollo_state_sync_config::config::{
+    CentralSyncClientConfig,
+    StateSyncConfig,
+    StateSyncStaticConfig,
+};
 use apollo_state_sync_metrics::metrics::{
     register_metrics,
     update_marker_metrics,
@@ -41,7 +41,14 @@ use apollo_state_sync_types::state_sync_types::SyncBlock;
 use apollo_storage::body::BodyStorageReader;
 use apollo_storage::header::HeaderStorageReader;
 use apollo_storage::metrics::SYNC_STORAGE_OPEN_READ_TRANSACTIONS;
-use apollo_storage::{open_storage_with_metric, StorageConfig, StorageReader, StorageWriter};
+use apollo_storage::storage_reader_server::ServerConfig;
+use apollo_storage::storage_reader_types::GenericStorageReaderServer;
+use apollo_storage::{
+    open_storage_with_metric_and_server,
+    StorageConfig,
+    StorageReader,
+    StorageWriter,
+};
 use async_trait::async_trait;
 use futures::channel::mpsc::Receiver;
 use futures::future::{self, pending, BoxFuture};
@@ -49,8 +56,8 @@ use futures::never::Never;
 use futures::{FutureExt, StreamExt};
 use papyrus_common::pending_classes::PendingClasses;
 use starknet_api::block::{BlockHash, BlockHashAndNumber};
-use starknet_api::felt;
 use tokio::sync::RwLock;
+use tokio::task::AbortHandle;
 use tracing::instrument::Instrument;
 use tracing::{debug, info_span};
 
@@ -63,6 +70,9 @@ pub struct StateSyncRunner {
     new_block_dev_null_future: BoxFuture<'static, Never>,
     rpc_server_future: BoxFuture<'static, ()>,
     register_metrics_future: BoxFuture<'static, ()>,
+    // Kept alive to maintain the server running.
+    #[allow(dead_code)]
+    storage_reader_server_handle: Option<AbortHandle>,
 }
 
 #[async_trait]
@@ -98,25 +108,39 @@ pub struct StateSyncResources {
     pub shared_highest_block: Arc<RwLock<Option<BlockHashAndNumber>>>,
     pub pending_data: Arc<RwLock<PendingData>>,
     pub pending_classes: Arc<RwLock<PendingClasses>>,
+    pub storage_reader_server_handle: Option<AbortHandle>,
 }
 
 impl StateSyncResources {
-    pub fn new(storage_config: &StorageConfig) -> Self {
-        let (storage_reader, storage_writer) =
-            open_storage_with_metric(storage_config.clone(), &SYNC_STORAGE_OPEN_READ_TRANSACTIONS)
-                .expect("StateSyncRunner failed opening storage");
+    pub fn new(storage_config: &StorageConfig, storage_reader_server_config: ServerConfig) -> Self {
+        let (storage_reader, storage_writer, storage_reader_server) =
+            open_storage_with_metric_and_server(
+                storage_config.clone(),
+                &SYNC_STORAGE_OPEN_READ_TRANSACTIONS,
+                storage_reader_server_config,
+            )
+            .expect("StateSyncRunner failed opening storage");
+        let storage_reader_server_handle =
+            GenericStorageReaderServer::spawn_if_enabled(storage_reader_server);
         let shared_highest_block = Arc::new(RwLock::new(None));
         let pending_data = Arc::new(RwLock::new(PendingData {
             // The pending data might change later to DeprecatedPendingBlock, depending on the
             // response from the feeder gateway.
             block: PendingBlockOrDeprecated::Current(PendingBlock {
-                parent_block_hash: BlockHash(felt!(GENESIS_HASH)),
+                parent_block_hash: BlockHash::GENESIS_PARENT_HASH,
                 ..Default::default()
             }),
             ..Default::default()
         }));
         let pending_classes = Arc::new(RwLock::new(PendingClasses::default()));
-        Self { storage_reader, storage_writer, shared_highest_block, pending_data, pending_classes }
+        Self {
+            storage_reader,
+            storage_writer,
+            shared_highest_block,
+            pending_data,
+            pending_classes,
+            storage_reader_server_handle,
+        }
     }
 }
 
@@ -126,22 +150,30 @@ impl StateSyncRunner {
         new_block_receiver: Receiver<SyncBlock>,
         class_manager_client: SharedClassManagerClient,
     ) -> (Self, StorageReader) {
-        let StateSyncConfig {
-            storage_config,
-            p2p_sync_client_config,
-            central_sync_client_config,
-            network_config,
-            revert_config,
-            rpc_config,
-        } = config;
+        let StateSyncConfig { static_config, dynamic_config } = config;
 
+        let storage_reader_server_config = ServerConfig {
+            static_config: static_config.storage_reader_server_static_config.clone(),
+            dynamic_config: dynamic_config.storage_reader_server_dynamic_config.clone(),
+        };
         let StateSyncResources {
             storage_reader,
             mut storage_writer,
             shared_highest_block,
             pending_data,
             pending_classes,
-        } = StateSyncResources::new(&storage_config);
+            storage_reader_server_handle,
+        } = StateSyncResources::new(&static_config.storage_config, storage_reader_server_config);
+
+        let StateSyncStaticConfig {
+            storage_config: _,
+            p2p_sync_client_config,
+            central_sync_client_config,
+            network_config,
+            revert_config,
+            rpc_config,
+            ..
+        } = static_config;
 
         let register_metrics_future = register_metrics(storage_reader.clone()).boxed();
 
@@ -202,6 +234,7 @@ impl StateSyncRunner {
                     new_block_dev_null_future: pending().boxed(),
                     rpc_server_future,
                     register_metrics_future,
+                    storage_reader_server_handle,
                 },
                 storage_reader,
             );
@@ -312,6 +345,7 @@ impl StateSyncRunner {
                 new_block_dev_null_future,
                 rpc_server_future,
                 register_metrics_future,
+                storage_reader_server_handle,
             },
             storage_reader,
         )

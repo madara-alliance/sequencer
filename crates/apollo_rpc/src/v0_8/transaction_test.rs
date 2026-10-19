@@ -8,13 +8,13 @@ use apollo_test_utils::{
 use pretty_assertions::assert_eq;
 use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector, Nonce};
 use starknet_api::data_availability::DataAvailabilityMode;
+use starknet_api::hash::L1L2MsgHash;
 use starknet_api::transaction::fields::{
     AccountDeploymentData,
     Calldata,
     ContractAddressSalt,
     Fee,
     PaymasterData,
-    Proof,
     ProofFacts,
     Tip,
     TransactionSignature,
@@ -22,7 +22,6 @@ use starknet_api::transaction::fields::{
 use starknet_api::transaction::{L1HandlerTransaction, Transaction};
 use starknet_api::{calldata, contract_address, felt, nonce};
 
-use super::super::transaction::{L1HandlerMsgHash, L1L2MsgHash};
 use super::{
     DeployAccountTransaction,
     DeployAccountTransactionV1,
@@ -123,7 +122,6 @@ auto_impl_get_test_instance! {
         pub nonce_data_availability_mode: DataAvailabilityMode,
         pub fee_data_availability_mode: DataAvailabilityMode,
         pub proof_facts: ProofFacts,
-        pub proof: Proof,
     }
     pub enum TransactionVersion0 {
         Version0 = 0,

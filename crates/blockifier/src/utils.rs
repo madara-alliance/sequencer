@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use starknet_api::core::{ClassHash, CompiledClassHash};
@@ -6,6 +6,7 @@ use starknet_api::hash::StarkHash;
 
 use crate::blockifier::transaction_executor::CompiledClassHashV2ToV1;
 use crate::blockifier_versioned_constants::{BaseGasCosts, BuiltinGasCosts};
+use crate::execution::call_info::CairoPrimitiveName;
 use crate::state::state_api::{StateReader, StateResult};
 use crate::transaction::errors::NumericConversionError;
 
@@ -62,6 +63,11 @@ pub fn usize_from_u64(val: u64) -> Result<usize, NumericConversionError> {
     val.try_into().map_err(|_| NumericConversionError::U64ToUsizeError(val))
 }
 
+/// Conversion from u32 to usize. May fail on architectures with less than 32 bits of address space.
+pub fn usize_from_u32(val: u32) -> Result<usize, NumericConversionError> {
+    val.try_into().map_err(|_| NumericConversionError::U32ToUsizeError(val))
+}
+
 /// Conversion from usize to u64. May fail on architectures with over 64 bits
 /// of address space.
 pub fn u64_from_usize(val: usize) -> u64 {
@@ -80,7 +86,7 @@ pub fn get_gas_cost_from_vm_resources(
         .iter()
         .map(|(builtin, amount)| {
             let builtin_cost = builtin_costs
-                .get_builtin_gas_cost(builtin)
+                .get_cairo_primitive_gas_cost(&CairoPrimitiveName::Builtin(*builtin))
                 .unwrap_or_else(|err| panic!("Failed to get gas cost: {err}"));
             builtin_cost * u64_from_usize(*amount)
         })
@@ -94,9 +100,9 @@ pub fn get_gas_cost_from_vm_resources(
 /// Adds values from `source` into `dest` by key.
 /// - If a key exists in both maps, the values are combined using `CheckedAdd`.
 /// - If a key exists only in `source`, it is inserted into `dest`
-pub fn add_maps<K, V>(dest: &mut HashMap<K, V>, source: &HashMap<K, V>)
+pub fn add_maps<K, V>(dest: &mut BTreeMap<K, V>, source: &BTreeMap<K, V>)
 where
-    K: Clone + Eq + std::hash::Hash,
+    K: Clone + Eq + std::hash::Hash + std::cmp::Ord,
     V: Clone + num_traits::CheckedAdd + std::fmt::Debug,
 {
     for (key, value) in source {

@@ -280,6 +280,7 @@ pub struct DeclareV3WithClass {
     pub class: ::core::option::Option<Cairo1Class>,
 }
 /// see <https://external.integration.starknet.io/feeder_gateway/get_transaction?transactionHash=0x41906f1c314cca5f43170ea75d3b1904196a10101190d2b12a41cc61cfd17c>
+/// An invoke V3 transaction without client-side proof (only contains proof_facts).
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InvokeV3 {
@@ -305,8 +306,16 @@ pub struct InvokeV3 {
     pub nonce: ::core::option::Option<Felt252>,
     #[prost(message, repeated, tag = "11")]
     pub proof_facts: ::prost::alloc::vec::Vec<Felt252>,
-    #[prost(uint32, repeated, tag = "12")]
-    pub proof: ::prost::alloc::vec::Vec<u32>,
+}
+/// An invoke V3 transaction with client-side proof.
+/// Used in consensus and mempool contexts where proof is included.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InvokeV3WithProof {
+    #[prost(message, optional, tag = "1")]
+    pub invoke: ::core::option::Option<InvokeV3>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub proof: ::prost::alloc::vec::Vec<u8>,
 }
 /// see <https://external.integration.starknet.io/feeder_gateway/get_transaction?transactionHash=0x29fd7881f14380842414cdfdd8d6c0b1f2174f8916edcfeb1ede1eb26ac3ef0>
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -333,8 +342,9 @@ pub struct DeployAccountV3 {
     #[prost(enumeration = "VolitionDomain", tag = "10")]
     pub fee_data_availability_mode: i32,
 }
-/// Contains all variants of mempool and an L1Handler variant to cover all transactions that can be
-/// in a new block.
+/// Contains all transaction types that can be in a new block:
+/// - User transactions (same types as MempoolTransaction: Declare, DeployAccount, Invoke)
+/// - L1Handler transactions (messages from L1, not propagated via mempool)
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ConsensusTransaction {
@@ -353,7 +363,7 @@ pub mod consensus_transaction {
         #[prost(message, tag = "2")]
         DeployAccountV3(super::DeployAccountV3),
         #[prost(message, tag = "3")]
-        InvokeV3(super::InvokeV3),
+        InvokeV3(super::InvokeV3WithProof),
         #[prost(message, tag = "4")]
         L1Handler(super::L1HandlerV0),
     }
@@ -375,6 +385,8 @@ pub struct Vote {
     pub proposal_commitment: ::core::option::Option<Hash>,
     #[prost(message, optional, tag = "6")]
     pub voter: ::core::option::Option<Address>,
+    #[prost(message, optional, tag = "7")]
+    pub signature: ::core::option::Option<Hashes>,
 }
 /// Nested message and enum types in `Vote`.
 pub mod vote {
@@ -447,26 +459,26 @@ pub struct ProposalInit {
     pub valid_round: ::core::option::Option<u32>,
     #[prost(message, optional, tag = "4")]
     pub proposer: ::core::option::Option<Address>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BlockInfo {
-    #[prost(uint64, tag = "1")]
-    pub height: u64,
-    #[prost(uint64, tag = "2")]
+    #[prost(uint64, tag = "5")]
     pub timestamp: u64,
-    #[prost(message, optional, tag = "3")]
-    pub builder: ::core::option::Option<Address>,
-    #[prost(enumeration = "L1DataAvailabilityMode", tag = "4")]
-    pub l1_da_mode: i32,
-    #[prost(message, optional, tag = "5")]
-    pub l2_gas_price_fri: ::core::option::Option<Uint128>,
     #[prost(message, optional, tag = "6")]
-    pub l1_gas_price_wei: ::core::option::Option<Uint128>,
-    #[prost(message, optional, tag = "7")]
-    pub l1_data_gas_price_wei: ::core::option::Option<Uint128>,
+    pub builder: ::core::option::Option<Address>,
+    #[prost(enumeration = "L1DataAvailabilityMode", tag = "7")]
+    pub l1_da_mode: i32,
     #[prost(message, optional, tag = "8")]
-    pub eth_to_fri_rate: ::core::option::Option<Uint128>,
+    pub l2_gas_price_fri: ::core::option::Option<Uint128>,
+    #[prost(message, optional, tag = "9")]
+    pub l1_gas_price_fri: ::core::option::Option<Uint128>,
+    #[prost(message, optional, tag = "10")]
+    pub l1_data_gas_price_fri: ::core::option::Option<Uint128>,
+    #[prost(message, optional, tag = "11")]
+    pub l1_gas_price_wei: ::core::option::Option<Uint128>,
+    #[prost(message, optional, tag = "12")]
+    pub l1_data_gas_price_wei: ::core::option::Option<Uint128>,
+    #[prost(string, tag = "13")]
+    pub starknet_version: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "14")]
+    pub version_constant_commitment: ::core::option::Option<Hash>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -476,25 +488,56 @@ pub struct TransactionBatch {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CommitmentParts {
+    #[prost(message, optional, tag = "1")]
+    pub concatenated_counts: ::core::option::Option<Felt252>,
+    #[prost(message, optional, tag = "2")]
+    pub parent_commitment: ::core::option::Option<Hash>,
+    #[prost(message, optional, tag = "3")]
+    pub transaction_commitment: ::core::option::Option<Hash>,
+    #[prost(message, optional, tag = "4")]
+    pub event_commitment: ::core::option::Option<Hash>,
+    #[prost(message, optional, tag = "5")]
+    pub receipt_commitment: ::core::option::Option<Hash>,
+}
+/// L2 gas info for the block (next price and gas used).
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct L2GasInfo {
+    #[prost(message, optional, tag = "1")]
+    pub next_l2_gas_price_fri: ::core::option::Option<Uint128>,
+    #[prost(uint64, tag = "2")]
+    pub l2_gas_used: u64,
+}
+/// Optional payload carried in ProposalFin: commitment parts and L2 gas.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProposalFinPayload {
+    #[prost(message, optional, tag = "1")]
+    pub commitment_parts: ::core::option::Option<CommitmentParts>,
+    #[prost(message, optional, tag = "2")]
+    pub l2_gas_info: ::core::option::Option<L2GasInfo>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProposalFin {
     /// Identifies a Starknet block based on the content streamed in the proposal.
     #[prost(message, optional, tag = "1")]
     pub proposal_commitment: ::core::option::Option<Hash>,
+    /// Number of executed transactions in the proposal.
+    #[prost(uint64, tag = "2")]
+    pub executed_transaction_count: u64,
+    #[prost(message, optional, tag = "3")]
+    pub fin_payload: ::core::option::Option<ProposalFinPayload>,
 }
 /// Network format:
-/// 1. First message is ProposalInit
-/// 2. Last message is ProposalFin
-///
-/// Empty block - no other messages sent.
-///
-/// Block with transactions:
-/// 3. block_info is sent once
-/// 4. transactions is sent repeatedly
-/// 5. executed_transaction_count is sent once
+/// 1. First message is ProposalInit (init, includes all block metadata)
+/// 2. transactions is sent repeatedly (for non-empty blocks)
+/// 3. Last message is ProposalFin
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProposalPart {
-    #[prost(oneof = "proposal_part::Message", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "proposal_part::Message", tags = "1, 2, 3")]
     pub message: ::core::option::Option<proposal_part::Message>,
 }
 /// Nested message and enum types in `ProposalPart`.
@@ -507,11 +550,7 @@ pub mod proposal_part {
         #[prost(message, tag = "2")]
         Fin(super::ProposalFin),
         #[prost(message, tag = "3")]
-        BlockInfo(super::BlockInfo),
-        #[prost(message, tag = "4")]
         Transactions(super::TransactionBatch),
-        #[prost(uint64, tag = "5")]
-        ExecutedTransactionCount(u64),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -950,7 +989,7 @@ pub mod mempool_transaction {
         #[prost(message, tag = "2")]
         DeployAccountV3(super::DeployAccountV3),
         #[prost(message, tag = "3")]
-        InvokeV3(super::InvokeV3),
+        InvokeV3(super::InvokeV3WithProof),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -958,6 +997,54 @@ pub mod mempool_transaction {
 pub struct MempoolTransactionBatch {
     #[prost(message, repeated, tag = "1")]
     pub transactions: ::prost::alloc::vec::Vec<MempoolTransaction>,
+}
+/// A Merkle proof consisting of sibling hashes used to verify that a leaf belongs to a Merkle tree.
+/// Each sibling hash is 32 bytes (SHA-256). The siblings are ordered from leaf level to root level.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MerkleProof {
+    /// The sibling hashes needed to reconstruct the path from the leaf to the root.
+    /// Each hash is 32 bytes.
+    #[prost(message, repeated, tag = "1")]
+    pub siblings: ::prost::alloc::vec::Vec<Hash256>,
+}
+/// A single unit in the Propeller protocol containing a shard of erasure-coded data
+/// along with cryptographic proofs for verification.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PropellerUnit {
+    /// The actual data shard (erasure-coded fragment of the original message).
+    #[prost(bytes = "vec", tag = "1")]
+    pub shard: ::prost::alloc::vec::Vec<u8>,
+    /// The position of this shard in the erasure coding scheme.
+    #[prost(uint64, tag = "2")]
+    pub index: u64,
+    /// The Merkle root of all shards, used to verify shard integrity.
+    #[prost(message, optional, tag = "3")]
+    pub merkle_root: ::core::option::Option<Hash256>,
+    /// The Merkle proof that this shard belongs to the tree with the given root.
+    #[prost(message, optional, tag = "4")]
+    pub merkle_proof: ::core::option::Option<MerkleProof>,
+    /// The peer ID of the original publisher who created and signed this unit.
+    #[prost(message, optional, tag = "5")]
+    pub publisher: ::core::option::Option<PeerId>,
+    /// Cryptographic signature from the publisher over the merkle_root.
+    #[prost(bytes = "vec", tag = "6")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+    /// TODO(AndrewL): consider re-naming channel
+    /// TODO(AndrewL): make it uint64 instead of uint32.
+    /// Logical channel identifier for multiplexing different message streams.
+    ///
+    /// TODO(AndrewL): CRITICAL: protect against replay attacks (maybe using a timestamp)
+    #[prost(uint32, tag = "7")]
+    pub channel: u32,
+}
+/// A batch of PropellerUnits for efficient transmission.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PropellerUnitBatch {
+    #[prost(message, repeated, tag = "1")]
+    pub batch: ::prost::alloc::vec::Vec<PropellerUnit>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

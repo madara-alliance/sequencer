@@ -1,6 +1,8 @@
-#![allow(dead_code)]
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use blockifier::context::BlockContext;
+use blockifier::state::state_api::UpdatableState;
+use blockifier::test_utils::generate_block_hash_storage_updates;
 use blockifier::transaction::transaction_execution::Transaction;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::calldata::create_calldata;
@@ -31,11 +33,15 @@ use starknet_api::transaction::constants::DEPLOY_CONTRACT_FUNCTION_ENTRY_POINT_N
 use starknet_api::transaction::fields::{Calldata, ContractAddressSalt, ValidResourceBounds};
 use starknet_api::{calldata, deploy_account_tx_args, invoke_tx_args};
 use starknet_committer::block_committer::input::StateDiff;
-use starknet_committer::db::facts_db::db::FactsDb;
+use starknet_committer::db::facts_db::FactsDb;
+use starknet_committer::db::forest_trait::StorageInitializer;
 use starknet_patricia_storage::map_storage::MapStorage;
+use starknet_transaction_prover::running::committer_utils::{
+    commit_state_diff,
+    state_maps_to_committer_state_diff,
+};
 use starknet_types_core::felt::Felt;
 
-use crate::state_trait::FlowTestState;
 use crate::test_manager::{
     block_context_for_flow_tests,
     EXPECTED_STRK_FEE_TOKEN_ADDRESS,
@@ -44,9 +50,7 @@ use crate::test_manager::{
 };
 use crate::tests::NON_TRIVIAL_RESOURCE_BOUNDS;
 use crate::utils::{
-    commit_state_diff,
     create_cairo1_bootstrap_declare_tx,
-    create_committer_state_diff,
     create_declare_tx,
     execute_transactions,
     get_class_hash_of_feature_contract,
@@ -58,6 +62,10 @@ const STRK_TOKEN_NAME: &[u8] = b"StarkNet Token";
 const STRK_SYMBOL: &[u8] = b"STRK";
 const STRK_DECIMALS: u8 = 18;
 
+/// Trait alias for state readers used in flow tests.
+pub(crate) trait FlowTestState: Default + UpdatableState + Send {}
+impl<S: Default + UpdatableState + Send> FlowTestState for S {}
+
 /// Gathers the information needed to execute a flow test.
 pub(crate) struct InitialStateData<S: FlowTestState> {
     pub(crate) initial_state: InitialState<S>,
@@ -68,7 +76,7 @@ pub(crate) struct InitialStateData<S: FlowTestState> {
 #[derive(Default)]
 pub(crate) struct OsExecutionContracts {
     // Cairo contracts that are executed during the OS execution.
-    pub(crate) executed_contracts: ExecutedContracts,
+    pub(crate) executed: ExecutedContracts,
     // Cairo 1 contracts that are declared during the OS execution.
     pub(crate) declared_class_hash_to_component_hashes:
         HashMap<ClassHash, ContractClassComponentHashes>,
@@ -80,7 +88,7 @@ impl OsExecutionContracts {
         casm_contract_class: CasmContractClass,
         sierra: &SierraContractClass,
     ) {
-        self.executed_contracts.add_cairo1_contract(casm_contract_class);
+        self.executed.add_cairo1_contract(casm_contract_class);
         self.declared_class_hash_to_component_hashes
             .insert(sierra.calculate_class_hash(), sierra.get_component_hashes());
     }
@@ -90,14 +98,14 @@ impl OsExecutionContracts {
         class_hash: ClassHash,
         deprecated_contract_class: DeprecatedContractClass,
     ) {
-        self.executed_contracts.add_deprecated_contract(class_hash, deprecated_contract_class);
+        self.executed.add_deprecated_contract(class_hash, deprecated_contract_class);
     }
 }
 
 #[derive(Default)]
 pub(crate) struct ExecutedContracts {
-    pub(crate) contracts: HashMap<CompiledClassHash, CasmContractClass>,
-    pub(crate) deprecated_contracts: HashMap<ClassHash, DeprecatedContractClass>,
+    pub(crate) contracts: BTreeMap<CompiledClassHash, CasmContractClass>,
+    pub(crate) deprecated_contracts: BTreeMap<ClassHash, DeprecatedContractClass>,
 }
 
 impl ExecutedContracts {
@@ -120,8 +128,8 @@ pub(crate) struct InitialState<S: FlowTestState> {
     // Current patricia roots.
     pub(crate) contracts_trie_root_hash: HashOutput,
     pub(crate) classes_trie_root_hash: HashOutput,
-    // Next available block number.
-    pub(crate) next_block_number: BlockNumber,
+    // Block context of the last block in the initial state.
+    pub(crate) block_context: BlockContext,
 }
 
 /// Creates the initial state for the flow test which includes:
@@ -140,15 +148,17 @@ pub(crate) async fn create_default_initial_state_data<S: FlowTestState, const N:
         extra_contracts_addresses,
     ) = create_default_initial_state_txs_and_contracts(extra_contracts);
     // Execute these 4 txs.
-    let initial_state_reader = S::create_empty_state();
+    let initial_state_reader = S::default();
     let initial_block_number = BlockNumber(CURRENT_BLOCK_NUMBER);
     let use_kzg_da = false;
-    let ExecutionOutput { execution_outputs, block_summary, mut final_state } =
-        execute_transactions(
-            initial_state_reader,
-            &default_initial_state_txs,
-            block_context_for_flow_tests(initial_block_number, use_kzg_da),
-        );
+    let block_context = block_context_for_flow_tests(initial_block_number, use_kzg_da);
+    let virtual_os = false;
+    let ExecutionOutput { execution_outputs, mut final_state } = execute_transactions(
+        initial_state_reader,
+        &default_initial_state_txs,
+        block_context.clone(),
+        virtual_os,
+    );
     assert_eq!(
         execution_outputs.len(),
         default_initial_state_txs.len(),
@@ -158,20 +168,22 @@ pub(crate) async fn create_default_initial_state_data<S: FlowTestState, const N:
     // Make sure none of them is reverted.
     assert!(execution_outputs.iter().all(|output| output.0.revert_error.is_none()));
     // Update the state reader with the state diff.
-    let state_diff = final_state.to_state_diff().unwrap();
+    let mut state_diff = final_state.to_state_diff().unwrap().state_maps;
     // Sanity check to verify the STRK_FEE_TOKEN_ADDRESS constant.
     assert_eq!(
-        state_diff.state_maps.class_hashes[&STRK_FEE_TOKEN_ADDRESS],
+        state_diff.class_hashes[&STRK_FEE_TOKEN_ADDRESS],
         FeatureContract::ERC20(CairoVersion::Cairo1(RunnableCairo1::Casm))
             .get_sierra()
             .calculate_class_hash()
     );
-    final_state
-        .state
-        .apply_writes(&state_diff.state_maps, &final_state.class_hash_to_class.borrow());
+    // Add historical block hashes to state_diff for commitment.
+    let block_hash_state_maps = generate_block_hash_storage_updates();
+    state_diff.extend(&block_hash_state_maps);
 
-    // Commit the state diff.
-    let committer_state_diff = create_committer_state_diff(block_summary.state_diff);
+    final_state.state.apply_writes(&state_diff, &final_state.class_hash_to_class.borrow());
+
+    // Commits the state diff with block hash mappings.
+    let committer_state_diff = state_maps_to_committer_state_diff(state_diff);
     let (commitment_output, commitment_storage) =
         commit_initial_state_diff(committer_state_diff).await;
 
@@ -180,7 +192,7 @@ pub(crate) async fn create_default_initial_state_data<S: FlowTestState, const N:
         commitment_storage,
         contracts_trie_root_hash: commitment_output.contracts_trie_root_hash,
         classes_trie_root_hash: commitment_output.classes_trie_root_hash,
-        next_block_number: initial_block_number.next().unwrap(),
+        block_context,
     };
 
     (
@@ -276,7 +288,8 @@ pub(crate) async fn commit_initial_state_diff(
         classes_trie_root,
         committer_state_diff,
     )
-    .await;
+    .await
+    .expect("Failed to commit initial state diff.");
     (state_roots, facts_db.consume_storage())
 }
 

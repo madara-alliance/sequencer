@@ -364,8 +364,6 @@ pub(crate) trait InvokeTransactionV3Trait {
     fn calldata(&self) -> &Calldata;
     fn sender_address(&self) -> &ContractAddress;
     fn nonce(&self) -> &Nonce;
-    // TODO(AvivG): Remove #[allow(unused)] when proof_facts is used for hash calculation.
-    #[allow(unused)]
     fn proof_facts(&self) -> &ProofFacts;
 }
 
@@ -387,21 +385,23 @@ pub(crate) fn get_invoke_transaction_v3_hash<T: InvokeTransactionV3Trait>(
         .get_poseidon_hash();
     let calldata_hash =
         HashChain::new().chain_iter(transaction.calldata().0.iter()).get_poseidon_hash();
-    // TODO(AvivG): Add proof_facts to hash calculation.
-    Ok(TransactionHash(
-        HashChain::new()
-            .chain(&INVOKE)
-            .chain(&transaction_version.0)
-            .chain(transaction.sender_address().0.key())
-            .chain(&tip_resource_bounds_hash)
-            .chain(&paymaster_data_hash)
-            .chain(&Felt::try_from(chain_id)?)
-            .chain(&transaction.nonce().0)
-            .chain(&data_availability_mode)
-            .chain(&account_deployment_data_hash)
-            .chain(&calldata_hash)
-            .get_poseidon_hash(),
-    ))
+    let mut hash_chain = HashChain::new()
+        .chain(&INVOKE)
+        .chain(&transaction_version.0)
+        .chain(transaction.sender_address().0.key())
+        .chain(&tip_resource_bounds_hash)
+        .chain(&paymaster_data_hash)
+        .chain(&Felt::try_from(chain_id)?)
+        .chain(&transaction.nonce().0)
+        .chain(&data_availability_mode)
+        .chain(&account_deployment_data_hash)
+        .chain(&calldata_hash);
+    if !transaction.proof_facts().0.is_empty() {
+        let proof_facts_hash =
+            HashChain::new().chain_iter(transaction.proof_facts().0.iter()).get_poseidon_hash();
+        hash_chain = hash_chain.chain(&proof_facts_hash);
+    }
+    Ok(TransactionHash(hash_chain.get_poseidon_hash()))
 }
 
 impl InvokeTransactionV3Trait for InvokeTransactionV3 {
@@ -432,8 +432,6 @@ impl InvokeTransactionV3Trait for InvokeTransactionV3 {
     fn calldata(&self) -> &Calldata {
         &self.calldata
     }
-    // TODO(AvivG): Remove #[allow(unused)] when proof_facts is used for hash calculation.
-    #[allow(unused)]
     fn proof_facts(&self) -> &ProofFacts {
         &self.proof_facts
     }

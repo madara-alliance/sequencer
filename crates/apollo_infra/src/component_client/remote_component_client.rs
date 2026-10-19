@@ -1,29 +1,41 @@
 use std::collections::BTreeMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::time::Duration;
 
 use apollo_config::dumping::{ser_param, SerializeConfig};
 use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use async_trait::async_trait;
-use hyper::body::{to_bytes, Bytes};
-use hyper::client::connect::HttpConnector;
-use hyper::header::CONTENT_TYPE;
-use hyper::{Body, Client, Request as HyperRequest, Response as HyperResponse, StatusCode, Uri};
+use bytes::Bytes;
+use http::header::CONTENT_TYPE;
+use http::{StatusCode, Uri};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Body;
+use hyper::{Request as HyperRequest, Response as HyperResponse};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use tracing::{debug, trace, warn};
+use tracing::field::{display, Empty};
+use tracing::{debug, instrument, trace, warn};
 use validator::Validate;
 
 use super::definitions::{ClientError, ClientResult};
-use crate::component_definitions::{ComponentClient, ServerError, APPLICATION_OCTET_STREAM};
+use crate::component_definitions::{
+    ComponentClient,
+    RequestId,
+    ServerError,
+    APPLICATION_OCTET_STREAM,
+    REQUEST_ID_HEADER,
+};
 use crate::metrics::RemoteClientMetrics;
 use crate::requests::LabeledRequest;
 use crate::serde_utils::SerdeWrapper;
 
-pub const DEFAULT_RETRIES: usize = 150;
+pub const DEFAULT_RETRIES: usize = 15;
 const DEFAULT_IDLE_CONNECTIONS: usize = 10;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30000;
 const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 1000;
@@ -124,7 +136,7 @@ where
     Response: DeserializeOwned,
 {
     uri: Uri,
-    client: Client<hyper::client::HttpConnector>,
+    client: Client<HttpConnector, Full<Bytes>>,
     config: RemoteClientConfig,
     metrics: &'static RemoteClientMetrics,
     // [`RemoteComponentClient<Request,Response>`] should be [`Send + Sync`] while [`Request`] and
@@ -152,7 +164,7 @@ where
         let mut connector = HttpConnector::new();
         connector.set_nodelay(config.set_tcp_nodelay);
         connector.set_connect_timeout(Some(Duration::from_millis(config.connection_timeout_ms)));
-        let client = Client::builder()
+        let client = Client::builder(TokioExecutor::new())
             .http2_only(true)
             .pool_max_idle_per_host(config.idle_connections)
             .pool_idle_timeout(Duration::from_millis(config.idle_timeout_ms))
@@ -163,15 +175,20 @@ where
         Self { uri, client, config, metrics, _req: PhantomData, _res: PhantomData }
     }
 
-    fn construct_http_request(&self, serialized_request: Bytes) -> HyperRequest<Body> {
+    fn construct_http_request(
+        &self,
+        serialized_request: Bytes,
+        request_id: &RequestId,
+    ) -> HyperRequest<Full<Bytes>> {
         trace!("Constructing remote request");
         HyperRequest::post(self.uri.clone())
             .header(CONTENT_TYPE, APPLICATION_OCTET_STREAM)
-            .body(Body::from(serialized_request))
+            .header(REQUEST_ID_HEADER, request_id.to_string())
+            .body(Full::new(serialized_request))
             .expect("Request building should succeed")
     }
 
-    async fn try_send(&self, http_request: HyperRequest<Body>) -> ClientResult<Response> {
+    async fn try_send(&self, http_request: HyperRequest<Full<Bytes>>) -> ClientResult<Response> {
         trace!("Sending HTTP request");
         let http_response = self.client.request(http_request).await.map_err(|err| {
             warn!("HTTP request to {} failed with error: {err:?}", self.uri);
@@ -185,9 +202,12 @@ where
                 response_body
             }
             status_code => {
-                let body_bytes = to_bytes(http_response.into_body())
+                let body_bytes = http_response
+                    .into_body()
+                    .collect()
                     .await
-                    .map_err(|e| ClientError::CommunicationFailure(e.to_string()))?;
+                    .map_err(|e| ClientError::CommunicationFailure(e.to_string()))?
+                    .to_bytes();
 
                 match SerdeWrapper::<ServerError>::wrapper_deserialize(&body_bytes) {
                     Ok(server_err) => Err(ClientError::ResponseError(status_code, server_err)),
@@ -217,7 +237,10 @@ where
     Request: Send + Serialize + DeserializeOwned + Debug + AsRef<str> + LabeledRequest,
     Response: Send + Serialize + DeserializeOwned + Debug,
 {
+    #[instrument(skip_all, fields(request_id = Empty))]
     async fn send(&self, component_request: Request) -> ClientResult<Response> {
+        let request_id = RequestId::generate();
+        tracing::Span::current().record("request_id", display(&request_id));
         let log_message = format!("{} to {}", component_request.as_ref(), self.uri);
         let request_label = component_request.request_label();
 
@@ -237,11 +260,11 @@ where
         let max_attempts = self.config.retries + 1;
         trace!("Starting retry loop: max_attempts = {max_attempts}");
         let mut retry_interval_ms = self.config.initial_retry_delay_ms;
+        let http_request = self.construct_http_request(serialized_request_bytes, &request_id);
         for attempt in 1..max_attempts + 1 {
             trace!("Request {log_message} attempt {attempt} of {max_attempts}");
-            let http_request = self.construct_http_request(serialized_request_bytes.clone());
             let start = Instant::now();
-            let res = self.try_send(http_request).await;
+            let res = self.try_send(http_request.clone()).await;
             let elapsed = start.elapsed();
             if res.is_ok() {
                 trace!("Request {log_message} successful on attempt {attempt}/{max_attempts}");
@@ -266,13 +289,18 @@ where
     }
 }
 
-async fn get_response_body<Response>(response: HyperResponse<Body>) -> Result<Response, ClientError>
+async fn get_response_body<Response, B>(response: HyperResponse<B>) -> Result<Response, ClientError>
 where
     Response: Serialize + DeserializeOwned + Debug,
+    B: Body,
+    B::Error: Display,
 {
-    let body_bytes = to_bytes(response.into_body())
+    let body_bytes = response
+        .into_body()
+        .collect()
         .await
-        .map_err(|err| ClientError::ResponseParsingFailure(err.to_string()))?;
+        .map_err(|err| ClientError::ResponseParsingFailure(err.to_string()))?
+        .to_bytes();
 
     SerdeWrapper::<Response>::wrapper_deserialize(&body_bytes)
         .map_err(|err| ClientError::ResponseDeserializationFailure(err.to_string()))

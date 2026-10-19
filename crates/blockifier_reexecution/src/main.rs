@@ -1,8 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use apollo_gateway_config::config::RpcStateReaderConfig;
-use blockifier::blockifier::config::ContractClassManagerConfig;
+use blockifier::blockifier::config::{CairoNativeRunConfig, ContractClassManagerConfig};
 use blockifier::state::contract_class_manager::ContractClassManager;
 use blockifier_reexecution::cli::{
     parse_block_numbers_args,
@@ -11,15 +10,19 @@ use blockifier_reexecution::cli::{
     TransactionInput,
     FULL_RESOURCES_DIR,
 };
+use blockifier_reexecution::rpc_replay::run_rpc_replay;
+use blockifier_reexecution::state_reader::config::RpcStateReaderConfig;
 use blockifier_reexecution::state_reader::offline_state_reader::OfflineConsecutiveStateReaders;
 use blockifier_reexecution::state_reader::reexecution_state_reader::ConsecutiveReexecutionStateReaders;
 use blockifier_reexecution::state_reader::rpc_state_reader::ConsecutiveRpcStateReaders;
+use blockifier_reexecution::utils::get_chain_info;
 use clap::Parser;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
 use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
 use starknet_api::block::BlockNumber;
+use tracing::info;
 
 const BUCKET: &str = "reexecution_artifacts";
 const RESOURCES_DIR: &str = "/resources";
@@ -30,6 +33,16 @@ const OFFLINE_PREFIX_FILE: &str = "/offline_reexecution_files_prefix";
 /// TODO(Aner): run by default from the root of the project.
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+            |_| {
+                tracing_subscriber::EnvFilter::new(
+                    "warn,blockifier=info,blockifier_reexecution=info",
+                )
+            },
+        ))
+        .init();
+
     let args = BlockifierReexecutionCliArgs::parse();
 
     // Lambda functions for single point of truth.
@@ -51,38 +64,38 @@ async fn main() {
     // Initialize the contract class manager.
     let mut contract_class_manager_config = ContractClassManagerConfig::default();
     if cfg!(feature = "cairo_native") {
-        contract_class_manager_config.cairo_native_run_config.wait_on_native_compilation = true;
-        contract_class_manager_config.cairo_native_run_config.run_cairo_native = true;
+        contract_class_manager_config.cairo_native_run_config =
+            CairoNativeRunConfig::wait_on_compilation_for_testing();
     }
     let contract_class_manager = ContractClassManager::start(contract_class_manager_config);
 
     match args.command {
         Command::RpcTest { block_number, rpc_args } => {
-            println!(
+            info!(
                 "Running RPC test for block number {block_number} using node url {}.",
                 rpc_args.node_url
             );
-
             let rpc_state_reader_config = RpcStateReaderConfig::from_url(rpc_args.node_url.clone());
             // RPC calls are "synchronous IO" (see, e.g., https://stackoverflow.com/questions/74547541/when-should-you-use-tokios-spawn-blocking)
             // for details), so should be executed in a blocking thread.
             // TODO(Aner): make only the RPC calls blocking, not the whole function.
             tokio::task::spawn_blocking(move || {
+                let chain_info = get_chain_info(&rpc_args.parse_chain_id(), None);
+                let prefetch_initial_reads = true;
                 ConsecutiveRpcStateReaders::new(
                     BlockNumber(block_number - 1),
                     Some(rpc_state_reader_config),
-                    rpc_args.parse_chain_id(),
+                    chain_info,
                     false,
                     contract_class_manager,
+                    prefetch_initial_reads,
                 )
                 .reexecute_and_verify_correctness()
             })
             .await
             .unwrap();
 
-            // Compare the expected and actual state differences
-            // by avoiding discrepancies caused by insertion order
-            println!("RPC test passed successfully.");
+            info!("RPC test passed successfully.");
         }
 
         Command::ReexecuteSingleTx { block_number, rpc_args, tx_input } => {
@@ -91,14 +104,15 @@ async fn main() {
                 TransactionInput::FromHash { ref tx_hash } => format!("with hash {tx_hash}"),
             };
 
-            println!(
-                "Executing single transaction {tx_source}, for block number {block_number}, and \
-                 using node url {}.",
+            info!(
+                "Executing single transaction {tx_source}, for block number {block_number}, using \
+                 node url {}.",
                 rpc_args.node_url
             );
 
             let rpc_state_reader_config = RpcStateReaderConfig::from_url(rpc_args.node_url.clone());
-            let chain_id = rpc_args.parse_chain_id();
+            let chain_info = get_chain_info(&rpc_args.parse_chain_id(), None);
+            let prefetch_initial_reads = true;
 
             // RPC calls are "synchronous IO" (see, e.g., https://stackoverflow.com/questions/74547541/when-should-you-use-tokios-spawn_blocking)
             // for details), so should be executed in a blocking thread.
@@ -107,9 +121,10 @@ async fn main() {
                 ConsecutiveRpcStateReaders::new(
                     BlockNumber(block_number - 1),
                     Some(rpc_state_reader_config),
-                    chain_id,
+                    chain_info,
                     false,
                     contract_class_manager,
+                    prefetch_initial_reads,
                 )
                 .execute_single_transaction(tx_input)
             })
@@ -117,41 +132,45 @@ async fn main() {
             .unwrap()
             .unwrap();
 
-            println!("Single transaction execution completed.");
+            info!("Single transaction execution completed.");
         }
 
         Command::WriteToFile { block_numbers, directory_path, rpc_args } => {
             let directory_path = directory_path.unwrap_or(FULL_RESOURCES_DIR.to_string());
 
             let block_numbers = parse_block_numbers_args(block_numbers);
-            println!("Computing reexecution data for blocks {block_numbers:?}.");
+            info!("Computing reexecution data for blocks {block_numbers:?}.");
 
             let mut task_set = tokio::task::JoinSet::new();
             for block_number in block_numbers {
                 let full_file_path = block_full_file_path(directory_path.clone(), block_number);
-                let (node_url, chain_id) = (rpc_args.node_url.clone(), rpc_args.parse_chain_id());
+                let node_url = rpc_args.node_url.clone();
+                let chain_info = get_chain_info(&rpc_args.parse_chain_id(), None);
                 let contract_class_manager = contract_class_manager.clone();
+                // Prefatching initial reads is not supported for offline reexecution.
+                let prefetch_initial_reads = false;
 
                 // RPC calls are "synchronous IO" (see, e.g., https://stackoverflow.com/questions/74547541/when-should-you-use-tokios-spawn-blocking)
                 // for details), so should be executed in a blocking thread.
                 // TODO(Aner): make only the RPC calls blocking, not the whole function.
                 let rpc_state_reader_config = RpcStateReaderConfig::from_url(node_url);
                 task_set.spawn(async move {
-                    println!("Computing reexecution data for block {block_number}.");
+                    info!("Computing reexecution data for block {block_number}.");
                     tokio::task::spawn_blocking(move || {
                         ConsecutiveRpcStateReaders::new(
                             block_number.prev().expect("Should not run with block 0"),
                             Some(rpc_state_reader_config),
-                            chain_id,
+                            chain_info,
                             true,
                             contract_class_manager,
+                            prefetch_initial_reads,
                         )
                         .write_block_reexecution_data_to_file(&full_file_path)
                     })
                     .await
                 });
             }
-            println!("Waiting for all blocks to be processed.");
+            info!("Waiting for all blocks to be processed.");
             task_set.join_all().await;
         }
 
@@ -159,7 +178,7 @@ async fn main() {
             let directory_path = directory_path.unwrap_or(FULL_RESOURCES_DIR.to_string());
 
             let block_numbers = parse_block_numbers_args(block_numbers);
-            println!("Reexecuting blocks {block_numbers:?}.");
+            info!("Reexecuting blocks {block_numbers:?}.");
 
             let mut task_set = tokio::task::JoinSet::new();
             for block in block_numbers {
@@ -172,10 +191,10 @@ async fn main() {
                     )
                     .unwrap()
                     .reexecute_and_verify_correctness();
-                    println!("Reexecution test for block {block} passed successfully.");
+                    info!("Reexecution test for block {block} passed successfully.");
                 });
             }
-            println!("Waiting for all blocks to be processed.");
+            info!("Waiting for all blocks to be processed.");
             task_set.join_all().await;
         }
 
@@ -185,7 +204,7 @@ async fn main() {
             let directory_path = directory_path.unwrap_or(FULL_RESOURCES_DIR.to_string());
 
             let block_numbers = parse_block_numbers_args(block_numbers);
-            println!("Uploading blocks {block_numbers:?}.");
+            info!("Uploading blocks {block_numbers:?}.");
 
             let files_prefix = prefix_dir(directory_path.clone());
 
@@ -235,8 +254,9 @@ async fn main() {
                     .unwrap();
             }
 
-            println!(
-                "All blocks uploaded successfully to https://console.cloud.google.com/storage/browser/{BUCKET}/{files_prefix}."
+            info!(
+                "All blocks uploaded successfully to \
+                 https://console.cloud.google.com/storage/browser/{BUCKET}/{files_prefix}."
             );
         }
 
@@ -244,7 +264,7 @@ async fn main() {
             let directory_path = directory_path.unwrap_or(FULL_RESOURCES_DIR.to_string());
 
             let block_numbers = parse_block_numbers_args(block_numbers);
-            println!("Downloading blocks {block_numbers:?}.");
+            info!("Downloading blocks {block_numbers:?}.");
 
             let files_prefix = prefix_dir(directory_path.clone());
 
@@ -273,7 +293,29 @@ async fn main() {
                 fs::write(block_full_file_path(directory_path.clone(), block_number), res).unwrap();
             }
 
-            println!("All blocks downloaded successfully to {directory_path}.");
+            info!("All blocks downloaded successfully to {directory_path}.");
+        }
+
+        Command::RpcReplay {
+            rpc_args,
+            start_block,
+            end_block,
+            n_workers,
+            compare_native,
+            prefetch_initial_reads,
+        } => {
+            let chain_id = rpc_args.parse_chain_id();
+            run_rpc_replay(
+                rpc_args.node_url,
+                chain_id,
+                start_block,
+                end_block,
+                n_workers,
+                contract_class_manager,
+                compare_native,
+                prefetch_initial_reads,
+            )
+            .await;
         }
     }
 }

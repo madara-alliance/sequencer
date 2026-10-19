@@ -5,18 +5,20 @@ use std::time::Duration;
 
 use apollo_batcher_config::config::BlockBuilderConfig;
 use apollo_batcher_types::batcher_types::ProposalCommitment;
-use apollo_class_manager_types::transaction_converter::{
+use apollo_class_manager_types::SharedClassManagerClient;
+use apollo_infra_utils::tracing::LogCompatibleToStringExt;
+use apollo_proof_manager_types::SharedProofManagerClient;
+use apollo_state_reader::apollo_state::{ApolloReader, ClassReader};
+use apollo_storage::StorageReader;
+use apollo_transaction_converter::{
     TransactionConverter,
     TransactionConverterError,
     TransactionConverterResult,
     TransactionConverterTrait,
 };
-use apollo_class_manager_types::SharedClassManagerClient;
-use apollo_infra_utils::tracing::LogCompatibleToStringExt;
-use apollo_state_reader::apollo_state::{ApolloReader, ClassReader};
-use apollo_storage::StorageReader;
 use async_trait::async_trait;
 use blockifier::blockifier::concurrent_transaction_executor::ConcurrentTransactionExecutor;
+use blockifier::blockifier::config::NativeClassesWhitelist;
 use blockifier::blockifier::transaction_executor::{
     BlockExecutionSummary,
     CompiledClassHashesForMigration,
@@ -37,14 +39,16 @@ use blockifier::transaction::transaction_execution::Transaction as BlockifierTra
 use indexmap::{IndexMap, IndexSet};
 #[cfg(test)]
 use mockall::automock;
-use starknet_api::block::{BlockHashAndNumber, BlockInfo};
+use starknet_api::block::{BlockHashAndNumber, BlockInfo, BlockNumber};
 use starknet_api::block_hash::block_hash_calculator::{
     calculate_block_commitments,
+    BlockCommitmentsMeasurements,
+    PartialBlockHash,
     PartialBlockHashComponents,
     TransactionHashingData,
 };
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
-use starknet_api::core::{ContractAddress, Nonce, SequencerContractAddress};
+use starknet_api::core::{ContractAddress, Nonce};
 use starknet_api::data_availability::L1DataAvailabilityMode;
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::state::ThinStateDiff;
@@ -53,6 +57,7 @@ use starknet_api::transaction::{TransactionHash, TransactionOffsetInBlock};
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, MutexGuard};
+use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::block_builder::FailOnErrorCause::L1HandlerTransactionValidationFailed;
@@ -61,7 +66,15 @@ use crate::metrics::{
     record_block_close_reason,
     BlockCloseReason,
     BATCHER_CLASS_CACHE_METRICS,
+    BLOCK_COMMITMENT_MEASUREMENTS_COUNT,
+    EVENT_COMMITMENT_COUNT,
+    EVENT_COMMITMENT_LATENCY,
     PROPOSER_DEFERRED_TXS,
+    RECEIPT_COMMITMENT_LATENCY,
+    STATE_DIFF_COMMITMENT_LATENCY,
+    STATE_DIFF_LENGTH,
+    TX_COMMITMENT_COUNT,
+    TX_COMMITMENT_LATENCY,
     VALIDATOR_WASTED_TXS,
 };
 use crate::pre_confirmed_block_writer::{CandidateTxSender, PreconfirmedTxSender};
@@ -141,26 +154,19 @@ impl BlockExecutionArtifacts {
         final_n_executed_txs: usize,
     ) -> Self {
         let l1_da_mode = L1DataAvailabilityMode::from_use_kzg_da(block_info.use_kzg_da);
-        let starknet_version = block_info.starknet_version;
         let transactions_data =
             prepare_txs_hashing_data(&execution_data.execution_infos_and_signatures);
-        let header_commitments = calculate_block_commitments(
+        // TODO(Ayelet): Remove the clones.
+        let (header_commitments, measurements) = calculate_block_commitments(
             &transactions_data,
-            commitment_state_diff_as_thin_state_diff(&commitment_state_diff),
+            ThinStateDiff::from(commitment_state_diff.clone()),
             l1_da_mode,
-            &starknet_version,
+            &block_info.starknet_version,
         )
         .await;
-        let partial_block_hash_components = PartialBlockHashComponents {
-            header_commitments,
-            block_number: block_info.block_number,
-            l1_gas_price: block_info.gas_prices.l1_gas_price_per_token(),
-            l1_data_gas_price: block_info.gas_prices.l1_data_gas_price_per_token(),
-            l2_gas_price: block_info.gas_prices.l2_gas_price_per_token(),
-            sequencer: SequencerContractAddress(block_info.sequencer_address),
-            timestamp: block_info.block_timestamp,
-            starknet_version,
-        };
+        record_and_log_block_commitment_measurements(block_info.block_number, measurements);
+        let partial_block_hash_components =
+            PartialBlockHashComponents::new(&block_info, header_commitments);
         let l2_gas_used = execution_data.l2_gas_used();
         Self {
             execution_data,
@@ -190,37 +196,22 @@ impl BlockExecutionArtifacts {
     }
 
     pub fn thin_state_diff(&self) -> ThinStateDiff {
-        commitment_state_diff_as_thin_state_diff(&self.commitment_state_diff)
+        // TODO(Ayelet): Remove the clones.
+        ThinStateDiff::from(self.commitment_state_diff.clone())
     }
 
     pub fn commitment(&self) -> ProposalCommitment {
         ProposalCommitment {
-            state_diff_commitment: self
-                .partial_block_hash_components
-                .header_commitments
-                .state_diff_commitment,
+            partial_block_hash: PartialBlockHash::from_partial_block_hash_components(
+                &self.partial_block_hash_components,
+            )
+            .expect("Unable to calculate the proposal commitment"),
         }
     }
 
     /// Returns the [PartialBlockHashComponents] based on the execution artifacts.
-    pub async fn partial_block_hash_components(&self) -> PartialBlockHashComponents {
+    pub fn partial_block_hash_components(&self) -> PartialBlockHashComponents {
         self.partial_block_hash_components.clone()
-    }
-}
-
-fn commitment_state_diff_as_thin_state_diff(
-    commitment_state_diff: &CommitmentStateDiff,
-) -> ThinStateDiff {
-    // TODO(Ayelet): Remove the clones.
-    ThinStateDiff {
-        deployed_contracts: commitment_state_diff.address_to_class_hash.clone(),
-        storage_diffs: commitment_state_diff.storage_updates.clone(),
-        class_hash_to_compiled_class_hash: commitment_state_diff
-            .class_hash_to_compiled_class_hash
-            .clone(),
-        nonces: commitment_state_diff.address_to_nonce.clone(),
-        // TODO(AlonH): Remove this when the structure of storage diffs changes.
-        deprecated_declared_classes: Vec::new(),
     }
 }
 
@@ -321,7 +312,13 @@ impl BlockBuilderTrait for BlockBuilder {
     async fn build_block(&mut self) -> BlockBuilderResult<BlockExecutionArtifacts> {
         let res = self.build_block_inner().await;
         if res.is_err() {
-            self.executor.lock().await.abort_block();
+            let executor = self.executor.clone();
+            spawn_blocking(move || {
+                let mut locked_executor = executor.blocking_lock();
+                locked_executor.abort_block();
+            })
+            .await
+            .expect("Aborting block should succeed.");
         }
         res
     }
@@ -367,7 +364,12 @@ impl BlockBuilder {
             // Check if the block is full. This is only relevant in propose mode.
             // In validate mode, this is ignored and we simply wait for the proposer to send the
             // final number of transactions in the block.
-            if !self.execution_params.is_validator && lock_executor(&self.executor).is_done() {
+            let executor = self.executor.clone();
+            if !self.execution_params.is_validator
+                && spawn_blocking(move || lock_executor(&executor).is_done())
+                    .await
+                    .expect("Checking completion should succeed.")
+            {
                 // Call `handle_executed_txs()` once more to get the last results.
                 self.handle_executed_txs().await?;
                 info!("Block is full.");
@@ -436,7 +438,7 @@ impl BlockBuilder {
 
         // Move a clone of the executor into the lambda function.
         let executor = self.executor.clone();
-        let block_summary = tokio::task::spawn_blocking(move || {
+        let block_summary = spawn_blocking(move || {
             lock_executor(&executor).close_block(final_n_executed_txs_nonopt)
         })
         .await
@@ -523,7 +525,12 @@ impl BlockBuilder {
 
         // Start the execution of the transactions on the worker pool.
         info!("Starting execution of {} transactions.", n_txs);
-        lock_executor(&self.executor).add_txs_to_block(executor_input_chunk.as_slice());
+        let executor = self.executor.clone();
+        spawn_blocking(move || {
+            lock_executor(&executor).add_txs_to_block(executor_input_chunk.as_slice())
+        })
+        .await
+        .expect("Adding txs to block should succeed.");
 
         if let Some(output_content_sender) = &self.output_content_sender {
             // Send the transactions to the validators.
@@ -538,7 +545,10 @@ impl BlockBuilder {
 
     /// Handles the transactions that were executed so far by the executor.
     async fn handle_executed_txs(&mut self) -> BlockBuilderResult<()> {
-        let results = lock_executor(&self.executor).get_new_results();
+        let executor = self.executor.clone();
+        let results = spawn_blocking(move || lock_executor(&executor).get_new_results())
+            .await
+            .expect("Getting new results should succeed.");
 
         if results.is_empty() {
             return Ok(());
@@ -620,6 +630,8 @@ impl BlockBuilder {
     }
 }
 
+// TODO(Tsabary): consider converting this to an async function and calling spawn_blocking
+// internally.
 fn lock_executor(
     executor: &Arc<Mutex<dyn TransactionExecutorTrait>>,
 ) -> MutexGuard<'_, dyn TransactionExecutorTrait> {
@@ -668,7 +680,7 @@ async fn collect_execution_results_and_stream_txs(
                 if let Some(ref revert_error) = tx_execution_info.revert_error {
                     warn!(
                         "Transaction {} is reverted during execution while still accepted. Revert \
-                         Error: {:?}",
+                         Error: {}",
                         input_tx.tx_hash(),
                         revert_error,
                     );
@@ -750,6 +762,7 @@ pub trait BlockBuilderFactoryTrait: Send + Sync {
         &self,
         block_metadata: BlockMetadata,
         execution_params: BlockBuilderExecutionParams,
+        native_classes_whitelist: NativeClassesWhitelist,
         tx_provider: Box<dyn TransactionProvider>,
         output_content_sender: Option<
             tokio::sync::mpsc::UnboundedSender<InternalConsensusTransaction>,
@@ -765,6 +778,7 @@ pub struct BlockBuilderFactory {
     pub storage_reader: StorageReader,
     pub contract_class_manager: ContractClassManager,
     pub class_manager_client: SharedClassManagerClient,
+    pub proof_manager_client: SharedProofManagerClient,
     pub worker_pool: BatcherWorkerPool,
 }
 
@@ -773,6 +787,7 @@ impl BlockBuilderFactory {
     fn preprocess_and_create_transaction_executor(
         &self,
         block_metadata: BlockMetadata,
+        native_classes_whitelist: NativeClassesWhitelist,
         runtime: tokio::runtime::Handle,
     ) -> BlockBuilderResult<ConcurrentTransactionExecutor<ApolloStateReaderAndContractManager>>
     {
@@ -795,9 +810,10 @@ impl BlockBuilderFactory {
         let class_reader = Some(ClassReader { reader: self.class_manager_client.clone(), runtime });
         let apollo_reader =
             ApolloReader::new_with_class_reader(self.storage_reader.clone(), height, class_reader);
-        let state_reader = StateReaderAndContractManager::new(
+        let state_reader = StateReaderAndContractManager::new_with_native_classes_whitelist(
             apollo_reader,
             self.contract_class_manager.clone(),
+            native_classes_whitelist,
             Some(BATCHER_CLASS_CACHE_METRICS),
         );
 
@@ -818,6 +834,7 @@ impl BlockBuilderFactoryTrait for BlockBuilderFactory {
         &self,
         block_metadata: BlockMetadata,
         execution_params: BlockBuilderExecutionParams,
+        native_classes_whitelist: NativeClassesWhitelist,
         tx_provider: Box<dyn TransactionProvider>,
         output_content_sender: Option<
             tokio::sync::mpsc::UnboundedSender<InternalConsensusTransaction>,
@@ -826,10 +843,15 @@ impl BlockBuilderFactoryTrait for BlockBuilderFactory {
         pre_confirmed_tx_sender: Option<PreconfirmedTxSender>,
         runtime: tokio::runtime::Handle,
     ) -> BlockBuilderResult<(Box<dyn BlockBuilderTrait>, AbortSignalSender)> {
-        let executor = self.preprocess_and_create_transaction_executor(block_metadata, runtime)?;
+        let executor = self.preprocess_and_create_transaction_executor(
+            block_metadata,
+            native_classes_whitelist,
+            runtime,
+        )?;
         let (abort_signal_sender, abort_signal_receiver) = tokio::sync::oneshot::channel();
         let transaction_converter = TransactionConverter::new(
             self.class_manager_client.clone(),
+            self.proof_manager_client.clone(),
             self.block_builder_config.chain_info.chain_id.clone(),
         );
         let block_builder = Box::new(BlockBuilder::new(
@@ -896,4 +918,69 @@ fn remove_last_set(set: &mut IndexSet<TransactionHash>, tx_hash: &TransactionHas
     if let Some((idx, _)) = set.swap_remove_full(tx_hash) {
         assert_eq!(idx, set.len(), "The removed txs must be the last ones.");
     }
+}
+
+fn record_and_log_block_commitment_measurements(
+    height: BlockNumber,
+    measurements: BlockCommitmentsMeasurements,
+) {
+    let usize_to_u64_warn_msg = "Conversion from usize to u64 should not fail.";
+
+    // Record the measurements.
+    BLOCK_COMMITMENT_MEASUREMENTS_COUNT.increment(1);
+
+    let tx_commitment_latency =
+        convert_microseconds_to_u64(measurements.transaction_commitment_duration);
+    let n_txs = u64::try_from(measurements.n_txs).expect(usize_to_u64_warn_msg);
+    TX_COMMITMENT_LATENCY.increment(tx_commitment_latency);
+    TX_COMMITMENT_COUNT.increment(n_txs);
+
+    let event_commitment_latency =
+        convert_microseconds_to_u64(measurements.event_commitment_duration);
+    let n_events = u64::try_from(measurements.n_events).expect(usize_to_u64_warn_msg);
+    EVENT_COMMITMENT_LATENCY.increment(event_commitment_latency);
+    EVENT_COMMITMENT_COUNT.increment(n_events);
+
+    let receipt_commitment_latency =
+        convert_microseconds_to_u64(measurements.receipt_commitment_duration);
+    RECEIPT_COMMITMENT_LATENCY.increment(receipt_commitment_latency);
+
+    let state_diff_commitment_latency =
+        convert_microseconds_to_u64(measurements.state_diff_commitment_duration);
+    let state_diff_length =
+        u64::try_from(measurements.state_diff_length).expect(usize_to_u64_warn_msg);
+    STATE_DIFF_COMMITMENT_LATENCY.increment(state_diff_commitment_latency);
+    STATE_DIFF_LENGTH.increment(state_diff_length);
+
+    // Log the measurements.
+    let height = height.0;
+    let tx_commitment_per_tx_latency_string =
+        if n_txs > 0 { format!("{} µs", tx_commitment_latency / n_txs) } else { "?".to_string() };
+    let event_commitment_per_event_latency_string = if n_events > 0 {
+        format!("{} µs", event_commitment_latency / n_events)
+    } else {
+        "?".to_string()
+    };
+    let state_diff_commitment_per_state_diff_length_latency_string = if state_diff_length > 0 {
+        format!("{} µs", state_diff_commitment_latency / state_diff_length)
+    } else {
+        "?".to_string()
+    };
+
+    debug!(
+        "Block {height} commitments latencies: tx/event/receipt/state_diff in µs: \
+         {tx_commitment_latency}/{event_commitment_latency}/{receipt_commitment_latency}/\
+         {state_diff_commitment_latency},
+        tx commitment per tx: {tx_commitment_per_tx_latency_string},
+        event commitment per event: {event_commitment_per_event_latency_string},
+        state diff commitment per state diff length: \
+         {state_diff_commitment_per_state_diff_length_latency_string}",
+    );
+}
+
+fn convert_microseconds_to_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or_else(|_| {
+        warn!("Failed to convert duration microseconds to u64.");
+        0
+    })
 }

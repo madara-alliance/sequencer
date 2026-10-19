@@ -1,6 +1,7 @@
 pub(crate) mod batcher;
 pub(crate) mod blockifier;
 pub(crate) mod class_manager;
+pub(crate) mod committer;
 pub(crate) mod consensus;
 pub(crate) mod gateway;
 pub(crate) mod http_server;
@@ -11,6 +12,7 @@ pub(crate) mod mempool_p2p;
 pub(crate) mod pod_metrics;
 pub(crate) mod reverts;
 pub(crate) mod sierra_compiler;
+pub(crate) mod staking;
 pub(crate) mod state_sync;
 pub(crate) mod storage;
 pub(crate) mod tokio;

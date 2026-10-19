@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use apollo_sizeof::SizeOf;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use starknet_types_core::felt::Felt;
-use strum_macros::EnumIter;
+use strum::EnumIter;
 
-use crate::block::{GasPrice, NonzeroGasPrice};
+use crate::block::{BlockHash, BlockNumber, GasPrice, NonzeroGasPrice};
+use crate::crypto::utils::HashChain;
 use crate::execution_resources::{GasAmount, GasVector};
 use crate::hash::StarkHash;
 use crate::serde_utils::PrefixedBytesAsHex;
@@ -615,39 +617,191 @@ impl AccountDeploymentData {
     }
 }
 
+// Represent the string `VIRTUAL_SNOS` as a Felt.
+pub const VIRTUAL_SNOS: Felt = Felt::from_hex_unchecked("0x5649525455414c5f534e4f53");
+
+// Represent the `PROOF_VERSION` marker as a Felt ('PROOF0').
+pub const PROOF_VERSION: Felt = Felt::from_hex_unchecked("0x50524f4f4630");
+
+/// The version of the virtual OS output (short string 'VIRTUAL_SNOS0').
+/// This must match the Cairo constant `VIRTUAL_OS_OUTPUT_VERSION` in `virtual_os_output.cairo`.
+pub const VIRTUAL_OS_OUTPUT_VERSION: Felt =
+    Felt::from_hex_unchecked("0x5649525455414c5f534e4f5330");
+
 /// Client-provided proof facts used for client-side proving.
 /// Only needed when the client supplies a proof; otherwise empty.
 #[derive(
     Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, SizeOf,
 )]
-pub struct ProofFacts(pub Vec<Felt>);
+pub struct ProofFacts(pub Arc<Vec<Felt>>);
 
 impl ProofFacts {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub fn hash(&self) -> Felt {
+        HashChain::new().chain_iter(self.0.iter()).get_poseidon_hash()
+    }
+}
+
+/// Represents the variants of proof facts associated with a transaction.
+///
+/// Currently, only SNOS proof facts are supported.
+/// The `Empty` variant indicates that the transaction does not utilize the client-side proving
+/// feature.
+pub enum ProofFactsVariant {
+    Empty,
+    Snos(SnosProofFacts),
+}
+
+impl TryFrom<&ProofFacts> for ProofFactsVariant {
+    type Error = StarknetApiError;
+    fn try_from(proof_facts: &ProofFacts) -> Result<Self, Self::Error> {
+        if proof_facts.0.is_empty() {
+            return Ok(ProofFactsVariant::Empty);
+        }
+
+        let Some(([proof_version, variant_marker], snos_fields)) =
+            proof_facts.0.split_at_checked(2)
+        else {
+            return Err(StarknetApiError::InvalidProofFacts(format!(
+                "Proof facts must have at least 2 fields, got {}",
+                proof_facts.0.len()
+            )));
+        };
+
+        // Validate that the first element is PROOF_VERSION.
+        if *proof_version != PROOF_VERSION {
+            return Err(StarknetApiError::InvalidProofFacts(format!(
+                "Expected first field to be {} (PROOF_VERSION), but got {}",
+                PROOF_VERSION, proof_version
+            )));
+        }
+
+        // Validate that the second element is VIRTUAL_SNOS.
+        if *variant_marker != VIRTUAL_SNOS {
+            return Err(StarknetApiError::InvalidProofFacts(format!(
+                "Non-SNOS proofs are not currently supported. Expected second field to be {} \
+                 (VIRTUAL_SNOS), but got {}",
+                VIRTUAL_SNOS, variant_marker
+            )));
+        }
+
+        let [program_hash, output_version, block_number_felt, block_hash, config_hash, ..] =
+            snos_fields
+        else {
+            return Err(StarknetApiError::InvalidProofFacts(format!(
+                "SNOS proof facts is too small with {} fields",
+                proof_facts.0.len()
+            )));
+        };
+
+        // TODO(Yoni): reuse VirtualOsOutput parsing.
+        let expected_version = VIRTUAL_OS_OUTPUT_VERSION;
+        if *output_version != expected_version {
+            return Err(StarknetApiError::InvalidProofFacts(format!(
+                "Expected SNOS proof facts version to be {} (VIRTUAL_OS_OUTPUT_VERSION), but got \
+                 {}",
+                expected_version, output_version
+            )));
+        }
+
+        let block_number = BlockNumber((*block_number_felt).try_into().map_err(|_| {
+            StarknetApiError::InvalidProofFacts(format!(
+                "Block number field is not a valid u64: {}",
+                block_number_felt
+            ))
+        })?);
+
+        Ok(ProofFactsVariant::Snos(SnosProofFacts {
+            proof_version: *proof_version,
+            program_hash: *program_hash,
+            block_number,
+            block_hash: BlockHash(*block_hash),
+            config_hash: *config_hash,
+        }))
+    }
+}
+
+/// Contains the required fields for valid SNOS proof facts.
+///
+/// A valid SNOS proof facts structure must include these fields as its first five entries.
+pub struct SnosProofFacts {
+    pub proof_version: Felt,
+    pub program_hash: StarkHash,
+    pub block_number: BlockNumber,
+    pub block_hash: BlockHash,
+    pub config_hash: StarkHash,
+}
+
+impl From<Vec<Felt>> for ProofFacts {
+    fn from(value: Vec<Felt>) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl TryFrom<ProofFacts> for SnosProofFacts {
+    type Error = StarknetApiError;
+    fn try_from(proof_facts: ProofFacts) -> Result<Self, Self::Error> {
+        match ProofFactsVariant::try_from(&proof_facts) {
+            Ok(ProofFactsVariant::Snos(snos_proof_facts)) => Ok(snos_proof_facts),
+            _ => Err(StarknetApiError::InvalidProofFacts(format!(
+                "Invalid SNOS proof facts: {proof_facts:?}",
+            ))),
+        }
+    }
 }
 
 /// Client-provided proof used for client-side proving.
+/// Serialized as a base64 string of big-endian u32 bytes.
 #[derive(
     Clone,
-    Debug,
     Default,
-    Deserialize,
     Eq,
     Hash,
     Ord,
     PartialEq,
     PartialOrd,
-    Serialize,
     SizeOf,
     derive_more::Deref,
     derive_more::From,
 )]
-pub struct Proof(pub Arc<Vec<u32>>);
+pub struct Proof(pub Arc<Vec<u8>>);
 
-impl From<Vec<u32>> for Proof {
-    fn from(value: Vec<u32>) -> Self {
+impl fmt::Debug for Proof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self.0.len();
+
+        if len == 0 { write!(f, "Proof([])") } else { write!(f, "Proof(<{} elements>)", len) }
+    }
+}
+
+impl Serialize for Proof {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::encode(&*self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Proof {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if s.is_empty() {
+            return Ok(Self::default());
+        }
+        let bytes = base64::decode(&s).map_err(serde::de::Error::custom)?;
+        Ok(Self(Arc::new(bytes)))
+    }
+}
+
+impl From<Vec<u8>> for Proof {
+    fn from(value: Vec<u8>) -> Self {
         Self(Arc::new(value))
+    }
+}
+
+impl Proof {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }

@@ -10,7 +10,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::{Poseidon, StarkHash as CoreStarkHash};
-use strum_macros::EnumIter;
+use strum::EnumIter;
 use time::OffsetDateTime;
 
 use crate::core::{
@@ -56,7 +56,7 @@ macro_rules! starknet_version_enum {
         $latest:ident
     ) => {
         /// A version of the Starknet protocol used when creating a block.
-        #[cfg_attr(any(test, feature = "testing"), derive(strum_macros::EnumIter))]
+        #[cfg_attr(any(test, feature = "testing"), derive(EnumIter))]
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
         pub enum StarknetVersion {
             $($variant,)+
@@ -121,8 +121,8 @@ starknet_version_enum! {
     (V0_13_6, 0, 13, 6),
     (V0_14_0, 0, 14, 0),
     (V0_14_1, 0, 14, 1),
-    (V0_15_0, 0, 15, 0),
-    V0_15_0
+    (V0_14_2, 0, 14, 2),
+    V0_14_2
 }
 
 impl Default for StarknetVersion {
@@ -286,6 +286,11 @@ pub enum BlockStatus {
 )]
 pub struct BlockHash(pub StarkHash);
 
+impl BlockHash {
+    // TODO(Amos): Use this anywhere the genesis parent block hash is used.
+    pub const GENESIS_PARENT_HASH: Self = Self(StarkHash::ZERO);
+}
+
 /// The number of a [Block](`crate::block::Block`).
 #[derive(
     Debug,
@@ -305,6 +310,8 @@ pub struct BlockHash(pub StarkHash);
 pub struct BlockNumber(pub u64);
 
 impl BlockNumber {
+    pub const ZERO: Self = Self(0);
+
     /// Returns the next block number, without checking if it's in range.
     pub fn unchecked_next(&self) -> BlockNumber {
         BlockNumber(self.0 + 1)
@@ -316,7 +323,7 @@ impl BlockNumber {
     }
 
     /// Returns the previous block number, or None if the previous block number is out of range.
-    pub fn prev(&self) -> Option<BlockNumber> {
+    pub const fn prev(&self) -> Option<BlockNumber> {
         match self.0 {
             0 => None,
             i => Some(BlockNumber(i - 1)),
@@ -420,7 +427,10 @@ impl GasPrice {
         Ok(self
             .checked_mul_u128(eth_to_fri_rate)
             .ok_or_else(|| {
-                StarknetApiError::GasPriceConversionError("Gas price is too high".to_string())
+                StarknetApiError::GasPriceConversionError(format!(
+                    "Gas price is too high: {:?}, eth to fri rate: {:?}",
+                    self, eth_to_fri_rate
+                ))
             })?
             .checked_div(WEI_PER_ETH)
             .expect("WEI_PER_ETH must be non-zero"))
@@ -428,7 +438,10 @@ impl GasPrice {
     pub fn fri_to_wei(self, eth_to_fri_rate: u128) -> Result<GasPrice, StarknetApiError> {
         self.checked_mul_u128(WEI_PER_ETH)
             .ok_or_else(|| {
-                StarknetApiError::GasPriceConversionError("Gas price is too high".to_string())
+                StarknetApiError::GasPriceConversionError(format!(
+                    "Gas price is too high: {:?}, eth to fri rate: {:?}",
+                    self, eth_to_fri_rate
+                ))
             })?
             .checked_div(eth_to_fri_rate)
             .ok_or_else(|| {

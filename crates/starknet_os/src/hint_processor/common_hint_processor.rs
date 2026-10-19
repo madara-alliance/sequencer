@@ -1,7 +1,6 @@
 use cairo_lang_casm::hints::StarknetHint;
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::BuiltinHintProcessor;
 use cairo_vm::hint_processor::hint_processor_definition::HintExtension;
-use cairo_vm::types::program::Program;
 use cairo_vm::vm::errors::hint_errors::HintError as VmHintError;
 use cairo_vm::vm::vm_core::VirtualMachine;
 use starknet_types_core::felt::Felt;
@@ -9,15 +8,13 @@ use starknet_types_core::felt::Felt;
 use crate::hint_processor::state_update_pointers::StateUpdatePointers;
 use crate::hints::enum_definition::AllHints;
 use crate::hints::error::OsHintResult;
-use crate::hints::types::HintArgs;
+use crate::hints::types::HintContext;
 
 pub(crate) type VmHintResultType<T> = Result<T, VmHintError>;
 pub(crate) type VmHintResult = VmHintResultType<()>;
 pub(crate) type VmHintExtensionResult = VmHintResultType<HintExtension>;
 
-pub(crate) trait CommonHintProcessor<'a> {
-    // The program being run. The hint processor does not require ownership.
-    fn get_program(&self) -> &'a Program;
+pub(crate) trait CommonHintProcessor {
     fn get_mut_state_update_pointers(&mut self) -> &mut Option<StateUpdatePointers>;
     // KZG fields.
     fn get_da_segment(&mut self) -> &mut Option<Vec<Felt>>;
@@ -25,6 +22,8 @@ pub(crate) trait CommonHintProcessor<'a> {
     // Indicates wether to create pages or not when serializing data-availability.
     fn get_serialize_data_availability_create_pages(&self) -> bool;
     fn get_builtin_hint_processor(&mut self) -> &mut BuiltinHintProcessor;
+    // Gets the public keys used for state diff encryption.
+    fn get_public_keys(&self) -> Option<&[Felt]>;
     // Gets the current randomness.
     fn get_rng(&mut self) -> &mut rand::rngs::StdRng;
     // For testing, track hint coverage.
@@ -40,7 +39,7 @@ pub(crate) trait CommonHintProcessor<'a> {
     fn execute_cairo0_unique_hint(
         &mut self,
         hint: &AllHints,
-        hint_args: HintArgs<'_>,
+        ctx: HintContext<'_>,
         _hint_str: &str,
     ) -> VmHintExtensionResult;
 
@@ -71,26 +70,26 @@ macro_rules! impl_common_hint_processor_logic {
         ) -> VmHintExtensionResult {
             if let Some(hint_processor_data) = hint_data.downcast_ref::<Cairo0Hint>() {
                 // AllHints (OS hint, aggregator hint, Cairo0 syscall) or Cairo0 core hint.
-                let hint_args = HintArgs {
+                let ctx = HintContext {
                     vm,
                     exec_scopes,
                     ids_data: &hint_processor_data.ids_data,
                     ap_tracking: &hint_processor_data.ap_tracking,
-                    constants: &self.program.constants,
+                    program: self.program,
                 };
                 let hint_str = hint_processor_data.code.as_str();
                 if let Ok(hint) = AllHints::from_str(hint_str) {
                     // OS hint, Cairo0 syscall.
                     return match hint {
                         AllHints::StatelessHint(stateless) => {
-                            stateless.execute_hint(self, hint_args)?;
+                            stateless.execute_hint(self, ctx)?;
                             Ok(HintExtension::default())
                         }
                         AllHints::CommonHint(common_hint) => {
-                            common_hint.execute_hint(self, hint_args)?;
+                            common_hint.execute_hint(self, ctx)?;
                             Ok(HintExtension::default())
                         }
-                        _ => self.execute_cairo0_unique_hint(&hint, hint_args, hint_str),
+                        _ => self.execute_cairo0_unique_hint(&hint, ctx, hint_str),
                     };
                 } else {
                     // Cairo0 core hint.
@@ -132,7 +131,7 @@ macro_rules! impl_common_hint_processor_logic {
                     execute_core_hint_base(vm, exec_scopes, &hint, no_temporary_segments)?;
                     Ok(HintExtension::default())
                 }
-                Cairo1Hint::Starknet(hint) => self.execute_cairo1_unique_hint(hint, vm),
+                Cairo1Hint::Starknet(hint) => self.execute_cairo1_unique_hint(&hint, vm),
                 Cairo1Hint::External(_) => {
                     panic!("starknet should never accept classes with external hints!")
                 }
@@ -144,10 +143,6 @@ macro_rules! impl_common_hint_processor_logic {
 #[macro_export]
 macro_rules! impl_common_hint_processor_getters {
     () => {
-        fn get_program(&self) -> &'program Program {
-            self.program
-        }
-
         fn get_mut_state_update_pointers(&mut self) -> &mut Option<StateUpdatePointers> {
             &mut self.state_update_pointers
         }

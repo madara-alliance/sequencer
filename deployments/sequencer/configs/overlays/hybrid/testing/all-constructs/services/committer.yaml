@@ -1,0 +1,40 @@
+# Committer service configuration with all constructs enabled
+include:
+  - configs/overlays/hybrid/testing/all-constructs/common.yaml
+
+name: committer
+
+metaLabels:
+  node-service-label: "true"
+
+# StatefulSet enabled (committer uses StatefulSet)
+statefulSet:
+  enabled: true
+  annotations:
+    statefulset-type: "committer"
+  labels: {}
+  podManagementPolicy: "OrderedReady"
+  updateStrategy:
+    type: "RollingUpdate"
+    rollingUpdate:
+      partition: null
+      maxUnavailable: null
+
+# Service with ports
+service:
+  enabled: true
+  type: ClusterIP
+  ports:
+  - name: committer
+    port: 55013
+    targetPort: 55013
+    protocol: TCP
+
+# PersistentVolume enabled for committer (StatefulSet needs storage)
+persistentVolume:
+  enabled: true
+  accessModes:
+    - ReadWriteOnce
+  mountPath: "/data"
+  size: "10Gi"
+  storageClass: ""

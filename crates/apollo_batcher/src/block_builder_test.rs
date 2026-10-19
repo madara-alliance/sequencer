@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use apollo_class_manager_types::transaction_converter::TransactionConverter;
 use apollo_class_manager_types::MockClassManagerClient;
 use apollo_l1_provider_types::InvalidValidationStatus;
 use apollo_l1_provider_types::InvalidValidationStatus::{
@@ -10,6 +9,8 @@ use apollo_l1_provider_types::InvalidValidationStatus::{
     ConsumedOnL1,
     NotFound,
 };
+use apollo_proof_manager_types::MockProofManagerClient;
+use apollo_transaction_converter::TransactionConverter;
 use assert_matches::assert_matches;
 use blockifier::blockifier::transaction_executor::{
     BlockExecutionSummary,
@@ -701,6 +702,7 @@ async fn run_build_block(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(deadline_secs);
     let transaction_converter = TransactionConverter::new(
         Arc::new(MockClassManagerClient::new()),
+        Arc::new(MockProofManagerClient::new()),
         CHAIN_ID_FOR_TESTS.clone(),
     );
     let mut block_builder = BlockBuilder::new(

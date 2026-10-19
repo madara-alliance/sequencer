@@ -1,11 +1,12 @@
 use apollo_batcher::metrics::{
     BATCHER_CLASS_CACHE_METRICS,
+    L2_GAS_IN_LAST_BLOCK,
     NUM_TRANSACTION_IN_BLOCK,
     PROVING_GAS_IN_LAST_BLOCK,
     SIERRA_GAS_IN_LAST_BLOCK,
 };
 use apollo_gateway::metrics::GATEWAY_CLASS_CACHE_METRICS;
-use apollo_metrics::metrics::{MetricQueryName, MetricScope};
+use apollo_metrics::metrics::MetricQueryName;
 use blockifier::metrics::{
     CacheMetrics,
     BLOCKIFIER_METRIC_RATE_DURATION,
@@ -15,21 +16,15 @@ use blockifier::metrics::{
     TOTAL_CALLS,
 };
 
-use crate::dashboard::{Panel, PanelType, Row};
+use crate::dashboard::Row;
+use crate::panel::{Panel, PanelType};
 
 const DENOMINATOR_DIVISOR_FOR_READABILITY: f64 = 1_000_000_000.0;
 
-// TODO(MatanL/Shahak): use clamp_min(X, 1) on denom to avoid division by zero.
 fn get_panel_blockifier_state_reader_class_cache_miss_ratio(
     class_cache_metrics: &CacheMetrics,
 ) -> Panel {
     let scope = class_cache_metrics.get_scope();
-    // TODO(Arni): Share this code.
-    let scope = match scope {
-        MetricScope::Batcher => "Batcher",
-        MetricScope::Gateway => "Gateway",
-        _ => unreachable!("Scope of class cache metrics must be Batcher or Gateway. Got {scope:?}"),
-    };
     let name = format!("Class Cache Miss in {scope}");
     let description = format!(
         "The ratio of cache misses when requesting compiled classes from the Blockifier State \
@@ -44,7 +39,6 @@ fn get_panel_blockifier_state_reader_class_cache_miss_ratio(
     )
 }
 
-// TODO(MatanL/Shahak): use clamp_min(X, 1) on denom to avoid division by zero.
 fn get_panel_blockifier_state_reader_native_class_returned_ratio() -> Panel {
     let class_cache_metrics = BATCHER_CLASS_CACHE_METRICS;
 
@@ -112,6 +106,19 @@ fn get_panel_proving_gas_in_last_block() -> Panel {
     )
 }
 
+fn get_panel_l2_gas_used_in_last_block() -> Panel {
+    Panel::new(
+        "Average L2 Gas Usage in Block",
+        "The average L2 gas usage in block (10m window)",
+        format!(
+            "avg_over_time({}[10m])/{}",
+            L2_GAS_IN_LAST_BLOCK.get_name_with_filter(),
+            DENOMINATOR_DIVISOR_FOR_READABILITY
+        ),
+        PanelType::TimeSeries,
+    )
+}
+
 pub(crate) fn get_blockifier_row() -> Row {
     Row::new(
         "Blockifier",
@@ -125,6 +132,7 @@ pub(crate) fn get_blockifier_row() -> Row {
             get_panel_transactions_per_block(),
             get_panel_sierra_gas_in_last_block(),
             get_panel_proving_gas_in_last_block(),
+            get_panel_l2_gas_used_in_last_block(),
         ],
     )
 }

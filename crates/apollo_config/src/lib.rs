@@ -53,11 +53,14 @@ use const_format::formatcp;
 use dumping::REQUIRED_PARAM_DESCRIPTION_PREFIX;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use strum::Display;
 use validator::ValidationError;
 use validators::ParsedValidationErrors;
 
 /// Arg name for providing a configuration file.
 pub const CONFIG_FILE_ARG_NAME: &str = "config_file";
+/// Short arg name for providing a configuration file.
+pub const CONFIG_FILE_SHORT_ARG_NAME: char = 'f';
 /// The config file arg name prepended with a double dash.
 pub const CONFIG_FILE_ARG: &str = formatcp!("--{}", CONFIG_FILE_ARG_NAME);
 
@@ -71,18 +74,19 @@ pub type ParamPath = String;
 /// A description of a configuration parameter.
 pub type Description = String;
 
+/// Behavior mode configuration for the node.
+pub mod behavior_mode;
+mod command;
 #[cfg(test)]
 mod config_test;
-#[cfg(any(feature = "testing", test))]
-/// Utilities for the produced configuration.
-pub mod test_utils;
-
-mod command;
 pub mod converters;
 pub mod dumping;
 pub mod loading;
 pub mod presentation;
 pub mod secrets;
+#[cfg(any(feature = "testing", test))]
+/// Utilities for the produced configuration.
+pub mod test_utils;
 pub mod validators;
 
 /// The privacy level of a config parameter, that received as input from the configs.
@@ -176,7 +180,7 @@ impl SerializedParam {
 }
 
 /// A serialized type of a configuration parameter.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, strum_macros::Display)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Display)]
 #[allow(missing_docs)]
 pub enum SerializationType {
     Boolean,

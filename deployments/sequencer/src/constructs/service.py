@@ -1,0 +1,154 @@
+import typing
+
+from imports import k8s
+from src.constructs.base import BaseConstruct
+
+
+class ServiceConstruct(BaseConstruct):
+    def __init__(
+        self,
+        scope,
+        id: str,
+        service_config,
+        labels,
+        monitoring_endpoint_port,
+        service_name_suffix: str | None = None,
+        service_spec=None,
+    ):
+        super().__init__(
+            scope,
+            id,
+            service_config,
+            labels,
+            monitoring_endpoint_port,
+        )
+        self.service_name_suffix = service_name_suffix
+        self.service_spec_override = service_spec
+
+        self.service = self._create_service()
+
+    def _create_service(self) -> k8s.KubeService:
+        # Use override if provided (for extra services), otherwise use primary service
+        service_spec = (
+            self.service_spec_override
+            if self.service_spec_override is not None
+            else self.service_config.service
+        )
+
+        if service_spec is None:
+            raise ValueError(
+                f"Service spec is required for service {self.service_config.name}. "
+                f"Please define service.ports or provide a valid service spec."
+            )
+
+        # Generate service name
+        service_name = f"sequencer-{self.service_config.name}-service"
+        if self.service_name_suffix:
+            service_name = (
+                f"sequencer-{self.service_config.name}-{self.service_name_suffix}-service"
+            )
+
+        # Merge Service labels with common labels, ensuring common labels take precedence
+        service_labels = (
+            {**service_spec.labels, **self.labels}
+            if service_spec and service_spec.labels
+            else self.labels
+        )
+
+        return k8s.KubeService(
+            self,
+            "service",
+            metadata=k8s.ObjectMeta(
+                name=service_name,
+                labels=service_labels,
+                annotations=self._get_service_annotations(service_spec),
+            ),
+            spec=k8s.ServiceSpec(
+                type=self._get_service_type(service_spec),
+                ports=self._get_service_ports(service_spec),
+                selector=self.labels,
+                cluster_ip=service_spec.clusterIP or None,
+                external_i_ps=service_spec.externalIPs or None,
+                load_balancer_ip=service_spec.loadBalancerIP or None,
+                load_balancer_source_ranges=service_spec.loadBalancerSourceRanges or None,
+                session_affinity=service_spec.sessionAffinity or "None",
+            ),
+        )
+
+    def _get_service_annotations(self, service_spec) -> typing.Dict[str, str]:
+        """Merge custom annotations and GKE-specific internal/external hints."""
+        annotations = dict(service_spec.annotations or {})
+        svc_type = service_spec.type
+
+        # Example: automatically annotate internal load balancers for GKE
+        if svc_type == "LoadBalancer" and getattr(service_spec, "internal", False):
+            annotations.update(
+                {
+                    "cloud.google.com/load-balancer-type": "Internal",
+                    "networking.gke.io/internal-load-balancer-allow-global-access": "true",
+                }
+            )
+
+        # Add external DNS hostname if defined
+        external_dns = getattr(service_spec, "external_dns_name", None)
+        if external_dns:
+            annotations["external-dns.alpha.kubernetes.io/hostname"] = external_dns
+
+        return annotations
+
+    def _get_service_type(self, service_spec) -> str:
+        """Get Kubernetes service type, normalized to standard values."""
+        svc_type = service_spec.type or "ClusterIP"
+        # Normalize to Kubernetes standard service types
+        svc_type_lower = svc_type.lower()
+        if svc_type_lower in ["loadbalancer", "lb"]:
+            return "LoadBalancer"
+        elif svc_type_lower in ["nodeport", "np"]:
+            return "NodePort"
+        elif svc_type_lower in ["clusterip", "cluster", ""]:
+            return "ClusterIP"
+        else:
+            # If already correctly formatted, return as-is
+            if svc_type in ["LoadBalancer", "NodePort", "ClusterIP"]:
+                return svc_type
+            raise ValueError(
+                f"Unknown service type: {svc_type}. Valid types: LoadBalancer, NodePort, ClusterIP"
+            )
+
+    def _get_service_ports(self, service_spec) -> typing.List[k8s.ServicePort]:
+        """Convert Pydantic ports list into Kubernetes ServicePort objects with sane defaults.
+
+        Ports are now already merged from common into service_config.
+        """
+        ports: list[k8s.ServicePort] = []
+
+        # Ports are already merged from common into service_config
+        for p in service_spec.ports:
+            # Validate required "port"
+            if p.port is None:
+                raise ValueError(
+                    f"Service port entry is missing 'port' (service: {getattr(self.service_config, 'name', '<unknown>')})"
+                )
+
+            # Default targetPort to port if not provided
+            target = p.targetPort if getattr(p, "targetPort", None) is not None else p.port
+
+            # Build IntOrString for targetPort
+            if isinstance(target, (int, float)):
+                target_ios = k8s.IntOrString.from_number(int(target))
+            else:
+                # allow named port like "http" or "monitoring"
+                target_ios = k8s.IntOrString.from_string(str(target))
+
+            ports.append(
+                k8s.ServicePort(
+                    name=p.name,
+                    port=int(p.port),
+                    target_port=target_ios,
+                    protocol=(p.protocol or "TCP"),
+                )
+            )
+
+        # Sort ports by name to ensure consistent ordering
+        ports.sort(key=lambda p: p.name or "")
+        return ports

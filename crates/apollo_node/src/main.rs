@@ -1,12 +1,20 @@
 use std::env::args;
+use std::time::Duration;
 
 use apollo_infra::metrics::{metrics_recorder, MetricsConfig};
 use apollo_infra::trace_util::configure_tracing;
 use apollo_infra_utils::set_global_allocator;
 use apollo_node::servers::run_component_servers;
+use apollo_node::signal_handling::{
+    handle_signals,
+    GracefulShutdownBehavior,
+    GracefulShutdownCallback,
+};
 use apollo_node::utils::create_node_modules;
 use apollo_node_config::config_utils::load_and_validate_config;
-use tracing::info;
+use futures::FutureExt;
+use tokio::time::sleep;
+use tracing::{error, info};
 
 set_global_allocator!();
 
@@ -19,6 +27,12 @@ fn set_exit_process_on_panic() {
     }));
 }
 
+// Graceful shutdown duration limit is vendor dependent, 30 seconds in GKE. We set the graceful
+// shutdown period to be of 20 seconds, which suffice for all purposes as well as keeping a margin
+// from the vendor threshold.
+const GRACEFUL_SHUTDOWN_DURATION_MS: u64 = 20_000;
+
+// TODO(Tsabary): Do we need a return type for `main`?
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     configure_tracing().await;
@@ -34,8 +48,26 @@ async fn main() -> anyhow::Result<()> {
     // Clients are currently unused, but should not be dropped.
     let (_clients, servers) = create_node_modules(&config, prometheus_handle, cli_args).await;
 
+    let sigterm_cb: GracefulShutdownCallback = Box::new(|| {
+        async move {
+            info!("Graceful shutdown future started");
+            sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DURATION_MS)).await;
+            info!("Graceful shutdown future completed");
+        }
+        .boxed()
+    });
+
+    let graceful_shutdown = GracefulShutdownBehavior::new().with_sigterm(sigterm_cb);
+
     info!("START_UP: Starting components!");
-    run_component_servers(servers).await;
+    tokio::select! {
+        _ = run_component_servers(servers) => {
+            error!("Shutting down: Servers ended unexpectedly!");
+        }
+        _ = handle_signals(graceful_shutdown) => {
+            error!("Shutting down: Signal received and logged");
+        }
+    }
 
     // TODO(Tsabary): Add graceful shutdown.
     Ok(())

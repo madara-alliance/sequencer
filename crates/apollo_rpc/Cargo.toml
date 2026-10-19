@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license-file.workspace = true
+description = "JSON-RPC server implementation for Starknet API."
 
 [dependencies]
 anyhow.workspace = true
@@ -16,11 +17,9 @@ apollo_storage.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 cairo-lang-starknet-classes.workspace = true
-ethers.workspace = true
 flate2.workspace = true
 hex.workspace = true
-hyper = { workspace = true, features = ["full"] }
-jsonrpsee = { workspace = true, features = ["full"] }
+jsonrpsee = { workspace = true, features = ["http-client", "macros", "server"] }
 lazy_static.workspace = true
 metrics.workspace = true
 papyrus_common.workspace = true
@@ -43,7 +42,7 @@ assert_matches.workspace = true
 cairo-lang-casm.workspace = true
 cairo-lang-starknet-classes.workspace = true
 camelpaste.workspace = true
-derive_more.workspace = true
+derive_more = { workspace = true, features = ["display"] }
 enum-iterator.workspace = true
 indexmap = { workspace = true, features = ["serde"] }
 insta = { workspace = true, features = ["json"] }
@@ -59,8 +58,7 @@ rand_chacha.workspace = true
 reqwest.workspace = true
 starknet-core.workspace = true
 starknet_api = { workspace = true, features = ["testing"] }
-strum.workspace = true
-strum_macros.workspace = true
+strum = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

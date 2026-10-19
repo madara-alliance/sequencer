@@ -16,7 +16,7 @@ pub fn validate_ascii(name: &impl ToString) -> Result<(), ValidationError> {
 }
 
 /// Custom validation for file or directory path existence.
-pub(crate) fn validate_path_exists(file_path: &Path) -> Result<(), ValidationError> {
+pub fn validate_path_exists(file_path: &Path) -> Result<(), ValidationError> {
     if !file_path.exists() {
         let mut error = ValidationError::new("file or directory not found");
         error.message = Some(
@@ -39,7 +39,7 @@ pub fn validate_vec_u256(vec: &[u8]) -> Result<(), ValidationError> {
 pub fn validate_optional_sensitive_vec_u256(
     secret_key: &Sensitive<Vec<u8>>,
 ) -> Result<(), ValidationError> {
-    validate_vec_u256(secret_key.as_ref())
+    validate_vec_u256(secret_key.peek_secret())
 }
 
 /// Struct for parsing a validation error.

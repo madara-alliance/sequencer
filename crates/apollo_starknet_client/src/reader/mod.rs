@@ -27,6 +27,7 @@ use starknet_types_core::felt::Felt;
 use tracing::{debug, error, instrument};
 use url::Url;
 
+use crate::reader::objects::block::BlockStatus;
 pub use crate::reader::objects::block::{
     Block,
     BlockSignatureData,
@@ -69,6 +70,8 @@ pub enum ReaderClientError {
     TransactionReceiptsError(#[from] TransactionReceiptsError),
     #[error("Invalid transaction: {:?}, error: {:?}.", tx_hash, msg)]
     BadTransaction { tx_hash: TransactionHash, msg: String },
+    #[error("Aborted block {:?}.", block_number)]
+    AbortedBlock { block_number: BlockNumber },
 }
 
 pub type ReaderClientResult<T> = Result<T, ReaderClientError>;
@@ -166,18 +169,16 @@ impl StarknetUrls {
         let base_url = Url::parse(url_str)?;
         Ok(StarknetUrls {
             get_block: base_url.join(GET_BLOCK_URL)?,
-            // Query the pending block since the feeder-gateway uses the `latest` block by default.
             get_contract_by_hash: base_url
                 .join(GET_CONTRACT_BY_HASH_URL)?
                 .query_pairs_mut()
-                .append_pair(BLOCK_NUMBER_QUERY, PENDING_BLOCK_ID)
+                .append_pair(BLOCK_NUMBER_QUERY, LATEST_BLOCK_NUMBER)
                 .finish()
                 .clone(),
-            // Query the pending block since the feeder-gateway uses the `latest` block by default.
             get_compiled_class_by_class_hash: base_url
                 .join(GET_COMPILED_CLASS_BY_CLASS_HASH_URL)?
                 .query_pairs_mut()
-                .append_pair(BLOCK_NUMBER_QUERY, PENDING_BLOCK_ID)
+                .append_pair(BLOCK_NUMBER_QUERY, LATEST_BLOCK_NUMBER)
                 .finish()
                 .clone(),
             get_state_update: base_url.join(GET_STATE_UPDATE_URL)?,
@@ -228,7 +229,7 @@ impl StarknetFeederGatewayClient {
         only_header: bool,
     ) -> ReaderClientResult<String> {
         let block_number =
-            block_number.map(|bn| bn.to_string()).unwrap_or(String::from(LATEST_BLOCK_NUMBER));
+            block_number.map_or(String::from(LATEST_BLOCK_NUMBER), |bn| bn.to_string());
 
         let mut get_block_url = self.urls.get_block.clone();
         get_block_url.query_pairs_mut().append_pair(BLOCK_NUMBER_QUERY, block_number.as_str());
@@ -245,11 +246,20 @@ impl StarknetFeederGatewayClient {
         block_number: Option<BlockNumber>,
     ) -> ReaderClientResult<Option<Block>> {
         let response = self.request_block_raw(block_number, false).await;
-        load_object_from_response(
+        let block = load_object_from_response(
             response,
             Some(KnownStarknetErrorCode::BlockNotFound),
             format!("Failed to get block number {block_number:?} from starknet server."),
-        )
+        )?;
+        if let Some(Block::PostV0_13_1(block_data)) = block.as_ref() {
+            if matches!(block_data.status, BlockStatus::Aborted) {
+                debug!("Aborted block {:?}; returning error for retry.", block_data.block_number);
+                return Err(ReaderClientError::AbortedBlock {
+                    block_number: block_data.block_number,
+                });
+            }
+        }
+        Ok(block)
     }
 
     // TODO(shahak): reduce code duplication with request_block.
@@ -463,6 +473,7 @@ fn load_object_from_response<Object: for<'a> Deserialize<'a>>(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum GenericContractClass {
     Cairo0ContractClass(DeprecatedContractClass),
     Cairo1ContractClass(ContractClass),

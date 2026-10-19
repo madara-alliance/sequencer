@@ -1,4 +1,5 @@
 use apollo_sizeof::SizeOf;
+use expect_test::expect;
 use rstest::rstest;
 use starknet_types_core::felt::Felt;
 
@@ -18,6 +19,8 @@ use crate::transaction::fields::{
     AccountDeploymentData,
     ContractAddressSalt,
     PaymasterData,
+    Proof,
+    ProofFacts,
     Tip,
     TransactionSignature,
 };
@@ -57,8 +60,8 @@ fn create_deploy_account_tx() -> RpcTransaction {
     })
 }
 
-fn create_invoke_tx() -> RpcTransaction {
-    rpc_invoke_tx(InvokeTxArgs {
+fn base_invoke_tx_args() -> InvokeTxArgs {
+    InvokeTxArgs {
         resource_bounds: valid_resource_bounds_for_testing(),
         calldata: calldata![felt!("0x1"), felt!("0x2")],
         sender_address: contract_address!("0x1"),
@@ -66,6 +69,18 @@ fn create_invoke_tx() -> RpcTransaction {
         paymaster_data: PaymasterData(vec![Felt::TWO, Felt::ZERO]),
         account_deployment_data: AccountDeploymentData(vec![felt!("0x1")]),
         ..Default::default()
+    }
+}
+
+fn create_invoke_tx() -> RpcTransaction {
+    rpc_invoke_tx(base_invoke_tx_args())
+}
+
+fn create_invoke_tx_with_client_side_proving() -> RpcTransaction {
+    rpc_invoke_tx(InvokeTxArgs {
+        proof_facts: ProofFacts::snos_proof_facts_for_testing(),
+        proof: Proof::proof_for_testing(),
+        ..base_invoke_tx_args()
     })
 }
 
@@ -73,6 +88,7 @@ fn create_invoke_tx() -> RpcTransaction {
 #[rstest]
 #[case(create_declare_tx())]
 #[case(create_deploy_account_tx())]
+#[case(create_invoke_tx_with_client_side_proving())]
 #[case(create_invoke_tx())]
 fn test_rpc_transactions(#[case] tx: RpcTransaction) {
     let serialized = serde_json::to_string(&tx).unwrap();
@@ -107,7 +123,10 @@ fn test_deploy_account_tx_size_of() {
         // + tx_v3.paymaster_data.dynamic_size();
 
         // Check the size of the V3 deploy account transaction.
-        assert_eq!(tx_v3.size_bytes(), 432);
+        expect![[r#"
+            432
+        "#]]
+        .assert_debug_eq(&tx_v3.size_bytes());
     } else {
         panic!("Expected RpcTransaction::DeployAccount");
     }
@@ -115,7 +134,7 @@ fn test_deploy_account_tx_size_of() {
 
 #[test]
 fn test_invoke_tx_size_of() {
-    let tx = create_invoke_tx();
+    let tx = create_invoke_tx_with_client_side_proving();
     if let RpcTransaction::Invoke(invoke_tx) = tx {
         let RpcInvokeTransaction::V3(tx_v3) = invoke_tx;
 
@@ -137,10 +156,14 @@ fn test_invoke_tx_size_of() {
         // + tx_v3.fee_data_availability_mode.dynamic_size()
         // + tx_v3.paymaster_data.dynamic_size()
         // + tx_v3.account_deployment_data.dynamic_size();
-        // + tx_v3.proof_facts.dynamic_size();
+        // + tx_v3.proof_facts.dynamic_size()
+        // + tx_v3.proof.dynamic_size();
 
         // Check the size of the V3 invoke transaction.
-        assert_eq!(tx_v3.size_bytes(), 480);
+        expect![[r#"
+            774
+        "#]]
+        .assert_debug_eq(&tx_v3.size_bytes());
     } else {
         panic!("Expected RpcTransaction::Invoke");
     }

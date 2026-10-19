@@ -15,10 +15,11 @@ pub struct VersionedConstants {
     /// The minimum gas price in fri.
     pub min_gas_price: GasPrice,
     /// The maximum block size in gas units.
-    // NOTE: Must stay in sync with BouncerWeights sierra gas.
+    // NOTE: Must stay in sync with BouncerWeights receipt_l2_gas.
     // NOTE: When max_block_size is changed, update `gas_target` accordingly to maintain the ratio.
     pub max_block_size: GasAmount,
-    /// The target gas usage per block.
+    /// The target gas usage per block. Used by EIP-1559 to calculate the next block's gas price.
+    // Target is 60% of max_block_size, making price adjustment more responsive to congestion.
     pub gas_target: GasAmount,
     /// The margin for the eth to fri rate disagreement, expressed as a percentage (parts per
     /// hundred).
@@ -32,7 +33,7 @@ define_versioned_constants!(
     "resources/versioned_constants_diff_regression",
     (V0_14_0, "../resources/orchestrator_versioned_constants_0_14_0.json"),
     (V0_14_1, "../resources/orchestrator_versioned_constants_0_14_1.json"),
-    (V0_15_0, "../resources/orchestrator_versioned_constants_0_15_0.json"),
+    (V0_14_2, "../resources/orchestrator_versioned_constants_0_14_2.json"),
 );
 
 /// Error type for the Consensus' versioned constants.

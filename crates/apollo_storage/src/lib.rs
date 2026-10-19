@@ -78,7 +78,6 @@
 
 pub mod base_layer;
 pub mod block_hash;
-pub mod block_hash_marker;
 pub mod body;
 pub mod class;
 pub mod class_hash;
@@ -86,6 +85,7 @@ pub mod class_manager;
 pub mod compiled_class;
 pub mod consensus;
 pub mod global_root;
+pub mod global_root_marker;
 #[allow(missing_docs)]
 pub mod metrics;
 pub mod partial_block_hash;
@@ -100,6 +100,8 @@ mod serialization;
 pub mod state;
 /// Storage reader server framework for handling remote storage queries.
 pub mod storage_reader_server;
+/// Storage reader request and response types.
+pub mod storage_reader_types;
 mod version;
 
 mod deprecated;
@@ -112,6 +114,9 @@ mod open_storage_test;
 
 #[cfg(any(feature = "testing", test))]
 pub mod test_utils;
+
+#[cfg(any(feature = "testing", test))]
+pub mod storage_reader_server_test_utils;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -136,6 +141,7 @@ use mmap_file::{
     Reader,
     Writer,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use starknet_api::block::{BlockHash, BlockNumber, BlockSignature, StarknetVersion};
 use starknet_api::block_hash::block_hash_calculator::PartialBlockHashComponents;
@@ -168,6 +174,12 @@ use crate::header::StorageBlockHeader;
 use crate::metrics::{register_metrics, STORAGE_COMMIT_LATENCY};
 use crate::mmap_file::MMapFileStats;
 use crate::state::data::IndexedDeprecatedContractClass;
+use crate::storage_reader_server::{
+    create_storage_reader_server,
+    ServerConfig,
+    StorageReaderServer,
+    StorageReaderServerHandler,
+};
 use crate::version::{VersionStorageReader, VersionStorageWriter};
 
 // For more details on the storage version, see the module documentation.
@@ -183,12 +195,22 @@ pub fn open_storage(
     open_storage_internal(storage_config, None)
 }
 
-/// Same as [`open_storage`], but also updates the given metric for the number of open readers.
-pub fn open_storage_with_metric(
+/// Same as [`open_storage`], but also updates the given metric for the number of open readers and
+/// creates a storage reader server.
+pub fn open_storage_with_metric_and_server<RequestHandler, Request, Response>(
     storage_config: StorageConfig,
     open_readers_metric: &'static MetricGauge,
-) -> StorageResult<(StorageReader, StorageWriter)> {
-    open_storage_internal(storage_config, Some(open_readers_metric))
+    storage_reader_server_config: ServerConfig,
+) -> StorageResult<StorageWithServer<RequestHandler, Request, Response>>
+where
+    RequestHandler: StorageReaderServerHandler<Request, Response>,
+    Request: Serialize + DeserializeOwned + Send + 'static,
+    Response: Serialize + DeserializeOwned + Send + 'static,
+{
+    let (reader, writer) = open_storage_internal(storage_config, Some(open_readers_metric))?;
+    let storage_reader_server =
+        create_storage_reader_server(reader.clone(), storage_reader_server_config);
+    Ok((reader, writer, storage_reader_server))
 }
 
 fn open_storage_internal(
@@ -594,6 +616,39 @@ impl<'env, Mode: TransactionKind> StorageTxn<'env, Mode> {
         }
         Ok(self.txn.open_table(table_id)?)
     }
+
+    /// Returns the location of the state diff in the mmap file for the given block number.
+    pub fn get_state_diff_location(
+        &self,
+        block_number: BlockNumber,
+    ) -> StorageResult<Option<LocationInFile>> {
+        let state_diffs_table = self.open_table(&self.tables.state_diffs)?;
+        Ok(state_diffs_table.get(&self.txn, &block_number)?)
+    }
+
+    /// Returns the thin state diff stored in the mmap file at the given location.
+    pub fn get_state_diff_from_location(
+        &self,
+        state_diff_location: LocationInFile,
+    ) -> StorageResult<ThinStateDiff> {
+        self.file_handlers.get_thin_state_diff_unchecked(state_diff_location)
+    }
+
+    /// Returns the nonce for a contract at a given address and block number.
+    pub fn get_nonce(
+        &self,
+        contract_address: ContractAddress,
+        block_number: BlockNumber,
+    ) -> StorageResult<Option<Nonce>> {
+        let nonces_table = self.open_table(&self.tables.nonces)?;
+        Ok(nonces_table.get(&self.txn, &(contract_address, block_number))?)
+    }
+
+    /// Returns the file offset for a given offset kind.
+    pub fn get_file_offset(&self, offset_kind: OffsetKind) -> StorageResult<Option<usize>> {
+        let table = self.open_table(&self.tables.file_offsets)?;
+        Ok(table.get(&self.txn, &offset_kind)?)
+    }
 }
 
 /// Returns the names of the tables in the storage.
@@ -657,8 +712,9 @@ macro_rules! struct_field_names {
 }
 use struct_field_names;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TransactionMetadata {
+/// Metadata about a transaction stored in the database.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionMetadata {
     tx_hash: TransactionHash,
     tx_location: LocationInFile,
     tx_output_location: LocationInFile,
@@ -686,6 +742,8 @@ pub enum StorageError {
     EventNotFound { event_index: EventIndex, from_address: ContractAddress },
     #[error("DB in inconsistent state: {msg:?}.")]
     DBInconsistency { msg: String },
+    #[error("{resource_type} not found: {resource_id}")]
+    NotFound { resource_type: String, resource_id: String },
     /// Errors related to the underlying files.
     #[error(transparent)]
     MMapFileError(#[from] MMapFileError),
@@ -713,6 +771,11 @@ pub enum StorageError {
 
 /// A type alias that maps to std::result::Result<T, StorageError>.
 pub type StorageResult<V> = std::result::Result<V, StorageError>;
+
+/// A type alias for the return type of storage operations that include an optional storage reader
+/// server.
+pub type StorageWithServer<RequestHandler, Request, Response> =
+    (StorageReader, StorageWriter, Option<StorageReaderServer<RequestHandler, Request, Response>>);
 
 /// A struct for the configuration of the storage.
 #[allow(missing_docs)]
@@ -756,19 +819,30 @@ pub struct DbStats {
 // - Body <= Header
 // - BaseLayerBlock <= Header
 // Event is currently unsupported.
-pub(crate) enum MarkerKind {
+/// Represents different types of markers that track progress in the storage.
+pub enum MarkerKind {
+    /// Marks the last written block header.
     Header,
+    /// Marks the last written block body.
     Body,
+    /// Marks the last written event.
     Event,
+    /// Marks the last written state diff.
     State,
+    /// Marks the last written class.
     Class,
+    /// Marks the last written compiled class.
     CompiledClass,
+    /// Marks the last written base layer block.
     BaseLayerBlock,
+    /// Marks the last written class manager block.
     ClassManagerBlock,
     /// Marks the block beyond the last block that its classes can't be compiled with the current
     /// compiler version used in the class manager. Determined by starknet version.
     CompilerBackwardCompatibility,
-    BlockHash,
+    // TODO(Dori): fill in the missing doc.
+    #[allow(missing_docs)]
+    GlobalRoot,
 }
 
 pub(crate) type MarkersTable<'env> =

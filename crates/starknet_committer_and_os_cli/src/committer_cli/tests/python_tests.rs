@@ -12,10 +12,15 @@ use starknet_committer::block_committer::input::{
 };
 use starknet_committer::block_committer::random_structs::DummyRandomValue;
 use starknet_committer::db::external_test_utils::single_tree_flow_test;
+use starknet_committer::db::facts_db::{FactDbFilledNode, FactsNodeLayout};
 use starknet_committer::forest::filled_forest::FilledForest;
-use starknet_committer::hash_function::hash::TreeHashFunctionImpl;
+use starknet_committer::hash_function::hash::{
+    TreeHashFunctionImpl,
+    CONTRACT_CLASS_LEAF_V0,
+    CONTRACT_STATE_HASH_VERSION,
+};
 use starknet_committer::patricia_merkle_tree::leaf::leaf_impl::ContractState;
-use starknet_committer::patricia_merkle_tree::tree::OriginalSkeletonStorageTrieConfig;
+use starknet_committer::patricia_merkle_tree::tree::OriginalSkeletonTrieConfig;
 use starknet_committer::patricia_merkle_tree::types::CompiledClassHash;
 use starknet_patricia::patricia_merkle_tree::filled_tree::node::FilledNode;
 use starknet_patricia::patricia_merkle_tree::node_data::inner_node::{
@@ -25,9 +30,10 @@ use starknet_patricia::patricia_merkle_tree::node_data::inner_node::{
     NodeData,
     PathToBottom,
 };
+use starknet_patricia::patricia_merkle_tree::node_data::leaf::Leaf;
 use starknet_patricia::patricia_merkle_tree::types::SubTreeHeight;
-use starknet_patricia_storage::db_object::{DBObject, EmptyKeyContext};
-use starknet_patricia_storage::errors::DeserializationError;
+use starknet_patricia_storage::db_object::{DBObject, EmptyKeyContext, HasStaticPrefix};
+use starknet_patricia_storage::errors::{DeserializationError, SerializationError};
 use starknet_patricia_storage::map_storage::MapStorage;
 use starknet_patricia_storage::storage_trait::{DbKey, DbValue, Storage};
 use starknet_types_core::felt::Felt;
@@ -77,6 +83,8 @@ pub enum CommitterSpecificTestError {
     InvalidCastError(#[from] std::num::TryFromIntError),
     #[error(transparent)]
     DeserializationTestFailure(#[from] DeserializationError),
+    #[error(transparent)]
+    Serialization(#[from] SerializationError),
 }
 
 /// Implements conversion from a string to the test runner.
@@ -157,11 +165,17 @@ impl PythonTestRunner for CommitterPythonTestRunner {
                 let TreeFlowInput { leaf_modifications, mut storage, root_hash } =
                     serde_json::from_str(Self::non_optional_input(input)?)?;
                 // 2. Run the test.
-                let output = single_tree_flow_test::<StarknetStorageValue, TreeHashFunctionImpl>(
+                let dummy_contract_address = ContractAddress::from(0_u128);
+                let output = single_tree_flow_test::<
+                    StarknetStorageValue,
+                    FactsNodeLayout,
+                    TreeHashFunctionImpl,
+                >(
                     leaf_modifications,
                     &mut storage,
                     root_hash,
-                    OriginalSkeletonStorageTrieConfig::new(false),
+                    OriginalSkeletonTrieConfig::new_for_classes_or_storage_trie(false),
+                    &dummy_contract_address,
                 )
                 .await;
                 // 3. Serialize and return output.
@@ -191,8 +205,17 @@ fn serialize_for_rust_committer_flow_test(input: HashMap<String, String>) -> Str
     let TreeFlowInput { leaf_modifications, storage, root_hash } =
         parse_input_single_storage_tree_flow_test(&input);
     // Serialize the leaf modifications to an object that can be JSON-serialized.
-    let leaf_modifications_to_print: HashMap<String, Vec<u8>> =
-        leaf_modifications.into_iter().map(|(k, v)| (k.0.to_string(), v.serialize().0)).collect();
+    let leaf_modifications_to_print: HashMap<String, Vec<u8>> = leaf_modifications
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k.0.to_string(),
+                v.serialize()
+                    .unwrap_or_else(|error| panic!("Failed to serialize storage leaf: {error}"))
+                    .0,
+            )
+        })
+        .collect();
 
     // Create a json string to compare with the expected string in python.
     serde_json::to_string(&json!(
@@ -264,16 +287,20 @@ pub(crate) fn test_binary_serialize_test(binary_input: HashMap<String, u128>) ->
 
     // Create binary data from the left and right values.
     let binary_data = BinaryData {
-        left_hash: HashOutput(Felt::from(*left)),
-        right_hash: HashOutput(Felt::from(*right)),
+        left_data: HashOutput(Felt::from(*left)),
+        right_data: HashOutput(Felt::from(*right)),
     };
 
     // Create a filled node (irrelevant leaf type) with binary data and zero hash.
-    let filled_node: FilledNode<StarknetStorageValue> =
-        FilledNode { data: NodeData::Binary(binary_data), hash: HashOutput(Felt::ZERO) };
+    let filled_node: FactDbFilledNode<StarknetStorageValue> = FactDbFilledNode(FilledNode {
+        data: NodeData::Binary(binary_data),
+        hash: HashOutput(Felt::ZERO),
+    });
 
     // Serialize the binary node and insert it into the map under the key "value".
-    let value = filled_node.serialize();
+    let value = filled_node
+        .serialize()
+        .unwrap_or_else(|error| panic!("Failed to serialize filled node: {error}"));
     map.insert("value".to_string(), value.0);
 
     // Serialize the map to a JSON string and handle serialization errors.
@@ -288,7 +315,7 @@ pub(crate) fn parse_input_test(committer_input: String) -> CommitterPythonTestRe
 }
 
 fn create_output_to_python(
-    CommitterFactsDbInputImpl { input: actual_input, storage }: CommitterFactsDbInputImpl,
+    CommitterFactsDbInputImpl { input: actual_input, storage, .. }: CommitterFactsDbInputImpl,
 ) -> String {
     let (storage_keys_hash, storage_values_hash) = hash_storage(&storage);
     let (state_diff_keys_hash, state_diff_values_hash) = hash_state_diff(&actual_input.state_diff);
@@ -402,6 +429,14 @@ fn xor_hash(x: &[u8], y: &[u8]) -> Vec<u8> {
     x.iter().zip(y.iter()).map(|(a, b)| a ^ b).collect()
 }
 
+pub fn db_key<L: Leaf>(
+    node: &FactDbFilledNode<L>,
+    key_context: &<L as HasStaticPrefix>::KeyContext,
+) -> DbKey {
+    let suffix = node.0.hash.0.to_bytes_be();
+    node.get_db_key(key_context, &suffix)
+}
+
 /// Creates and serializes storage keys for different node types.
 ///
 /// This function generates and serializes storage keys for various node types, including binary
@@ -413,38 +448,40 @@ fn xor_hash(x: &[u8], y: &[u8]) -> Vec<u8> {
 /// A JSON string representing the serialized storage keys for different node types.
 pub(crate) fn test_node_db_key() -> String {
     let zero = Felt::ZERO;
-
+    let dummy_contract_address = ContractAddress::from(0_u128);
     // Generate keys for different node types.
     let hash = HashOutput(zero);
 
-    let binary_node: FilledNode<StarknetStorageValue> = FilledNode {
-        data: NodeData::Binary(BinaryData { left_hash: hash, right_hash: hash }),
+    let binary_node: FactDbFilledNode<StarknetStorageValue> = FactDbFilledNode(FilledNode {
+        data: NodeData::Binary(BinaryData { left_data: hash, right_data: hash }),
         hash,
-    };
-    let binary_node_key = binary_node.db_key(&EmptyKeyContext).0;
+    });
+    let binary_node_key = db_key(&binary_node, &dummy_contract_address).0;
 
-    let edge_node: FilledNode<StarknetStorageValue> = FilledNode {
-        data: NodeData::Edge(EdgeData { bottom_hash: hash, path_to_bottom: Default::default() }),
+    let edge_node: FactDbFilledNode<StarknetStorageValue> = FactDbFilledNode(FilledNode {
+        data: NodeData::Edge(EdgeData { bottom_data: hash, path_to_bottom: Default::default() }),
         hash,
-    };
+    });
 
-    let edge_node_key = edge_node.db_key(&EmptyKeyContext).0;
+    let edge_node_key = db_key(&edge_node, &dummy_contract_address).0;
 
-    let storage_leaf = FilledNode { data: NodeData::Leaf(StarknetStorageValue(zero)), hash };
-    let storage_leaf_key = storage_leaf.db_key(&EmptyKeyContext).0;
+    let storage_leaf =
+        FactDbFilledNode(FilledNode { data: NodeData::Leaf(StarknetStorageValue(zero)), hash });
+    let storage_leaf_key = db_key(&storage_leaf, &dummy_contract_address).0;
 
-    let state_tree_leaf = FilledNode {
+    let state_tree_leaf = FactDbFilledNode(FilledNode {
         data: NodeData::Leaf(ContractState {
             class_hash: ClassHash(zero),
             storage_root_hash: HashOutput(zero),
             nonce: Nonce(zero),
         }),
         hash,
-    };
-    let state_tree_leaf_key = state_tree_leaf.db_key(&EmptyKeyContext).0;
+    });
+    let state_tree_leaf_key = db_key(&state_tree_leaf, &EmptyKeyContext).0;
 
-    let compiled_class_leaf = FilledNode { data: NodeData::Leaf(CompiledClassHash(zero)), hash };
-    let compiled_class_leaf_key = compiled_class_leaf.db_key(&EmptyKeyContext).0;
+    let compiled_class_leaf =
+        FactDbFilledNode(FilledNode { data: NodeData::Leaf(CompiledClassHash(zero)), hash });
+    let compiled_class_leaf_key = db_key(&compiled_class_leaf, &EmptyKeyContext).0;
 
     // Store keys in a HashMap.
     let mut map: HashMap<String, Vec<u8>> = HashMap::new();
@@ -478,10 +515,8 @@ pub(crate) async fn storage_serialize_test() -> CommitterPythonTestResult {
 fn python_hash_constants_compare() -> String {
     format!(
         "[{:?}, {:?}]",
-        TreeHashFunctionImpl::CONTRACT_STATE_HASH_VERSION.to_bytes_be(),
-        Felt::from_hex(TreeHashFunctionImpl::CONTRACT_CLASS_LEAF_V0).expect(
-        "could not parse hex string corresponding to b'CONTRACT_CLASS_LEAF_V0' to Felt",
-        ).to_bytes_be()
+        CONTRACT_STATE_HASH_VERSION.to_bytes_be(),
+        CONTRACT_CLASS_LEAF_V0.to_bytes_be()
     )
 }
 
@@ -503,31 +538,39 @@ fn python_hash_constants_compare() -> String {
 async fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult {
     // Create a storage to store the nodes.
     let mut rust_fact_storage = MapStorage::default();
+    let dummy_contract_address = ContractAddress::from(0_u128);
 
     // Parse the binary node data from the input.
     let binary_json = get_or_key_not_found(&data, "binary")?;
     let binary_data: HashMap<String, u128> = serde_json::from_str(binary_json)?;
 
     // Create a binary node from the parsed data.
-    let binary_rust: FilledNode<StarknetStorageValue> = FilledNode {
+    let binary_rust: FactDbFilledNode<StarknetStorageValue> = FactDbFilledNode(FilledNode {
         data: NodeData::Binary(BinaryData {
-            left_hash: HashOutput(Felt::from(*get_or_key_not_found(&binary_data, "left")?)),
-            right_hash: HashOutput(Felt::from(*get_or_key_not_found(&binary_data, "right")?)),
+            left_data: HashOutput(Felt::from(*get_or_key_not_found(&binary_data, "left")?)),
+            right_data: HashOutput(Felt::from(*get_or_key_not_found(&binary_data, "right")?)),
         }),
         hash: HashOutput(Felt::from(*get_or_key_not_found(&binary_data, "hash")?)),
-    };
+    });
 
     // Store the binary node in the storage.
-    rust_fact_storage.set(binary_rust.db_key(&EmptyKeyContext), binary_rust.serialize()).await?;
+    rust_fact_storage
+        .set(
+            db_key(&binary_rust, &dummy_contract_address),
+            binary_rust.serialize().map_err(|error| {
+                PythonTestError::SpecificError(CommitterSpecificTestError::Serialization(error))
+            })?,
+        )
+        .await?;
 
     // Parse the edge node data from the input.
     let edge_json = get_or_key_not_found(&data, "edge")?;
     let edge_data: HashMap<String, u128> = serde_json::from_str(edge_json)?;
 
     // Create an edge node from the parsed data.
-    let edge_rust: FilledNode<StarknetStorageValue> = FilledNode {
+    let edge_rust: FactDbFilledNode<StarknetStorageValue> = FactDbFilledNode(FilledNode {
         data: NodeData::Edge(EdgeData {
-            bottom_hash: HashOutput(Felt::from(*get_or_key_not_found(&edge_data, "bottom")?)),
+            bottom_data: HashOutput(Felt::from(*get_or_key_not_found(&edge_data, "bottom")?)),
             path_to_bottom: PathToBottom::new(
                 U256::from(*get_or_key_not_found(&edge_data, "path")?).into(),
                 EdgePathLength::new(
@@ -542,27 +585,39 @@ async fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTest
             .expect("Illegal PathToBottom"),
         }),
         hash: HashOutput(Felt::from(*get_or_key_not_found(&edge_data, "hash")?)),
-    };
+    });
 
     // Store the edge node in the storage.
-    rust_fact_storage.set(edge_rust.db_key(&EmptyKeyContext), edge_rust.serialize()).await?;
+    rust_fact_storage
+        .set(
+            db_key(&edge_rust, &dummy_contract_address),
+            edge_rust.serialize().map_err(|error| {
+                PythonTestError::SpecificError(CommitterSpecificTestError::Serialization(error))
+            })?,
+        )
+        .await?;
 
     // Parse the storage leaf data from the input.
     let storage_leaf_json = get_or_key_not_found(&data, "storage")?;
     let storage_leaf_data: HashMap<String, u128> = serde_json::from_str(storage_leaf_json)?;
 
     // Create a storage leaf node from the parsed data.
-    let storage_leaf_rust = FilledNode {
+    let storage_leaf_rust = FactDbFilledNode(FilledNode {
         data: NodeData::Leaf(StarknetStorageValue(Felt::from(*get_or_key_not_found(
             &storage_leaf_data,
             "value",
         )?))),
         hash: HashOutput(Felt::from(*get_or_key_not_found(&storage_leaf_data, "hash")?)),
-    };
+    });
 
     // Store the storage leaf node in the storage.
     rust_fact_storage
-        .set(storage_leaf_rust.db_key(&EmptyKeyContext), storage_leaf_rust.serialize())
+        .set(
+            db_key(&storage_leaf_rust, &dummy_contract_address),
+            storage_leaf_rust.serialize().map_err(|error| {
+                PythonTestError::SpecificError(CommitterSpecificTestError::Serialization(error))
+            })?,
+        )
         .await?;
 
     // Parse the contract state leaf data from the input.
@@ -571,7 +626,7 @@ async fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTest
         serde_json::from_str(contract_state_leaf)?;
 
     // Create a contract state leaf node from the parsed data.
-    let contract_state_leaf_rust = FilledNode {
+    let contract_state_leaf_rust = FactDbFilledNode(FilledNode {
         data: NodeData::Leaf(ContractState {
             class_hash: ClassHash(Felt::from(*get_or_key_not_found(
                 &contract_state_leaf_data,
@@ -585,13 +640,15 @@ async fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTest
         }),
 
         hash: HashOutput(Felt::from(*get_or_key_not_found(&contract_state_leaf_data, "hash")?)),
-    };
+    });
 
     // Store the contract state leaf node in the storage.
     rust_fact_storage
         .set(
-            contract_state_leaf_rust.db_key(&EmptyKeyContext),
-            contract_state_leaf_rust.serialize(),
+            db_key(&contract_state_leaf_rust, &EmptyKeyContext),
+            contract_state_leaf_rust.serialize().map_err(|error| {
+                PythonTestError::SpecificError(CommitterSpecificTestError::Serialization(error))
+            })?,
         )
         .await?;
 
@@ -601,19 +658,21 @@ async fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTest
         serde_json::from_str(compiled_class_leaf)?;
 
     // Create a compiled class leaf node from the parsed data.
-    let compiled_class_leaf_rust = FilledNode {
+    let compiled_class_leaf_rust = FactDbFilledNode(FilledNode {
         data: NodeData::Leaf(CompiledClassHash(Felt::from(*get_or_key_not_found(
             &compiled_class_leaf_data,
             "compiled_class_hash",
         )?))),
         hash: HashOutput(Felt::from(*get_or_key_not_found(&compiled_class_leaf_data, "hash")?)),
-    };
+    });
 
     // Store the compiled class leaf node in the storage.
     rust_fact_storage
         .set(
-            compiled_class_leaf_rust.db_key(&EmptyKeyContext),
-            compiled_class_leaf_rust.serialize(),
+            db_key(&compiled_class_leaf_rust, &EmptyKeyContext),
+            compiled_class_leaf_rust.serialize().map_err(|error| {
+                PythonTestError::SpecificError(CommitterSpecificTestError::Serialization(error))
+            })?,
         )
         .await?;
 
@@ -624,7 +683,9 @@ async fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTest
 /// Generates a dummy random filled forest and serializes it to a JSON string.
 pub(crate) async fn filled_forest_output_test() -> CommitterPythonTestResult {
     let dummy_forest = SerializedForest(FilledForest::dummy_random(&mut rand::thread_rng(), None));
-    let output = dummy_forest.forest_to_output().await;
+    let output = dummy_forest.forest_to_output().await.map_err(|error| {
+        PythonTestError::SpecificError(CommitterSpecificTestError::Serialization(error))
+    })?;
     let output_string = serde_json::to_string(&output).expect("Failed to serialize");
     Ok(output_string)
 }

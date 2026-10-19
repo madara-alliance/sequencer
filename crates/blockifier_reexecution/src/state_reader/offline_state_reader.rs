@@ -16,6 +16,7 @@ use blockifier::state::state_reader_and_contract_manager::{
     FetchCompiledClasses,
     StateReaderAndContractManager,
 };
+use blockifier::state::utils::get_compiled_class_hash_v2 as default_get_compiled_class_hash_v2;
 use blockifier::transaction::transaction_execution::Transaction as BlockifierTransaction;
 use serde::{Deserialize, Serialize};
 use starknet_api::block::{BlockHash, BlockHashAndNumber, BlockInfo, BlockNumber, StarknetVersion};
@@ -33,7 +34,7 @@ use crate::state_reader::reexecution_state_reader::{
     ReexecutionStateReader,
 };
 use crate::state_reader::rpc_state_reader::StarknetContractClassMapping;
-use crate::utils::{get_chain_info, ReexecutionStateMaps};
+use crate::utils::get_chain_info;
 
 pub struct OfflineReexecutionData {
     offline_state_reader_prev_block: OfflineStateReader,
@@ -53,7 +54,7 @@ pub struct SerializableDataNextBlock {
 
 #[derive(Serialize, Deserialize)]
 pub struct SerializableDataPrevBlock {
-    pub state_maps: ReexecutionStateMaps,
+    pub state_maps: StateMaps,
     pub contract_class_mapping: StarknetContractClassMapping,
 }
 
@@ -100,11 +101,8 @@ impl From<SerializableOfflineReexecutionData> for OfflineReexecutionData {
             old_block_hash,
         } = value;
 
-        let offline_state_reader_prev_block = OfflineStateReader {
-            state_maps: state_maps.try_into().expect("Failed to deserialize state maps."),
-            contract_class_mapping,
-            old_block_hash,
-        };
+        let offline_state_reader_prev_block =
+            OfflineStateReader { state_maps, contract_class_mapping, old_block_hash };
 
         // Use the declared classes from the next block to allow retrieving the class info.
         let transactions_next_block =
@@ -112,12 +110,16 @@ impl From<SerializableOfflineReexecutionData> for OfflineReexecutionData {
                 .api_txs_to_blockifier_txs_next_block(transactions_next_block)
                 .expect("Failed to convert starknet-api transactions to blockifier transactions.");
 
+        // Disable casm hash migration for reexecution.
+        let mut versioned_constants = VersionedConstants::get(&starknet_version).unwrap().clone();
+        versioned_constants.enable_casm_hash_migration = false;
+
         Self {
             offline_state_reader_prev_block,
             block_context_next_block: BlockContext::new(
                 block_info_next_block,
-                get_chain_info(&chain_id),
-                VersionedConstants::get(&starknet_version).unwrap().clone(),
+                get_chain_info(&chain_id, None),
+                versioned_constants,
                 BouncerConfig::max(),
             ),
             transactions_next_block,
@@ -173,12 +175,16 @@ impl StateReader for OfflineStateReader {
         }
     }
 
-    fn get_compiled_class_hash(&self, class_hash: ClassHash) -> StateResult<CompiledClassHash> {
-        Ok(*self
-            .state_maps
-            .compiled_class_hashes
-            .get(&class_hash)
-            .ok_or(StateError::UndeclaredClassHash(class_hash))?)
+    fn get_compiled_class_hash(&self, _class_hash: ClassHash) -> StateResult<CompiledClassHash> {
+        unimplemented!("The offline state reader does not support get_compiled_class_hash.")
+    }
+
+    fn get_compiled_class_hash_v2(
+        &self,
+        class_hash: ClassHash,
+        compiled_class: &RunnableCompiledClass,
+    ) -> StateResult<CompiledClassHash> {
+        default_get_compiled_class_hash_v2(self, class_hash, compiled_class)
     }
 }
 

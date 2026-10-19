@@ -64,6 +64,12 @@ const RESERVED_CONTRACT_ADDRESS = 0x3;
 // The block number -> block hash mapping is written for the current block number minus this number.
 const STORED_BLOCK_HASH_BUFFER = 10;
 
+// Allowed virtual OS program hashes for client-side proving.
+const ALLOWED_VIRTUAL_OS_PROGRAM_HASHES_0 = (
+    0x03e98c2d7703b03a7edb73ed7f075f97f1dcbaa8f717cdf6e1a57bf058265473
+);
+const ALLOWED_VIRTUAL_OS_PROGRAM_HASHES_LEN = 1;
+
 // Gas constants.
 
 const STEP_GAS_COST = 100;
@@ -77,11 +83,12 @@ const POSEIDON_GAS_COST = 491;
 const ADD_MOD_GAS_COST = 230;
 const MUL_MOD_GAS_COST = 604;
 const ECDSA_GAS_COST = 10561;
+const BLAKE_GAS_COST = 3334;
 const MEMORY_HOLE_GAS_COST = 10;
 
 const DEFAULT_INITIAL_GAS_COST = 10000000000;
 const VALIDATE_MAX_SIERRA_GAS = 100000000;
-const EXECUTE_MAX_SIERRA_GAS = 1000000000;
+const EXECUTE_MAX_SIERRA_GAS = 1100000000;
 const DEFAULT_INITIAL_GAS_COST_NO_L2 = VALIDATE_MAX_SIERRA_GAS + EXECUTE_MAX_SIERRA_GAS;
 
 // Compiler gas costs.
@@ -103,8 +110,8 @@ const GET_EXECUTION_INFO_GAS_COST = 12640;
 const LIBRARY_CALL_GAS_COST = 89160;
 const REPLACE_CLASS_GAS_COST = 10670;
 // TODO(Yoni, 1/1/2026): take into account Patricia updates and dict squash.
-const STORAGE_READ_GAS_COST = 10000;
-const STORAGE_WRITE_GAS_COST = 10000;
+const STORAGE_READ_GAS_COST = 18070;
+const STORAGE_WRITE_GAS_COST = 44970;
 const EMIT_EVENT_GAS_COST = 10000;
 const SEND_MESSAGE_TO_L1_GAS_COST = 14470;
 const META_TX_V0_GAS_COST = 167950;

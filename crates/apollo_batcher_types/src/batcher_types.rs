@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::ops::Deref;
 
 use blockifier::blockifier::transaction_executor::CompiledClassHashesForMigration;
 use blockifier::bouncer::{BouncerWeights, CasmHashComputationData};
@@ -7,10 +8,9 @@ use blockifier::transaction::objects::TransactionExecutionInfo;
 use chrono::prelude::*;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use starknet_api::block::{BlockHashAndNumber, BlockHeader, BlockInfo, BlockNumber};
-use starknet_api::block_hash::block_hash_calculator::BlockHeaderCommitments;
+use starknet_api::block::{BlockHashAndNumber, BlockInfo, BlockNumber};
+use starknet_api::block_hash::block_hash_calculator::{BlockHeaderCommitments, PartialBlockHash};
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
-use starknet_api::core::StateDiffCommitment;
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::state::ThinStateDiff;
 use starknet_api::transaction::TransactionHash;
@@ -36,9 +36,10 @@ pub struct ProposalId(pub u64);
 
 pub type Round = u32;
 
-#[derive(Clone, Debug, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Commitment identifying a proposed block (its partial block hash).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProposalCommitment {
-    pub state_diff_commitment: StateDiffCommitment,
+    pub partial_block_hash: PartialBlockHash,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,10 +67,47 @@ pub struct GetProposalContentResponse {
     pub content: GetProposalContent,
 }
 
+/// Artifact-derived fields for a finished proposal. Use with
+/// [`FinishedProposalInfo::new`] to build the full info.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FinishedProposalInfoWithoutParent {
+    pub proposal_commitment: ProposalCommitment,
+    pub final_n_executed_txs: usize,
+    pub block_header_commitments: BlockHeaderCommitments,
+    pub l2_gas_used: GasAmount,
+}
+
+/// Information returned when block building has finished (proposer or validator).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FinishedProposalInfo {
+    #[serde(flatten)]
+    pub artifact: FinishedProposalInfoWithoutParent,
+    // None for the first block
+    pub parent_proposal_commitment: Option<ProposalCommitment>,
+}
+
+impl Deref for FinishedProposalInfo {
+    type Target = FinishedProposalInfoWithoutParent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.artifact
+    }
+}
+
+impl FinishedProposalInfo {
+    /// Builds [`FinishedProposalInfo`] from artifact-derived fields and the parent commitment.
+    pub fn new(
+        artifact_derived: FinishedProposalInfoWithoutParent,
+        parent_proposal_commitment: Option<ProposalCommitment>,
+    ) -> Self {
+        Self { artifact: artifact_derived, parent_proposal_commitment }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GetProposalContent {
     Txs(Vec<InternalConsensusTransaction>),
-    Finished { id: ProposalCommitment, final_n_executed_txs: usize },
+    Finished(FinishedProposalInfo),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,16 +156,14 @@ pub struct DecisionReachedResponse {
     // TODO(Yael): Consider passing the state_diff as CommitmentStateDiff inside CentralObjects.
     // Today the ThinStateDiff is used for the state sync but it may not be needed in the future.
     pub state_diff: ThinStateDiff,
-    pub l2_gas_used: GasAmount,
     pub central_objects: CentralObjects,
-    pub block_header_commitments: BlockHeaderCommitments,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ProposalStatus {
     Processing,
     // Only sent in response to `Finish`.
-    Finished(ProposalCommitment),
+    Finished(FinishedProposalInfo),
     // Only sent in response to `Abort`.
     Aborted,
     // May be caused due to handling of a previous item of the new proposal.
@@ -148,22 +184,6 @@ pub struct DecisionReachedInput {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RevertBlockInput {
     pub height: BlockNumber,
-}
-
-// TODO(Dean): Fill in with actual storage table names and operations.
-/// Storage-related requests for the batcher.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum BatcherStorageRequest {
-    /// Request to read data in Table1 for the given block height.
-    Table1Replacer(BlockNumber),
-}
-
-// TODO(Dean): Fill in with actual response types matching the request variants.
-/// Response for batcher storage requests.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum BatcherStorageResponse {
-    /// Table1 data for the requested operation.
-    Table1Replacer(BlockHeader),
 }
 
 pub type BatcherResult<T> = Result<T, BatcherError>;

@@ -7,8 +7,8 @@ fn required_cairo_native_version_test() {
     let cairo_native_version = ROOT_TOML
         .dependencies()
         .filter_map(|(name, value)| match (name.as_str(), value) {
-            ("cairo-native", DependencyValue::Object { version, .. }) => version.as_ref(),
-            ("cairo-native", DependencyValue::String(version)) => Some(version),
+            ("cairo-native", DependencyValue::String(version)) => Some(version.as_str()),
+            ("cairo-native", DependencyValue::Object { version, .. }) => version.as_deref(),
             _ => None,
         })
         .next()

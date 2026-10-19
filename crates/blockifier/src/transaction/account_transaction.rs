@@ -1,20 +1,21 @@
 use std::sync::Arc;
 
 use starknet_api::abi::abi_utils::selector_from_name;
-use starknet_api::block::GasPriceVector;
+use starknet_api::block::{BlockNumber, GasPriceVector};
 use starknet_api::calldata;
 use starknet_api::contract_class::EntryPointType;
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector, Nonce};
+use starknet_api::core::{ContractAddress, EntryPointSelector, Nonce, OsChainInfo};
 use starknet_api::data_availability::DataAvailabilityMode;
 use starknet_api::executable_transaction::{AccountTransaction as Transaction, TransactionType};
 use starknet_api::execution_resources::GasAmount;
+use starknet_api::state::StorageKey;
 use starknet_api::transaction::fields::Resource::{L1DataGas, L1Gas, L2Gas};
 use starknet_api::transaction::fields::{
-    AccountDeploymentData,
     AllResourceBounds,
     Calldata,
     Fee,
     PaymasterData,
+    ProofFactsVariant,
     Tip,
     TransactionSignature,
     ValidResourceBounds,
@@ -23,6 +24,8 @@ use starknet_api::transaction::{constants, TransactionHash, TransactionVersion};
 use starknet_types_core::felt::Felt;
 
 use super::errors::ResourceBoundsError;
+use crate::abi::constants::STORED_BLOCK_HASH_BUFFER;
+use crate::blockifier_versioned_constants::OsConstants;
 use crate::context::{BlockContext, GasCounter, TransactionContext};
 use crate::execution::call_info::CallInfo;
 use crate::execution::common_hints::ExecutionMode;
@@ -133,7 +136,8 @@ impl AccountTransaction {
         (nonce, Nonce),
         (nonce_data_availability_mode, DataAvailabilityMode),
         (fee_data_availability_mode, DataAvailabilityMode),
-        (paymaster_data, PaymasterData)
+        (paymaster_data, PaymasterData),
+        (tx_type, TransactionType)
     );
 
     pub fn new_with_default_flags(tx: Transaction) -> Self {
@@ -148,31 +152,6 @@ impl AccountTransaction {
             strict_nonce_check: true,
         };
         AccountTransaction { tx, execution_flags }
-    }
-
-    pub fn class_hash(&self) -> Option<ClassHash> {
-        match &self.tx {
-            Transaction::Declare(tx) => Some(tx.tx.class_hash()),
-            Transaction::DeployAccount(tx) => Some(tx.tx.class_hash()),
-            Transaction::Invoke(_) => None,
-        }
-    }
-
-    pub fn account_deployment_data(&self) -> Option<AccountDeploymentData> {
-        match &self.tx {
-            Transaction::Declare(tx) => Some(tx.tx.account_deployment_data().clone()),
-            Transaction::DeployAccount(_) => None,
-            Transaction::Invoke(tx) => Some(tx.tx.account_deployment_data().clone()),
-        }
-    }
-
-    // TODO(nir, 01/11/2023): Consider instantiating CommonAccountFields in AccountTransaction.
-    pub fn tx_type(&self) -> TransactionType {
-        match &self.tx {
-            Transaction::Declare(_) => TransactionType::Declare,
-            Transaction::DeployAccount(_) => TransactionType::DeployAccount,
-            Transaction::Invoke(_) => TransactionType::InvokeFunction,
-        }
     }
 
     fn validate_entry_point_selector(&self) -> EntryPointSelector {
@@ -202,7 +181,7 @@ impl AccountTransaction {
         }
     }
 
-    pub fn calldata_length(&self) -> usize {
+    fn calldata_length(&self) -> usize {
         let calldata = match &self.tx {
             Transaction::Declare(_tx) => return 0,
             Transaction::DeployAccount(tx) => tx.constructor_calldata(),
@@ -216,8 +195,19 @@ impl AccountTransaction {
         self.signature().0.len()
     }
 
-    pub fn enforce_fee(&self) -> bool {
-        self.create_tx_info().enforce_fee()
+    fn proof_facts_length(&self) -> usize {
+        if let Transaction::Invoke(tx) = &self.tx { tx.proof_facts_length() } else { 0 }
+    }
+
+    /// Returns the total calldata length, including proof_facts.
+    /// Both are charged at the same gas per data felt rate.
+    pub fn extended_calldata_length(&self) -> usize {
+        self.calldata_length() + self.proof_facts_length()
+    }
+
+    /// Returns whether this transaction includes client-side proof facts.
+    pub fn has_client_side_proof(&self) -> bool {
+        self.proof_facts_length() > 0
     }
 
     fn verify_tx_version(&self, version: TransactionVersion) -> TransactionExecutionResult<()> {
@@ -245,6 +235,117 @@ impl AccountTransaction {
         }
     }
 
+    fn validate_proof_block_number(
+        proof_block_number: u64,
+        current_block_number: BlockNumber,
+    ) -> TransactionPreValidationResult<()> {
+        // Proof block must be old enough to have a stored block hash.
+        // Stored block hashes are guaranteed only up to: current - STORED_BLOCK_HASH_BUFFER.
+        let max_allowed =
+            current_block_number.0.checked_sub(STORED_BLOCK_HASH_BUFFER).ok_or_else(|| {
+                TransactionPreValidationError::InvalidProofFacts(format!(
+                    "The current block number {current_block_number} is below the required \
+                     block-hash retention buffer: {STORED_BLOCK_HASH_BUFFER}."
+                ))
+            })?;
+
+        if proof_block_number > max_allowed {
+            return Err(TransactionPreValidationError::InvalidProofFacts(format!(
+                "The proof block number {proof_block_number} is too recent. The maximum allowed \
+                 block number is {max_allowed}."
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_proof_block_hash(
+        proof_block_hash: Felt,
+        proof_block_number: u64,
+        os_constants: &OsConstants,
+        state: &mut dyn State,
+    ) -> TransactionPreValidationResult<()> {
+        if proof_block_hash == Felt::ZERO {
+            return Err(TransactionPreValidationError::InvalidProofFacts(format!(
+                "Proof block hash is zero for block {proof_block_number}."
+            )));
+        }
+
+        // Compare the proof's block hash with the stored block hash.
+        let block_hash_contract_address =
+            os_constants.os_contract_addresses.block_hash_contract_address();
+
+        let stored_block_hash = state
+            .get_storage_at(block_hash_contract_address, StorageKey::from(proof_block_number))?;
+
+        if stored_block_hash != proof_block_hash {
+            return Err(TransactionPreValidationError::InvalidProofFacts(format!(
+                "Block hash mismatch for block {proof_block_number}. Proof block hash: \
+                 {proof_block_hash}, stored block hash: {stored_block_hash}."
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_proof_facts(
+        &self,
+        block_context: &BlockContext,
+        state: &mut dyn State,
+    ) -> TransactionPreValidationResult<()> {
+        // Only Invoke V3 transactions can carry proof facts.
+        let Transaction::Invoke(invoke_tx) = &self.tx else {
+            return Ok(());
+        };
+        if invoke_tx.version() < TransactionVersion::THREE {
+            return Ok(());
+        }
+
+        // Parse proof facts.
+        let proof_facts = invoke_tx.proof_facts();
+        let snos_proof_facts = match ProofFactsVariant::try_from(&proof_facts)
+            .map_err(|e| TransactionPreValidationError::InvalidProofFacts(e.to_string()))?
+        {
+            ProofFactsVariant::Empty => return Ok(()),
+            ProofFactsVariant::Snos(snos_proof_facts) => snos_proof_facts,
+        };
+        let os_constants = &block_context.versioned_constants.os_constants;
+
+        // Validate the program hash.
+        let allowed = &os_constants.allowed_virtual_os_program_hashes;
+        if !allowed.contains(&snos_proof_facts.program_hash) {
+            return Err(TransactionPreValidationError::InvalidProofFacts(format!(
+                "Virtual OS program hash {} is not allowed",
+                snos_proof_facts.program_hash
+            )));
+        }
+
+        // Validate the block hash and block number.
+        let proof_block_hash = snos_proof_facts.block_hash.0;
+        let proof_block_number = snos_proof_facts.block_number.0;
+        Self::validate_proof_block_number(
+            proof_block_number,
+            block_context.block_info.block_number,
+        )?;
+        Self::validate_proof_block_hash(proof_block_hash, proof_block_number, os_constants, state)?;
+
+        // Validate the config hash.
+        let chain_info = &block_context.chain_info;
+        // TODO(Meshi): Cache this computation as part of the chain context.
+        let virtual_os_config_hash = OsChainInfo::from(chain_info)
+            .compute_virtual_os_config_hash()
+            .expect("Failed to compute OS config hash");
+        let proof_config_hash = snos_proof_facts.config_hash;
+        if virtual_os_config_hash != proof_config_hash {
+            return Err(TransactionPreValidationError::InvalidProofFacts(format!(
+                "Virtual OS config hash mismatch. Computed virtual OS config hash: \
+                 {virtual_os_config_hash}, expected virtual OS config hash: {proof_config_hash}."
+            )));
+        }
+
+        Ok(())
+    }
+
     // Performs static checks before executing validation entry point.
     // Note that nonce is incremented during these checks.
     pub fn perform_pre_validation_stage<S: State + StateReader>(
@@ -260,6 +361,8 @@ impl AccountTransaction {
 
             verify_can_pay_committed_bounds(state, tx_context).map_err(Box::new)?;
         }
+
+        self.validate_proof_facts(&tx_context.block_context, state)?;
 
         Ok(())
     }
@@ -620,10 +723,11 @@ impl AccountTransaction {
                 remaining_gas.limit_usage(tx_context.sierra_gas_limit(&ExecutionMode::Execute)),
             )),
         );
+        let extended_calldata_length = self.extended_calldata_length();
         let n_allotted_execution_steps = execution_context.subtract_validation_and_overhead_steps(
             &validate_call_info,
             &self.tx_type(),
-            self.calldata_length(),
+            extended_calldata_length,
         );
 
         // Save the state changes resulting from running `validate_tx`, to be used later for

@@ -1,41 +1,44 @@
 name: Main-CI-Flow
 
 on:
-  push:
-    branches:
-      - main
-      - main-v[0-9].**
-    tags:
-      - v[0-9].**
-
   pull_request:
     types:
       - opened
       - reopened
-      - synchronize
       - edited
+      - synchronize
 
 env:
   CI: 1
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
-  EXTRA_RUST_TOOLCHAINS: nightly-2024-04-29
 
-# On PR events, cancel existing CI runs on this same PR for this workflow.
-# Also, create different concurrency groups for different pushed commits, on push events.
+# Cancel existing CI runs on this same PR when new commits are pushed.
 concurrency:
-  group: >
-    ${{ github.workflow }}-
-    ${{ github.ref }}-
-    ${{ github.event_name == 'pull_request' && 'PR' || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # https://graphite.com/docs/stacking-and-ci
+  optimize_ci:
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.check_skip.outputs.skip }}
+    steps:
+      - name: Optimize CI
+        id: check_skip
+        uses: withgraphite/graphite-ci-action@v0.0.9
+        with:
+          graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZER_TOKEN }}
+
   code_style:
     runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
+    timeout-minutes: 30
     steps:
       # Environment setup.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Fetch the entire history. Required to checkout the merge target commit, so the diff can
           # be computed.
@@ -44,7 +47,6 @@ jobs:
       # Install rust components + lld.
       - uses: ./.github/actions/bootstrap
         with:
-          extra_rust_toolchains: ${{ env.EXTRA_RUST_TOOLCHAINS }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       # Setup pypy and link to the location expected by .cargo/config.toml.
@@ -52,7 +54,6 @@ jobs:
         id: setup-pypy
         with:
           python-version: "pypy3.9"
-          cache: "pip"
       - run: ln -s '${{ steps.setup-pypy.outputs.python-path }}' /usr/local/bin/pypy3.9
       - env:
           LD_LIBRARY_PATH: ${{ env.Python3_ROOT_DIR }}/bin
@@ -62,36 +63,20 @@ jobs:
 
       # Check Cargo.lock is up to date.
       - name: "Check Cargo.lock"
-        run: |
-          cargo update -w --locked
-          git diff --exit-code Cargo.lock
+        run: cargo metadata --locked --format-version=1 > /dev/null
 
-      # Run code style on PR.
-      - name: "Run TODO style pull request"
-        if: github.event_name == 'pull_request'
+      # Run code style checks.
+      - name: "Run TODO style"
         run: scripts/named_todos.py --commit_id ${{ github.event.pull_request.base.sha }}
-      - name: "Run clippy pull request"
-        if: github.event_name == 'pull_request'
+      - name: "Run clippy"
         run: scripts/run_tests.py --command clippy --changes_only --commit_id ${{ github.event.pull_request.base.sha }}
-      - name: "Run cargo doc pull request"
-        if: github.event_name == 'pull_request'
+      - name: "Run cargo doc"
         run: scripts/run_tests.py --command doc --changes_only --commit_id ${{ github.event.pull_request.base.sha }}
-      - name: "Run python code style pull request"
-        if: github.event_name == 'pull_request'
+      - name: "Run python code style"
         run: scripts/py_code_style.py
 
-      # Run code style on push.
       - name: "Run rustfmt"
-        # The nightly here is coupled with the one in install_rust/action.yml.
-        # If we move the install here we can use a const.
-        run: cargo +"$EXTRA_RUST_TOOLCHAINS" fmt --all -- --check
-
-      - name: "Run clippy on push"
-        if: github.event_name == 'push'
-        run: scripts/run_tests.py --command clippy
-      - name: "Run cargo doc on push"
-        if: github.event_name == 'push'
-        run: scripts/run_tests.py --command doc
+        run: scripts/rust_fmt.sh --check
 
       - name: "Run taplo"
         run: scripts/taplo.sh
@@ -100,8 +85,11 @@ jobs:
 
   run-workspace-tests:
     runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/bootstrap
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -109,8 +97,11 @@ jobs:
 
   run-tests:
     runs-on: namespace-profile-xlarge-ubuntu-24-04-amd64
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Fetch the entire history.
           fetch-depth: 0
@@ -123,32 +114,25 @@ jobs:
         id: setup-pypy
         with:
           python-version: "pypy3.9"
-          cache: "pip"
       - run: ln -s '${{ steps.setup-pypy.outputs.python-path }}' /usr/local/bin/pypy3.9
       - env:
           LD_LIBRARY_PATH: ${{ env.Python3_ROOT_DIR }}/bin
         run: echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> $GITHUB_ENV
       - run: pip install -r scripts/requirements.txt
 
-      - name: "Run tests pull request"
-        if: github.event_name == 'pull_request'
+      - name: "Run tests"
         run: |
           scripts/run_tests.py --command test --changes_only --include_dependencies --commit_id ${{ github.event.pull_request.base.sha }}
         env:
           SEED: 0
 
-      - name: "Run tests on push"
-        if: github.event_name == 'push'
-        # TODO(AdiY/Dori): Better support for running tests on push.
-        run: |
-          scripts/run_tests.py --command test
-        env:
-          SEED: 0
-
   run-integration-tests:
     runs-on: namespace-profile-large-ubuntu-24-04-amd64
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Fetch the entire history.
           fetch-depth: 0
@@ -161,16 +145,29 @@ jobs:
         id: setup-pypy
         with:
           python-version: "pypy3.9"
-          cache: "pip"
       - run: ln -s '${{ steps.setup-pypy.outputs.python-path }}' /usr/local/bin/pypy3.9
       - env:
           LD_LIBRARY_PATH: ${{ env.Python3_ROOT_DIR }}/bin
         run: echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> $GITHUB_ENV
       - run: pip install -r scripts/requirements.txt
 
-      - name: "Run integration tests pull request"
-        if: github.event_name == 'pull_request'
+      - name: "Run integration tests"
         run: |
           scripts/run_tests.py --command integration --changes_only --include_dependencies --commit_id ${{ github.event.pull_request.base.sha }}
         env:
           SEED: 0
+
+  # TODO(dan): Once all cargo-deny issues are resolved, consider merging this into code_style job.
+  cargo-deny:
+    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/bootstrap
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run cargo-deny (security/license check)
+        continue-on-error: true  # Warning only until all issues are resolved
+        run: cargo deny check

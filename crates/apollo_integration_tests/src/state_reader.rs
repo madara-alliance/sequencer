@@ -1,14 +1,18 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use apollo_class_manager::test_utils::FsClassStorageBuilderForTesting;
 use apollo_class_manager::{ClassStorage, FsClassStorage};
 use apollo_class_manager_config::config::FsClassStorageConfig;
+use apollo_proof_manager::test_utils::FsProofStorageBuilderForTesting;
+use apollo_proof_manager_config::config::ProofManagerConfig;
 use apollo_storage::body::BodyStorageWriter;
 use apollo_storage::class::ClassStorageWriter;
 use apollo_storage::compiled_class::CasmStorageWriter;
 use apollo_storage::header::HeaderStorageWriter;
+use apollo_storage::partial_block_hash::PartialBlockHashComponentsStorageWriter;
 use apollo_storage::state::StateStorageWriter;
-use apollo_storage::test_utils::TestStorageBuilder;
+use apollo_storage::test_utils::{create_dir_for_testing, TestStorageBuilder};
 use apollo_storage::{StorageConfig, StorageScope, StorageWriter};
 use assert_matches::assert_matches;
 use blockifier::blockifier_versioned_constants::VersionedConstants;
@@ -28,6 +32,11 @@ use starknet_api::block::{
     FeeType,
     GasPricePerToken,
 };
+use starknet_api::block_hash::block_hash_calculator::{
+    BlockHeaderCommitments,
+    PartialBlockHashComponents,
+};
+use starknet_api::block_hash::state_diff_hash::calculate_state_diff_hash;
 use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{
@@ -69,6 +78,8 @@ pub(crate) const CLASS_HASH_STORAGE_DB_PATH_SUFFIX: &str = "class_hash_storage";
 pub(crate) const CLASSES_STORAGE_DB_PATH_SUFFIX: &str = "classes";
 pub(crate) const STATE_SYNC_DB_PATH_SUFFIX: &str = "state_sync";
 pub(crate) const CONSENSUS_DB_PATH_SUFFIX: &str = "consensus";
+pub(crate) const PROOF_MANAGER_DB_PATH_SUFFIX: &str = "proof_manager";
+pub(crate) const COMMITTER_DB_PATH_SUFFIX: &str = "committer";
 
 #[derive(Debug, Clone)]
 pub struct StorageTestConfig {
@@ -76,6 +87,8 @@ pub struct StorageTestConfig {
     pub state_sync_storage_config: StorageConfig,
     pub class_manager_storage_config: FsClassStorageConfig,
     pub consensus_storage_config: StorageConfig,
+    pub proof_manager_config: ProofManagerConfig,
+    pub committer_db_path: PathBuf,
 }
 
 impl StorageTestConfig {
@@ -84,12 +97,16 @@ impl StorageTestConfig {
         state_sync_storage_config: StorageConfig,
         class_manager_storage_config: FsClassStorageConfig,
         consensus_storage_config: StorageConfig,
+        proof_manager_config: ProofManagerConfig,
+        committer_db_path: PathBuf,
     ) -> Self {
         Self {
             batcher_storage_config,
             state_sync_storage_config,
             class_manager_storage_config,
             consensus_storage_config,
+            proof_manager_config,
+            committer_db_path,
         }
     }
 }
@@ -100,6 +117,8 @@ pub struct StorageTestHandles {
     pub state_sync_storage_handle: Option<TempDir>,
     pub class_manager_storage_handles: Option<TempDirHandlePair>,
     pub consensus_storage_handle: Option<TempDir>,
+    pub proof_manager_storage_handle: Option<TempDir>,
+    pub committer_storage_handle: Option<TempDir>,
 }
 
 impl StorageTestHandles {
@@ -108,12 +127,16 @@ impl StorageTestHandles {
         state_sync_storage_handle: Option<TempDir>,
         class_manager_storage_handles: Option<TempDirHandlePair>,
         consensus_storage_handle: Option<TempDir>,
+        proof_manager_storage_handle: Option<TempDir>,
+        committer_storage_handle: Option<TempDir>,
     ) -> Self {
         Self {
             batcher_storage_handle,
             state_sync_storage_handle,
             class_manager_storage_handles,
             consensus_storage_handle,
+            proof_manager_storage_handle,
+            committer_storage_handle,
         }
     }
 }
@@ -185,6 +208,15 @@ impl StorageTestSetup {
             class_manager_storage_handles,
         ) = fs_class_storage_builder.with_chain_id(chain_info.chain_id.clone()).build();
 
+        let proof_manager_db_path =
+            storage_exec_paths.as_ref().map(|p| p.get_proof_manager_path_with_db_suffix());
+        let mut proof_storage_builder = FsProofStorageBuilderForTesting::default();
+        if let Some(proof_manager_path) = proof_manager_db_path.as_ref() {
+            proof_storage_builder =
+                proof_storage_builder.with_existing_path(proof_manager_path.clone());
+        }
+        let (proof_manager_config, proof_manager_storage_handle) = proof_storage_builder.build();
+
         initialize_class_manager_test_state(&mut class_manager_storage, classes);
 
         let consensus_db_path =
@@ -194,19 +226,26 @@ impl StorageTestSetup {
                 .scope(StorageScope::StateOnly)
                 .chain_id(chain_info.chain_id.clone())
                 .build();
-
+        let committer_db_path =
+            storage_exec_paths.as_ref().map(|p| p.get_committer_path_with_db_suffix());
+        let (committer_db_path, committer_storage_handle) =
+            create_dir_for_testing(committer_db_path);
         Self {
             storage_config: StorageTestConfig::new(
                 batcher_storage_config,
                 state_sync_storage_config,
                 class_manager_storage_config,
                 consensus_storage_config,
+                proof_manager_config,
+                committer_db_path,
             ),
             storage_handles: StorageTestHandles::new(
                 batcher_storage_handle,
                 state_sync_storage_handle,
                 class_manager_storage_handles,
                 consensus_storage_handle,
+                proof_manager_storage_handle,
+                committer_storage_handle,
             ),
         }
     }
@@ -375,6 +414,17 @@ fn write_state_to_apollo_storage(
     let TestClasses { cairo0_contract_classes, cairo1_contract_classes } = classes;
     let cairo0_contract_classes: Vec<_> =
         cairo0_contract_classes.iter().map(|(hash, contract)| (*hash, contract)).collect();
+    let partial_block_hash = PartialBlockHashComponents {
+        block_number,
+        l1_gas_price: block_header.block_header_without_hash.l1_gas_price,
+        l1_data_gas_price: block_header.block_header_without_hash.l1_data_gas_price,
+        l2_gas_price: block_header.block_header_without_hash.l2_gas_price,
+        header_commitments: BlockHeaderCommitments {
+            state_diff_commitment: calculate_state_diff_hash(&state_diff),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let mut write_txn = storage_writer.begin_rw_txn().unwrap();
 
@@ -392,6 +442,8 @@ fn write_state_to_apollo_storage(
         .append_state_diff(block_number, state_diff)
         .unwrap()
         .append_classes(block_number, &sierras, &cairo0_contract_classes)
+        .unwrap()
+        .set_partial_block_hash_components(&block_number, &partial_block_hash)
         .unwrap()
         .commit()
         .unwrap();

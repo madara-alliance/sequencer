@@ -1,0 +1,47 @@
+[
+  {
+    "StatelessHint": "SetStateUpdatesStart"
+  },
+  {
+    "StatelessHint": "AllocateSegmentsForMessages"
+  },
+  {
+    "CommonHint": "SetProofFactTopology"
+  },
+  {
+    "CommonHint": "LoadStoragePtrAndPrevState"
+  },
+  {
+    "CommonHint": "UpdateClassesPtr"
+  },
+  {
+    "CommonHint": "GuessClassesPtr"
+  },
+  {
+    "CommonHint": "UpdateContractAddrToStoragePtr"
+  },
+  {
+    "CommonHint": "SetStateUpdatePointersToNone"
+  },
+  {
+    "CommonHint": "GetPublicKeys"
+  },
+  {
+    "AggregatorHint": "DisableDaPageCreation"
+  },
+  {
+    "AggregatorHint": "GetOsOuputForInnerBlocks"
+  },
+  {
+    "AggregatorHint": "GetAggregatorOutput"
+  },
+  {
+    "AggregatorHint": "WriteDaSegment"
+  },
+  {
+    "AggregatorHint": "GetUseKzgDaAndFullOutputFromInput"
+  },
+  {
+    "AggregatorHint": "GetChainIdAndFeeTokenAddressFromInput"
+  }
+]

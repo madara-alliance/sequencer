@@ -6,7 +6,7 @@ use std::time::Duration;
 use alloy::dyn_abi::SolType;
 use alloy::eips::eip7840;
 use alloy::network::Ethereum;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::json_rpc::RpcError;
 use alloy::rpc::types::eth::Filter as EthEventFilter;
@@ -19,6 +19,7 @@ use apollo_config::converters::{
     serialize_slice,
 };
 use apollo_config::dumping::{ser_param, SerializeConfig};
+use apollo_config::secrets::Sensitive;
 use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ use starknet_api::block::{BlockHash, BlockHashAndNumber, BlockNumber};
 use starknet_api::hash::StarkHash;
 use starknet_api::StarknetApiError;
 use tokio::time::error::Elapsed;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use validator::{Validate, ValidationError};
 
@@ -71,22 +72,22 @@ pub type StarknetL1Contract = Starknet::StarknetInstance<RootProvider, Ethereum>
 
 #[derive(Clone, Debug)]
 pub struct CircularUrlIterator {
-    urls: Vec<Url>,
+    urls: Vec<Sensitive<Url>>,
     index: usize,
 }
 
 impl CircularUrlIterator {
-    pub fn new(urls: Vec<Url>) -> Self {
+    pub fn new(urls: Vec<Sensitive<Url>>) -> Self {
         Self { urls, index: 0 }
     }
 
-    pub fn get_current_url(&self) -> Url {
+    pub fn get_current_url(&self) -> Sensitive<Url> {
         self.urls.get(self.index).cloned().expect("No endpoint URLs provided")
     }
 }
 
 impl Iterator for CircularUrlIterator {
-    type Item = Url;
+    type Item = Sensitive<Url>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.index = (self.index + 1) % self.urls.len();
@@ -108,6 +109,13 @@ impl EthereumBaseLayerContract {
             config.starknet_contract_address,
             url_iterator.get_current_url(),
         );
+        Self { url_iterator, contract, config }
+    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_with_provider(config: EthereumBaseLayerConfig, provider: RootProvider) -> Self {
+        let url_iterator = CircularUrlIterator::new(config.ordered_l1_endpoint_urls.clone());
+        let starknet_contract_address = config.starknet_contract_address;
+        let contract = Starknet::new(starknet_contract_address, provider);
         Self { url_iterator, contract, config }
     }
 }
@@ -145,21 +153,26 @@ impl BaseLayerContract for EthereumBaseLayerContract {
     async fn events<'a>(
         &'a mut self,
         block_range: RangeInclusive<u64>,
-        events: &'a [&'a str],
+        event_types_to_filter: &'a [&'a str],
     ) -> EthereumBaseLayerResult<Vec<L1Event>> {
+        // Don't actually need mutability here, and using mut self doesn't work with async move in
+        // the loop below.
         let immutable_self = &*self;
         let filter = EthEventFilter::new()
             .select(block_range.clone())
-            .events(events)
+            .events(event_types_to_filter)
             .address(immutable_self.config.starknet_contract_address);
+
         let matching_logs = tokio::time::timeout(
             immutable_self.config.timeout_millis,
             immutable_self.contract.provider().get_logs(&filter),
         )
         .await??;
+
         // Debugging.
         let hashes: Vec<_> = matching_logs.iter().filter_map(|log| log.transaction_hash).collect();
         debug!("Got events in {:?}, L1 tx hashes: {:?}", block_range, hashes);
+        debug!("Got events in {:?}, matching_logs: {:?}", block_range, matching_logs);
 
         let block_header_futures = matching_logs.into_iter().map(|log| {
             let block_number = log.block_number.unwrap();
@@ -169,8 +182,18 @@ impl BaseLayerContract for EthereumBaseLayerContract {
                 parse_event(log, header.timestamp)
             }
         });
-
-        futures::future::join_all(block_header_futures).await.into_iter().collect()
+        let events = futures::future::join_all(block_header_futures).await;
+        let mut parsed_events = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                Ok(event) => parsed_events.push(event),
+                Err(EthereumBaseLayerError::CalldataValueOutOfRange(_)) => {
+                    warn!("Skipping event due to calldata value out of range {:?}", event);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(parsed_events)
     }
 
     #[instrument(skip(self), err)]
@@ -256,12 +279,12 @@ impl BaseLayerContract for EthereumBaseLayerContract {
         }))
     }
 
-    async fn get_url(&self) -> Result<Url, Self::Error> {
+    async fn get_url(&self) -> Result<Sensitive<Url>, Self::Error> {
         Ok(self.url_iterator.get_current_url())
     }
 
     /// Rebuilds the provider on the new url.
-    async fn set_provider_url(&mut self, url: Url) -> Result<(), Self::Error> {
+    async fn set_provider_url(&mut self, url: Sensitive<Url>) -> Result<(), Self::Error> {
         self.contract = build_contract_instance(self.config.starknet_contract_address, url.clone());
         Ok(())
     }
@@ -286,6 +309,8 @@ pub enum EthereumBaseLayerError {
     RpcError(#[from] RpcError<TransportErrorKind>),
     #[error("{0}")]
     StarknetApiParsingError(StarknetApiError),
+    #[error("calldata value exceeds felt range: {0}")]
+    CalldataValueOutOfRange(U256),
     #[error(transparent)]
     TypeError(#[from] alloy::sol_types::Error),
     #[error("{0:?}")]
@@ -300,6 +325,7 @@ impl PartialEq for EthereumBaseLayerError {
             (FeeOutOfRange(this), FeeOutOfRange(other)) => this == other,
             (RpcError(this), RpcError(other)) => this.to_string() == other.to_string(),
             (StarknetApiParsingError(this), StarknetApiParsingError(other)) => this == other,
+            (CalldataValueOutOfRange(this), CalldataValueOutOfRange(other)) => this == other,
             (TypeError(this), TypeError(other)) => this == other,
             (UnhandledL1Event(this), UnhandledL1Event(other)) => this == other,
             _ => false,
@@ -310,7 +336,7 @@ impl PartialEq for EthereumBaseLayerError {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EthereumBaseLayerConfig {
     #[serde(deserialize_with = "deserialize_vec")]
-    pub ordered_l1_endpoint_urls: Vec<Url>,
+    pub ordered_l1_endpoint_urls: Vec<Sensitive<Url>>,
     pub starknet_contract_address: EthereumContractAddress,
     // Note: dates of fusaka-related upgrades: https://eips.ethereum.org/EIPS/eip-7607
     // Note 2: make sure to calculate the block number as activation epoch x32.
@@ -359,7 +385,13 @@ impl SerializeConfig for EthereumBaseLayerConfig {
         BTreeMap::from_iter([
             ser_param(
                 "ordered_l1_endpoint_urls",
-                &serialize_slice(&self.ordered_l1_endpoint_urls),
+                &serialize_slice(
+                    &self
+                        .ordered_l1_endpoint_urls
+                        .iter()
+                        .map(|url| url.peek_secret().clone())
+                        .collect::<Vec<_>>(),
+                ),
                 "An ordered list of URLs for communicating with Ethereum. The list is used in \
                  order, cyclically, switching if the current one is non-operational.",
                 ParamPrivacyInput::Private,
@@ -419,9 +451,13 @@ impl Default for EthereumBaseLayerConfig {
 
 fn build_contract_instance(
     starknet_contract_address: EthereumContractAddress,
-    node_url: Url,
+    node_url: Sensitive<Url>,
 ) -> StarknetL1Contract {
-    let l1_client = ProviderBuilder::default().connect_http(node_url);
+    info!(
+        "Building contract instance for Starknet contract address: {} and node URL: {}",
+        starknet_contract_address, node_url
+    );
+    let l1_client = ProviderBuilder::default().connect_http(node_url.expose_secret());
     // This type is generated from `sol!` macro, and the `new` method assumes it is already
     // deployed at L1, and wraps it with a type.
     Starknet::new(starknet_contract_address, l1_client)

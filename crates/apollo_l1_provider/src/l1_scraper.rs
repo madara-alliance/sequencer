@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use apollo_infra::component_client::ClientError;
 use apollo_infra::component_definitions::ComponentStarter;
-use apollo_infra_utils::{debug_every_n, info_every_n_sec};
+use apollo_infra_utils::{debug_every_n, info_every_n_ms};
 use apollo_l1_provider_types::errors::{L1ProviderClientError, L1ProviderError};
 use apollo_l1_provider_types::{Event, SharedL1ProviderClient};
 use apollo_l1_scraper_config::config::L1ScraperConfig;
+use apollo_metrics::metrics::set_unix_now_seconds;
 use apollo_time::time::{Clock, DefaultClock};
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt};
@@ -19,11 +20,13 @@ use starknet_api::StarknetApiError;
 use static_assertions::const_assert;
 use thiserror::Error;
 use tokio::time::sleep;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::metrics::{
     register_scraper_metrics,
     L1_MESSAGE_SCRAPER_BASELAYER_ERROR_COUNT,
+    L1_MESSAGE_SCRAPER_LAST_SUCCESS_TIMESTAMP_SECONDS,
+    L1_MESSAGE_SCRAPER_LATEST_SCRAPED_BLOCK,
     L1_MESSAGE_SCRAPER_REORG_DETECTED,
     L1_MESSAGE_SCRAPER_SUCCESS_COUNT,
 };
@@ -106,6 +109,7 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> L1Scraper<BaseLayer
                 }
                 Ok(_) => {
                     L1_MESSAGE_SCRAPER_SUCCESS_COUNT.increment(1);
+                    set_unix_now_seconds(&L1_MESSAGE_SCRAPER_LAST_SUCCESS_TIMESTAMP_SECONDS);
                 }
                 Err(e) => return Err(e),
             }
@@ -128,9 +132,9 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> L1Scraper<BaseLayer
             .await
             .map_err(L1ScraperError::BaseLayerError)?;
         let latest_l1_block_number = latest_l1_block_number.checked_sub(finality).ok_or(
-            L1ScraperError::FinalityTooHigh {
-                finality,
+            L1ScraperError::LatestBlockNumberTooLow {
                 latest_l1_block_no_finality: latest_l1_block_number,
+                finality,
             },
         )?;
         debug!("Latest L1 block number: {latest_l1_block_number:?}");
@@ -193,7 +197,7 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> L1Scraper<BaseLayer
             .await
             .map_err(L1ScraperError::BaseLayerError)?
             .number;
-        Ok(last_historic_l2_height)
+        Ok(last_historic_l2_height.unchecked_next())
     }
 
     /// Send an initialize message to the L1 provider, including the last L2 height that was proved
@@ -230,9 +234,9 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> L1Scraper<BaseLayer
         self.assert_no_l1_reorgs().await?;
 
         let (latest_l1_block, events) = self.fetch_events().await?;
-        // TODO(guyn): remove these _every_n_sec because the polling interval is longer.
+        // TODO(guyn): remove these _every_n_ms because the polling interval is longer.
         trace!("scraped up to {latest_l1_block:?}");
-        info_every_n_sec!(1, "scraped up to {latest_l1_block:?}");
+        info_every_n_ms!(1_000, "scraped up to {latest_l1_block:?}");
 
         // Sending even if there are no events, to keep the flow as simple/debuggable as possible.
         // Perf hit is minimal, since the scraper is on the same machine as the provider (no
@@ -240,6 +244,7 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> L1Scraper<BaseLayer
         let add_events_result = self.l1_provider_client.add_events(events).await;
         handle_client_error(add_events_result)?;
 
+        L1_MESSAGE_SCRAPER_LATEST_SCRAPED_BLOCK.set_lossy(latest_l1_block.number);
         // Successfully scraped events up to latest l1 block.
         self.scrape_from_this_l1_block = Some(latest_l1_block);
 
@@ -259,7 +264,7 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> L1Scraper<BaseLayer
             .map_err(L1ScraperError::BaseLayerError)?;
         let latest_l1_block_number = latest_l1_block_number
             .checked_sub(self.config.finality)
-            .ok_or(L1ScraperError::FinalityTooHigh {
+            .ok_or(L1ScraperError::LatestBlockNumberTooLow {
                 finality: self.config.finality,
                 latest_l1_block_no_finality: latest_l1_block_number,
             })?;
@@ -317,10 +322,20 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> L1Scraper<BaseLayer
             Event::L1HandlerTransaction { l1_handler_tx, .. } => Some(l1_handler_tx.tx_hash),
             _ => None,
         });
+        // Collect the L1-L2 message hashes (keccak) for L1 handler transactions.
+        let l1_msg_hashes = events.iter().filter_map(|event| match event {
+            Event::L1HandlerTransaction { l1_handler_tx, .. } => {
+                Some(l1_handler_tx.tx.calc_msg_hash())
+            }
+            _ => None,
+        });
 
-        let formatted_pairs = zip_eq(l1_messages_info, l2_hashes)
-            .map(|((l1_hash, timestamp), l2_hash)| {
-                format!("L1 tx hash: {l1_hash:?}, L1 timestamp: {timestamp}, L2 tx hash: {l2_hash}")
+        let formatted_pairs = zip_eq(zip_eq(l1_messages_info, l2_hashes), l1_msg_hashes)
+            .map(|(((l1_hash, timestamp), l2_hash), l1_msg_hash)| {
+                format!(
+                    "L1 tx hash: {l1_hash:?}, L1 timestamp: {timestamp}, L2 tx hash: {l2_hash}, \
+                     L1-L2 msg hash: {l1_msg_hash}"
+                )
             })
             .collect::<Vec<_>>();
         if formatted_pairs.is_empty() {
@@ -437,10 +452,10 @@ pub enum L1ScraperError<BaseLayerType: BaseLayerContract + Send + Sync + Debug> 
     #[error("Base layer error: {0}")]
     BaseLayerError(BaseLayerType::Error),
     #[error(
-        "Could not find block number. Finality {finality:?}, latest block: \
-         {latest_l1_block_no_finality:?}"
+        "Latest L1 block number is too low: latest L1 block number: \
+         {latest_l1_block_no_finality:?}, finality: {finality:?}"
     )]
-    FinalityTooHigh { finality: u64, latest_l1_block_no_finality: L1BlockNumber },
+    LatestBlockNumberTooLow { latest_l1_block_no_finality: L1BlockNumber, finality: u64 },
     #[error("Block number {block_number} not found")]
     LatestL1BlockNumberNoBlockFound { block_number: L1BlockNumber },
     #[error("Failed to calculate hash: {0}")]
@@ -462,9 +477,10 @@ impl<BaseLayerType: BaseLayerContract + Send + Sync + Debug> PartialEq
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::BaseLayerError(e1), Self::BaseLayerError(e2)) => e1 == e2,
-            (this @ Self::FinalityTooHigh { .. }, other @ Self::FinalityTooHigh { .. }) => {
-                this == other
-            }
+            (
+                this @ Self::LatestBlockNumberTooLow { .. },
+                other @ Self::LatestBlockNumberTooLow { .. },
+            ) => this == other,
             (Self::HashCalculationError(e1), Self::HashCalculationError(e2)) => e1 == e2,
             (Self::NetworkError(e1), Self::NetworkError(e2)) => e1 == e2,
             (this @ Self::L1ReorgDetected { .. }, other @ Self::L1ReorgDetected { .. }) => {

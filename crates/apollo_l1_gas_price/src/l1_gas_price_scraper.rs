@@ -4,19 +4,21 @@ use std::sync::Arc;
 
 use apollo_infra::component_client::ClientError;
 use apollo_infra::component_definitions::ComponentStarter;
-use apollo_infra_utils::info_every_n_sec;
+use apollo_infra_utils::info_every_n_ms;
 use apollo_l1_gas_price_provider_config::config::L1GasPriceScraperConfig;
 use apollo_l1_gas_price_types::errors::L1GasPriceClientError;
 use apollo_l1_gas_price_types::{GasPriceData, L1GasPriceProviderClient, PriceInfo};
+use apollo_metrics::metrics::set_unix_now_seconds;
 use async_trait::async_trait;
 use papyrus_base_layer::{BaseLayerContract, L1BlockHeader, L1BlockNumber};
 use starknet_api::block::GasPrice;
 use thiserror::Error;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use crate::metrics::{
     register_scraper_metrics,
     L1_GAS_PRICE_SCRAPER_BASELAYER_ERROR_COUNT,
+    L1_GAS_PRICE_SCRAPER_LAST_SUCCESS_TIMESTAMP_SECONDS,
     L1_GAS_PRICE_SCRAPER_LATEST_SCRAPED_BLOCK,
     L1_GAS_PRICE_SCRAPER_REORG_DETECTED,
     L1_GAS_PRICE_SCRAPER_SUCCESS_COUNT,
@@ -41,10 +43,10 @@ pub enum L1GasPriceScraperError<T: BaseLayerContract + Send + Sync> {
     #[error(transparent)]
     NetworkError(ClientError),
     #[error(
-        "Finality is too high: finality: {finality}, latest L1 block number: \
-         {latest_l1_block_number}"
+        "Latest L1 block number is too low: latest L1 block number: {latest_l1_block_number}, \
+         finality: {finality}"
     )]
-    FinalityTooHigh { finality: u64, latest_l1_block_number: u64 },
+    LatestBlockNumberTooLow { latest_l1_block_number: u64, finality: u64 },
 }
 
 pub struct L1GasPriceScraper<B: BaseLayerContract> {
@@ -61,6 +63,31 @@ impl<B: BaseLayerContract + Send + Sync + Debug> L1GasPriceScraper<B> {
         base_layer: B,
     ) -> Self {
         Self { config, l1_gas_price_provider, base_layer, last_l1_header: None }
+    }
+
+    pub async fn get_first_block_number(&mut self) -> L1BlockNumber {
+        if let Some(block) = self.config.starting_block {
+            return block;
+        };
+        loop {
+            let latest = self.latest_l1_block_number().await;
+            let Ok(latest) = latest else {
+                warn!(
+                    "Scraper startup failure: could not get the latest L1 block number: {latest:?}"
+                );
+                L1_GAS_PRICE_SCRAPER_BASELAYER_ERROR_COUNT.increment(1);
+                tokio::time::sleep(self.config.polling_interval).await;
+                continue;
+            };
+            // If no starting block is provided, the default is to start from
+            // startup_num_blocks_multiplier * number_of_blocks_for_mean before the tip of
+            // L1. Note that for new chains this subtraction may be
+            // negative, hence the use of saturating_sub.
+            let latest = latest.saturating_sub(
+                self.config.number_of_blocks_for_mean * self.config.startup_num_blocks_multiplier,
+            );
+            return latest;
+        }
     }
 
     /// Run the scraper, starting from the given L1 `block_number`, indefinitely.
@@ -97,8 +124,8 @@ impl<B: BaseLayerContract + Send + Sync + Debug> L1GasPriceScraper<B> {
         let last_block_number = self.latest_l1_block_number().await?;
 
         trace!("Scraping gas prices starting from block {} to {last_block_number}.", *block_number,);
-        info_every_n_sec!(
-            1,
+        info_every_n_ms!(
+            1_000,
             "Scraping gas prices starting from block {} to {last_block_number}.",
             *block_number,
         );
@@ -123,6 +150,7 @@ impl<B: BaseLayerContract + Send + Sync + Debug> L1GasPriceScraper<B> {
                 .await
                 .map_err(L1GasPriceScraperError::GasPriceClientError)?;
             L1_GAS_PRICE_SCRAPER_SUCCESS_COUNT.increment(1);
+            set_unix_now_seconds(&L1_GAS_PRICE_SCRAPER_LAST_SUCCESS_TIMESTAMP_SECONDS);
             *block_number += 1;
         }
         Ok(())
@@ -158,9 +186,9 @@ impl<B: BaseLayerContract + Send + Sync + Debug> L1GasPriceScraper<B> {
             .map_err(L1GasPriceScraperError::BaseLayerError)?;
         let latest_l1_block_number = latest_l1_block_number
             .checked_sub(self.config.finality)
-            .ok_or(L1GasPriceScraperError::FinalityTooHigh {
-                finality: self.config.finality,
+            .ok_or(L1GasPriceScraperError::LatestBlockNumberTooLow {
                 latest_l1_block_number,
+                finality: self.config.finality,
             })?;
         Ok(latest_l1_block_number)
     }
@@ -174,24 +202,12 @@ where
     async fn start(&mut self) {
         info!("Starting component {}.", type_name::<Self>());
         register_scraper_metrics();
-        let start_from = match self.config.starting_block {
-            Some(block) => block,
-            None => {
-                let latest = self
-                    .latest_l1_block_number()
-                    .await
-                    .expect("Failed to get the latest L1 block number at startup");
+        // Loop and retry base layer until we successfully get the first block number.
+        let first_block_number = self.get_first_block_number().await;
 
-                // If no starting block is provided, the default is to start from
-                // startup_num_blocks_multiplier * number_of_blocks_for_mean before the tip of L1.
-                // Note that for new chains this subtraction may be negative,
-                // hence the use of saturating_sub.
-                latest.saturating_sub(
-                    self.config.number_of_blocks_for_mean
-                        * self.config.startup_num_blocks_multiplier,
-                )
-            }
-        };
-        self.run(start_from).await.unwrap_or_else(|e| panic!("L1 gas price scraper failed: {e}"))
+        // Run the scraper on an endless loop.
+        self.run(first_block_number)
+            .await
+            .unwrap_or_else(|e| panic!("L1 gas price scraper failed: {e}"))
     }
 }

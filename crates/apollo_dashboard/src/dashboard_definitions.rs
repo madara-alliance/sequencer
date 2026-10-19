@@ -1,13 +1,14 @@
 use apollo_batcher::metrics::BATCHER_INFRA_METRICS;
 use apollo_class_manager::metrics::CLASS_MANAGER_INFRA_METRICS;
+use apollo_committer::metrics::COMMITTER_INFRA_METRICS;
 use apollo_compile_to_casm::metrics::SIERRA_COMPILER_INFRA_METRICS;
 use apollo_config_manager::metrics::CONFIG_MANAGER_INFRA_METRICS;
 use apollo_gateway::metrics::GATEWAY_INFRA_METRICS;
-use apollo_l1_endpoint_monitor_types::L1_ENDPOINT_MONITOR_INFRA_METRICS;
 use apollo_l1_gas_price::metrics::L1_GAS_PRICE_INFRA_METRICS;
 use apollo_l1_provider::metrics::L1_PROVIDER_INFRA_METRICS;
 use apollo_mempool::metrics::MEMPOOL_INFRA_METRICS;
 use apollo_mempool_p2p::metrics::MEMPOOL_P2P_INFRA_METRICS;
+use apollo_proof_manager::metrics::PROOF_MANAGER_INFRA_METRICS;
 use apollo_state_sync_metrics::metrics::STATE_SYNC_INFRA_METRICS;
 
 use crate::dashboard::{Dashboard, Row};
@@ -18,6 +19,7 @@ use crate::panels::batcher::{
     get_panel_consensus_block_time_avg,
 };
 use crate::panels::blockifier::get_blockifier_row;
+use crate::panels::committer::get_committer_row;
 use crate::panels::consensus::{
     get_cende_row,
     get_consensus_p2p_row,
@@ -41,6 +43,7 @@ use crate::panels::mempool_p2p::get_mempool_p2p_row;
 use crate::panels::pod_metrics::get_pod_metrics_row;
 use crate::panels::reverts::get_reverts_row;
 use crate::panels::sierra_compiler::get_compile_to_casm_row;
+use crate::panels::staking::get_staking_row;
 use crate::panels::state_sync::get_state_sync_row;
 use crate::panels::storage::get_storage_row;
 use crate::panels::tokio::get_tokio_row;
@@ -84,8 +87,10 @@ pub fn get_apollo_dashboard() -> Dashboard {
         vec![
             get_overview_row(),
             get_consensus_row(),
+            get_staking_row(),
             get_cende_row(),
             get_batcher_row(),
+            get_committer_row(),
             get_state_sync_row(),
             get_http_server_row(),
             get_gateway_row(),
@@ -101,13 +106,14 @@ pub fn get_apollo_dashboard() -> Dashboard {
             get_storage_row(),
             get_component_infra_row("Batcher", &BATCHER_INFRA_METRICS),
             get_component_infra_row("Class Manager", &CLASS_MANAGER_INFRA_METRICS),
+            get_component_infra_row("Committer", &COMMITTER_INFRA_METRICS),
             get_component_infra_row("Config Manager", &CONFIG_MANAGER_INFRA_METRICS),
             get_component_infra_row("Gateway", &GATEWAY_INFRA_METRICS),
-            get_component_infra_row("L1 Endpoint Monitor", &L1_ENDPOINT_MONITOR_INFRA_METRICS),
             get_component_infra_row("L1 Gas Price", &L1_GAS_PRICE_INFRA_METRICS),
             get_component_infra_row("L1 Provider", &L1_PROVIDER_INFRA_METRICS),
             get_component_infra_row("Mempool", &MEMPOOL_INFRA_METRICS),
             get_component_infra_row("Mempool P2P", &MEMPOOL_P2P_INFRA_METRICS),
+            get_component_infra_row("Proof Manager", &PROOF_MANAGER_INFRA_METRICS),
             get_component_infra_row("Sierra Compiler", &SIERRA_COMPILER_INFRA_METRICS),
             get_component_infra_row("State Sync", &STATE_SYNC_INFRA_METRICS),
             get_tokio_row(),

@@ -22,11 +22,6 @@ pub struct SecretsConfigOverride {
     )]
     consensus_manager_config_network_config_secret_key: Option<Vec<u8>>,
     #[serde(
-        rename = "l1_endpoint_monitor_config.ordered_l1_endpoint_urls",
-        serialize_with = "serialize_slice_wrapper"
-    )]
-    l1_endpoint_monitor_config_ordered_l1_endpoint_urls: Vec<Url>,
-    #[serde(
         rename = "l1_gas_price_provider_config.eth_to_strk_oracle_config.url_header_list",
         serialize_with = "serialize_optional_list_with_url_and_headers_wrapper"
     )]
@@ -37,13 +32,11 @@ pub struct SecretsConfigOverride {
         serialize_with = "serialize_optional_vec_u8_wrapper"
     )]
     mempool_p2p_config_network_config_secret_key: Option<Vec<u8>>,
-    recorder_url: Url,
-    #[serde(
-        rename = "state_sync_config.central_sync_client_config.central_source_config.http_headers"
-    )]
+    #[serde(rename = "state_sync_config.static_config.central_sync_client_config.\
+                      central_source_config.http_headers")]
     state_sync_config_central_sync_client_config_central_source_config_http_headers: String,
     #[serde(
-        rename = "state_sync_config.network_config.secret_key",
+        rename = "state_sync_config.static_config.network_config.secret_key",
         serialize_with = "serialize_optional_vec_u8_wrapper"
     )]
     state_sync_config_network_config_secret_key: Option<Vec<u8>>,
@@ -57,10 +50,6 @@ impl Default for SecretsConfigOverride {
                 Url::parse("https://arbitrary.ordered_l1_endpoint_2.url").unwrap(),
             ],
             consensus_manager_config_network_config_secret_key: None,
-            l1_endpoint_monitor_config_ordered_l1_endpoint_urls: vec![
-                Url::parse("https://arbitrary.ordered_l1_endpoint_1.url").unwrap(),
-                Url::parse("https://arbitrary.ordered_l1_endpoint_2.url").unwrap(),
-            ],
             l1_gas_price_provider_config_config_eth_to_strk_oracle_config_url_header_list: Some(
                 vec![UrlAndHeaders {
                     url: Url::parse("https://arbitrary.eth_to_strk_oracle.url").unwrap(),
@@ -68,7 +57,6 @@ impl Default for SecretsConfigOverride {
                 }],
             ),
             mempool_p2p_config_network_config_secret_key: None,
-            recorder_url: Url::parse("https://arbitrary.recorder.url").unwrap(),
             state_sync_config_central_sync_client_config_central_source_config_http_headers: ""
                 .to_string(),
             state_sync_config_network_config_secret_key: None,

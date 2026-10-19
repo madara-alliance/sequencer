@@ -2,10 +2,10 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
+use apollo_proc_macros::unique_u16;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use strum::EnumVariantNames;
-use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
+use strum::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr, VariantNames};
 use tokio::sync::mpsc::channel;
 use tokio::sync::Semaphore;
 use tokio::task;
@@ -31,8 +31,8 @@ use crate::component_server::{
     RemoteComponentServer,
 };
 use crate::tests::{
+    available_ports_factory,
     dummy_remote_server_config,
-    AVAILABLE_PORTS,
     TEST_LOCAL_CLIENT_METRICS,
     TEST_LOCAL_SERVER_METRICS,
     TEST_REMOTE_CLIENT_METRICS,
@@ -45,7 +45,7 @@ type TestResult = ClientResult<()>;
 #[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
 #[strum_discriminants(
     name(ConcurrentComponentRequestLabelValue),
-    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    derive(IntoStaticStr, EnumIter, VariantNames),
     strum(serialize_all = "snake_case")
 )]
 enum ConcurrentComponentRequest {
@@ -155,9 +155,10 @@ async fn setup_concurrent_local_test() -> LocalConcurrentComponentClient {
     local_client
 }
 
+// Uses available_ports_factory with index 7.
 async fn setup_concurrent_remote_test() -> RemoteConcurrentComponentClient {
     let local_client = setup_concurrent_local_test().await;
-    let socket = AVAILABLE_PORTS.lock().await.get_next_local_host_socket();
+    let socket = available_ports_factory(unique_u16!()).get_next_local_host_socket();
     let remote_client_config = RemoteClientConfig::default();
 
     let max_concurrency = 10;

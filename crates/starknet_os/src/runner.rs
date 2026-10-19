@@ -1,8 +1,6 @@
-use std::collections::BTreeMap;
-
-use apollo_starknet_os_program::{AGGREGATOR_PROGRAM, OS_PROGRAM};
+use apollo_starknet_os_program::{AGGREGATOR_PROGRAM, OS_PROGRAM, VIRTUAL_OS_PROGRAM};
+use blockifier::execution::contract_class::TrackedResource;
 use blockifier::state::state_api::StateReader;
-use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use cairo_vm::cairo_run::CairoRunConfig;
 use cairo_vm::hint_processor::hint_processor_definition::HintProcessor;
 use cairo_vm::types::builtin_name::BuiltinName;
@@ -14,26 +12,17 @@ use cairo_vm::vm::runners::cairo_pie::{
     OutputBuiltinAdditionalData,
 };
 use cairo_vm::vm::runners::cairo_runner::CairoRunner;
-use starknet_api::core::{ClassHash, CompiledClassHash};
-use starknet_api::deprecated_contract_class::ContractClass;
 use starknet_types_core::felt::Felt;
 
 use crate::errors::StarknetOsError;
 use crate::hint_processor::aggregator_hint_processor::{AggregatorHintProcessor, AggregatorInput};
 use crate::hint_processor::common_hint_processor::CommonHintProcessor;
-#[cfg(any(test, feature = "testing"))]
-use crate::hint_processor::os_logger::OsTransactionTrace;
 use crate::hint_processor::panicking_state_reader::PanickingStateReader;
 use crate::hint_processor::snos_hint_processor::SnosHintProcessor;
 use crate::hints::hint_implementation::output::OUTPUT_ATTRIBUTE_FACT_TOPOLOGY;
-use crate::io::os_input::{
-    CachedStateInput,
-    OsBlockInput,
-    OsHints,
-    OsHintsConfig,
-    StarknetOsInput,
-};
+use crate::io::os_input::{OsBlockInput, OsHints, StarknetOsInput};
 use crate::io::os_output::{StarknetAggregatorRunnerOutput, StarknetOsRunnerOutput};
+use crate::io::virtual_os_output::VirtualOsRunnerOutput;
 use crate::metrics::{AggregatorMetrics, OsMetrics};
 use crate::vm_utils::vm_error_with_code_snippet;
 
@@ -47,15 +36,15 @@ pub struct RunnerReturnObject {
 
 // TODO(Aner): replace the return type with Result<StarknetRunnerOutput,...>
 // TODO(Aner): Make generic (CommonHintProcessor trait) depend on testing flag.
-pub(crate) fn run_program<'a, HP: HintProcessor + CommonHintProcessor<'a>>(
+pub(crate) fn run_program<HP: HintProcessor + CommonHintProcessor>(
     layout: LayoutName,
     program: &Program,
     hint_processor: &mut HP,
 ) -> Result<RunnerReturnObject, StarknetOsError> {
     // Init CairoRunConfig.
-    // TODO(Einat): Set trace_enabled to false once blake opcodes are counted in the VM.
-    let cairo_run_config =
-        CairoRunConfig { layout, relocate_mem: true, trace_enabled: true, ..Default::default() };
+    // Cairo PIE construction reads the VM's segmented memory directly. Building dense relocated
+    // memory here only duplicates the completed VM state and causes a large end-of-run RSS spike.
+    let cairo_run_config = CairoRunConfig { layout, relocate_mem: false, ..Default::default() };
     let allow_missing_builtins = cairo_run_config.allow_missing_builtins.unwrap_or(false);
 
     // Init cairo runner.
@@ -82,6 +71,7 @@ pub(crate) fn run_program<'a, HP: HintProcessor + CommonHintProcessor<'a>>(
         cairo_run_config.disable_trace_padding,
         disable_finalize_all,
         hint_processor,
+        cairo_run_config.fill_holes,
     )?;
 
     if cairo_run_config.proof_mode {
@@ -95,8 +85,11 @@ pub(crate) fn run_program<'a, HP: HintProcessor + CommonHintProcessor<'a>>(
         .read_return_values(allow_missing_builtins)
         .map_err(StarknetOsError::RunnerError)?;
     cairo_runner
-        .relocate(cairo_run_config.relocate_mem)
+        .relocate(cairo_run_config.relocate_mem, cairo_run_config.relocate_trace)
         .map_err(|e| StarknetOsError::VirtualMachineError(e.into()))?;
+
+    #[cfg(any(test, feature = "testing"))]
+    crate::test_utils::validations::validate_builtins(&mut cairo_runner);
 
     // Parse the Cairo VM output.
     let cairo_pie = cairo_runner.get_cairo_pie().map_err(StarknetOsError::RunnerError)?;
@@ -107,47 +100,15 @@ pub fn run_os<S: StateReader>(
     layout: LayoutName,
     OsHints {
         os_hints_config,
-        os_input:
-            StarknetOsInput {
-                os_block_inputs,
-                cached_state_inputs,
-                deprecated_compiled_classes,
-                compiled_classes,
-            },
+        os_input: StarknetOsInput { os_block_inputs, deprecated_compiled_classes, compiled_classes },
     }: OsHints,
     state_readers: Vec<S>,
 ) -> Result<StarknetOsRunnerOutput, StarknetOsError> {
-    let (runner_output, snos_hint_processor, is_onchain_kzg_da) = create_hint_processor_and_run_os(
-        layout,
-        os_hints_config,
-        &os_block_inputs,
-        cached_state_inputs,
-        deprecated_compiled_classes,
-        compiled_classes,
-        state_readers,
-    )?;
-
-    generate_os_output(runner_output, snos_hint_processor, is_onchain_kzg_da)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn create_hint_processor_and_run_os<'a, S: StateReader>(
-    layout: LayoutName,
-    os_hints_config: OsHintsConfig,
-    os_block_inputs: &'a [OsBlockInput],
-    cached_state_inputs: Vec<CachedStateInput>,
-    deprecated_compiled_classes: BTreeMap<ClassHash, ContractClass>,
-    compiled_classes: BTreeMap<CompiledClassHash, CasmContractClass>,
-    state_readers: Vec<S>,
-) -> Result<(RunnerReturnObject, SnosHintProcessor<'a, S>, bool), StarknetOsError> {
-    let is_onchain_kzg_da = !os_hints_config.full_output && os_hints_config.use_kzg_da;
-
     // Create the hint processor.
     let mut snos_hint_processor = SnosHintProcessor::new(
         &OS_PROGRAM,
-        os_hints_config, // moved here
+        os_hints_config,
         os_block_inputs.iter().collect(),
-        cached_state_inputs,
         deprecated_compiled_classes,
         compiled_classes,
         state_readers,
@@ -155,14 +116,12 @@ fn create_hint_processor_and_run_os<'a, S: StateReader>(
 
     // Run the OS program.
     let runner_output = run_program(layout, &OS_PROGRAM, &mut snos_hint_processor)?;
-
-    Ok((runner_output, snos_hint_processor, is_onchain_kzg_da))
+    generate_os_output(runner_output, snos_hint_processor)
 }
 
 fn generate_os_output(
     mut runner_output: RunnerReturnObject,
     mut snos_hint_processor: SnosHintProcessor<'_, impl StateReader>,
-    is_onchain_kzg_da: bool,
 ) -> Result<StarknetOsRunnerOutput, StarknetOsError> {
     let BuiltinAdditionalData::Output(OutputBuiltinAdditionalData {
         attributes: output_attributes,
@@ -177,6 +136,8 @@ fn generate_os_output(
         panic!("Output builtin additional data should be of type OutputBuiltinAdditionalData.")
     };
 
+    let is_onchain_kzg_da = !snos_hint_processor.os_hints_config.full_output
+        && snos_hint_processor.os_hints_config.use_kzg_da;
     if is_onchain_kzg_da {
         assert!(output_attributes.is_empty(), "No attributes should be added in KZG mode.");
     } else {
@@ -186,51 +147,21 @@ fn generate_os_output(
         );
     }
 
-    // Existing HEAD return body stays as-is
     Ok(StarknetOsRunnerOutput {
         raw_os_output: runner_output.raw_output,
         cairo_pie: runner_output.cairo_pie,
         da_segment: snos_hint_processor.get_da_segment().take(),
         metrics: OsMetrics::new(&mut runner_output.cairo_runner, &snos_hint_processor)?,
         #[cfg(any(test, feature = "testing"))]
+        txs_trace: snos_hint_processor
+            .get_current_execution_helper()
+            .unwrap()
+            .os_logger
+            .get_txs()
+            .clone(),
+        #[cfg(any(test, feature = "testing"))]
         unused_hints: snos_hint_processor.get_unused_hints(),
     })
-}
-
-/// Runs the OS the same way as `run_os`. Returns also the transactions trace which are needed
-/// for some tests.
-#[cfg(any(test, feature = "testing"))]
-pub fn run_os_for_testing<S: StateReader>(
-    layout: LayoutName,
-    OsHints {
-        os_hints_config,
-        os_input:
-            StarknetOsInput {
-                os_block_inputs,
-                cached_state_inputs,
-                deprecated_compiled_classes,
-                compiled_classes,
-            },
-    }: OsHints,
-    state_readers: Vec<S>,
-) -> Result<(StarknetOsRunnerOutput, Vec<OsTransactionTrace>), StarknetOsError> {
-    let (mut runner_output, snos_hint_processor, is_onchain_kzg_da) =
-        create_hint_processor_and_run_os(
-            layout,
-            os_hints_config,
-            &os_block_inputs,
-            cached_state_inputs,
-            deprecated_compiled_classes,
-            compiled_classes,
-            state_readers,
-        )?;
-
-    crate::test_utils::validations::validate_builtins(&mut runner_output.cairo_runner);
-
-    let txs_trace: Vec<OsTransactionTrace> =
-        snos_hint_processor.get_current_execution_helper().unwrap().os_logger.get_txs().clone();
-
-    Ok((generate_os_output(runner_output, snos_hint_processor, is_onchain_kzg_da)?, txs_trace))
 }
 
 /// Run the OS with a "stateless" state reader - panics if the state is accessed for data that was
@@ -241,15 +172,6 @@ pub fn run_os_stateless(
 ) -> Result<StarknetOsRunnerOutput, StarknetOsError> {
     let n_blocks = os_hints.os_input.os_block_inputs.len();
     run_os(layout, os_hints, vec![PanickingStateReader; n_blocks])
-}
-
-#[cfg(any(test, feature = "testing"))]
-pub fn run_os_stateless_for_testing(
-    layout: LayoutName,
-    os_hints: OsHints,
-) -> Result<(StarknetOsRunnerOutput, Vec<OsTransactionTrace>), StarknetOsError> {
-    let n_blocks = os_hints.os_input.os_block_inputs.len();
-    run_os_for_testing(layout, os_hints, vec![PanickingStateReader; n_blocks])
 }
 
 /// Run the Aggregator.
@@ -270,5 +192,53 @@ pub fn run_aggregator(
         metrics: AggregatorMetrics::new(&mut runner_output.cairo_runner)?,
         #[cfg(any(test, feature = "testing"))]
         unused_hints: aggregator_hint_processor.get_unused_hints(),
+    })
+}
+
+/// Validates that all tracked resources in all execution infos are SierraGas.
+/// Called before execution to provide informative error message.
+fn validate_tracked_resources(os_block_inputs: &[OsBlockInput]) -> Result<(), StarknetOsError> {
+    for block_input in os_block_inputs {
+        for tx_execution_info in block_input.tx_execution_infos.iter() {
+            for call_info in tx_execution_info.call_info_iter() {
+                if call_info.tracked_resource != TrackedResource::SierraGas {
+                    return Err(StarknetOsError::InvalidTrackedResource {
+                        expected: TrackedResource::SierraGas,
+                        actual: call_info.tracked_resource,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs the virtual OS.
+pub fn run_virtual_os(
+    OsHints {
+        os_hints_config,
+        os_input: StarknetOsInput { os_block_inputs, deprecated_compiled_classes, compiled_classes },
+    }: OsHints,
+) -> Result<VirtualOsRunnerOutput, StarknetOsError> {
+    // Validate that all tracked resources are SierraGas.
+    validate_tracked_resources(&os_block_inputs)?;
+
+    // Create the hint processor - reuse the SNOS hint processor with the virtual OS program.
+    let mut snos_hint_processor = SnosHintProcessor::new(
+        &VIRTUAL_OS_PROGRAM,
+        os_hints_config,
+        os_block_inputs.iter().collect(),
+        deprecated_compiled_classes,
+        compiled_classes,
+        vec![PanickingStateReader; os_block_inputs.len()],
+    )?;
+
+    // Run the virtual OS program.
+    let runner_output =
+        run_program(DEFAULT_OS_LAYOUT, &VIRTUAL_OS_PROGRAM, &mut snos_hint_processor)?;
+
+    Ok(VirtualOsRunnerOutput {
+        raw_output: runner_output.raw_output,
+        cairo_pie: runner_output.cairo_pie,
     })
 }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use num_bigint::BigUint;
 use starknet_api::hash::HashOutput;
@@ -70,9 +71,9 @@ impl From<u128> for LayerIndex {
 /// `left` or `right` if only a single child is to be updated.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InnerNode {
-    Left(Box<UpdateTree>),
-    Right(Box<UpdateTree>),
-    Both(Box<UpdateTree>, Box<UpdateTree>),
+    Left(Arc<UpdateTree>),
+    Right(Arc<UpdateTree>),
+    Both(Arc<UpdateTree>, Arc<UpdateTree>),
 }
 
 impl InnerNode {
@@ -106,7 +107,7 @@ type TreeLayer = HashMap<LayerIndex, UpdateTree>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicNode {
     BinaryOrLeaf(HashOutput),
-    Edge(EdgeData),
+    Edge(EdgeData<HashOutput>),
     Empty,
 }
 
@@ -201,9 +202,9 @@ pub(crate) fn build_update_tree(
             let right_update = layer.remove(&right);
 
             let inner_node = match (left_update, right_update) {
-                (Some(left), Some(right)) => InnerNode::Both(Box::new(left), Box::new(right)),
-                (Some(left), None) => InnerNode::Left(Box::new(left)),
-                (None, Some(right)) => InnerNode::Right(Box::new(right)),
+                (Some(left), Some(right)) => InnerNode::Both(Arc::new(left), Arc::new(right)),
+                (Some(left), None) => InnerNode::Left(Arc::new(left)),
+                (None, Some(right)) => InnerNode::Right(Arc::new(right)),
                 (None, None) => {
                     unreachable!("Expected non-empty tree at index {index}, height {h}.")
                 }
@@ -252,19 +253,19 @@ fn get_children(
 
             let binary = preimage.get_binary()?;
             Ok((
-                CanonicNode::new(preimage_map, &binary.left_hash),
-                CanonicNode::new(preimage_map, &binary.right_hash),
+                CanonicNode::new(preimage_map, &binary.left_data),
+                CanonicNode::new(preimage_map, &binary.right_data),
             ))
         }
         CanonicNode::Edge(edge) => {
-            let hash = edge.bottom_hash;
+            let hash = edge.bottom_data;
             let path_to_bottom = edge.path_to_bottom;
 
             let child = if u8::from(path_to_bottom.length) == 1 {
                 CanonicNode::BinaryOrLeaf(hash)
             } else {
                 let new_path = path_to_bottom.remove_first_edges(EdgePathLength::new(1)?)?;
-                CanonicNode::Edge(EdgeData { bottom_hash: hash, path_to_bottom: new_path })
+                CanonicNode::Edge(EdgeData { bottom_data: hash, path_to_bottom: new_path })
             };
 
             if path_to_bottom.is_left_descendant() {

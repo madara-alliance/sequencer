@@ -8,8 +8,7 @@ use apollo_infra::metrics::{
 use apollo_mempool_types::mempool_types::MEMPOOL_REQUEST_LABELS;
 use apollo_metrics::{define_infra_metrics, define_metrics, generate_permutation_labels};
 use starknet_api::rpc_transaction::InternalRpcTransactionLabelValue;
-use strum::{EnumVariantNames, VariantNames};
-use strum_macros::{EnumIter, IntoStaticStr};
+use strum::{EnumIter, IntoStaticStr, VariantNames};
 
 define_infra_metrics!(mempool);
 
@@ -42,7 +41,7 @@ generate_permutation_labels! {
     (LABEL_NAME_DROP_REASON, DropReason),
 }
 
-#[derive(IntoStaticStr, EnumIter, EnumVariantNames)]
+#[derive(IntoStaticStr, EnumIter, VariantNames)]
 #[strum(serialize_all = "snake_case")]
 pub enum DropReason {
     Expired,

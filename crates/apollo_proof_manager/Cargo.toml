@@ -1,0 +1,32 @@
+[package]
+name = "apollo_proof_manager"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "Proof manager component for storing proofs"
+
+[features]
+testing = []
+
+[lints]
+workspace = true
+
+[dependencies]
+apollo_infra.workspace = true
+apollo_metrics.workspace = true
+apollo_proof_manager_config.workspace = true
+apollo_proof_manager_types.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+lru.workspace = true
+starknet-types-core = { workspace = true, features = ["hash"] }
+starknet_api.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+
+
+[dev-dependencies]
+starknet_api = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

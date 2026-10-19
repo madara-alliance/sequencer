@@ -1,23 +1,21 @@
 name: Sequencer - Hybrid Node System Test
 
 on:
-  workflow_dispatch:
-    inputs:
-      liveness_test_duration_sec:
-        description: Time in seconds to keep the liveness test running.
-        required: false
-        default: 10
-        type: number
-
   pull_request:
+    types:
+      - opened
+      - reopened
+      - edited
+      - synchronize
 
 env:
   job_link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-  deployment_config_path: ${{ github.workspace }}/crates/apollo_deployments/resources/deployments/testing/deployment_config_hybrid.json
   namespace: sequencer-hybrid-system-test-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+  layout: hybrid
+  overlay: hybrid.testing.node-0
   cluster_name: hybrid-system-test
   crate_triggers: "apollo_node,apollo_deployments,apollo_integration_tests"
-  path_triggers: ".github/workflows/hybrid_system_test.yaml,scripts/*.py,scripts/system_tests/**/*.py,deployments/sequencer/**"
+  path_triggers: ".github/workflows/hybrid_system_test.yaml,scripts/**,deployments/sequencer/**,deployments/images/**"
   path_triggers_exclude: "scripts/prod/**/*"
   pvc_storage_class_name: "premium-rwo"
   anvil_port: "8545"
@@ -28,33 +26,47 @@ permissions:
 
 # On PR events, cancel existing CI runs on this same PR for this workflow.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.job }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'pr' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.job }}-pr
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # https://graphite.com/docs/stacking-and-ci
+  optimize_ci:
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.check_skip.outputs.skip }}
+    steps:
+      - name: Optimize CI
+        id: check_skip
+        uses: withgraphite/graphite-ci-action@v0.0.9
+        with:
+          graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZER_TOKEN }}
+
   check-system-test-trigger:
     runs-on: namespace-profile-small-ubuntu-24-04-amd64
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
     outputs:
-      should_run: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.system_check.outputs.should_run }}
+      should_run: ${{ steps.system_check.outputs.should_run }}
     steps:
-      - uses: actions/checkout@v4
-        if: github.event_name != 'workflow_dispatch'
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
-        id: setup-pypy
-        if: github.event_name != 'workflow_dispatch'
+      - uses: actions/setup-python@v6
         with:
           python-version: "pypy3.9"
-          cache: "pip"
 
-      - run: pip install -r scripts/requirements.txt
-        if: github.event_name != 'workflow_dispatch'
+      - name: Set up pip dependency caching
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: python
+
+      - name: Install Python Dependencies
+        run: pip install -r scripts/requirements.txt
 
       - name: Check for system-test-triggering changes
         id: system_check
-        if: github.event_name != 'workflow_dispatch'
         run: |
           echo "Checking if any system-test-triggering crates were modified..."
           OUTPUT_FILE=$(mktemp)
@@ -72,7 +84,7 @@ jobs:
   build_docker_images:
     runs-on: namespace-profile-small-ubuntu-24-04-amd64
     needs: check-system-test-trigger
-    if: needs.check-system-test-trigger.outputs.should_run == 'true'
+    if: success() && needs.check-system-test-trigger.outputs.should_run == 'true'
     permissions:
       id-token: write
       contents: read
@@ -87,7 +99,7 @@ jobs:
           - svc: dummy_eth_to_strk_oracle
             dockerfile: dummy_eth_to_strk_oracle.Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build ${{ matrix.svc }} image remotely
         uses: docker/build-push-action@v6.18.0
@@ -97,43 +109,16 @@ jobs:
           push: true
           tags: ${{ env.NSC_CONTAINER_REGISTRY }}/${{ matrix.svc }}:${{ github.sha }}
 
-  build_rust_tools:
-    runs-on: namespace-profile-large-ubuntu-24-04-amd64
-    needs: check-system-test-trigger
-    if: needs.check-system-test-trigger.outputs.should_run == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        # TODO(Idan): 28-08-2025: Discovered a bug with that action. Namespace is working on a fix.
-        # For now, ignore errors. They also suggested to use it right after checkout, so moved it here.
-      - name: Set up Rust cache
-        uses: namespacelabs/nscloud-cache-action@v1
-        continue-on-error: true
-        with:
-          cache: rust
-
-      # Install rust components.
-      - uses: ./.github/actions/bootstrap
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build binaries
-        run: cargo build --bin sequencer_node_setup --bin sequencer_simulator
-
-      - name: Upload Archive
-        uses: namespace-actions/upload-artifact@v1
-        with:
-          name: rust-target
-          path: ./target/debug
-          compression-level: 0
-
   system_test_hybrid:
     needs:
+      - check-system-test-trigger
       - build_docker_images
-      - build_rust_tools
     runs-on: namespace-profile-large-ubuntu-24-04-amd64
+    if: success() && needs.check-system-test-trigger.outputs.should_run == 'true'
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Create registries.yaml for nscr.io
         run: |
@@ -148,6 +133,13 @@ jobs:
                 username: token
                 password: $(cat $NSC_TOKEN_FILE | jq -r .bearer_token)
           EOF
+
+      - uses: ./.github/actions/bootstrap
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build binaries
+        run: cargo build --bin sequencer_node_setup --bin sequencer_simulator
 
       - name: Create k3d cluster (Local k8s)
         uses: AbsaOSS/k3d-action@v2.4.0
@@ -179,19 +171,15 @@ jobs:
 
           echo "✅ local-path-provisioner is ready."
 
-          echo "📦 Verifying default StorageClass is set..."
+          echo "📦 Setting default StorageClass and volumeBindingMode..."
+          # First, set as default StorageClass
           kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
-          echo "📦 Creating alias StorageClass ${pvc_storage_class_name} for compatibility with PVCs..."
-          cat <<EOF | envsubst | kubectl apply -f -
-          apiVersion: storage.k8s.io/v1
-          kind: StorageClass
-          metadata:
-            name: ${pvc_storage_class_name}
-          provisioner: rancher.io/local-path
-          volumeBindingMode: WaitForFirstConsumer
-          reclaimPolicy: Delete
-          EOF
+          # Then, patch the volumeBindingMode in spec
+          kubectl patch storageclass local-path --type='merge' -p '{"volumeBindingMode":"WaitForFirstConsumer"}'
+
+          echo "📦 Verifying StorageClass configuration..."
+          kubectl get storageclass local-path -o yaml
 
           echo "🎉 StorageClasses available:"
           kubectl get storageclass
@@ -264,7 +252,7 @@ jobs:
           kubectl create namespace ${{ env.namespace }}
           kubectl apply -R -f ./dist
           echo "⏳ Waiting for Anvil to become ready..."
-          kubectl wait --namespace ${{ env.namespace }} --for=condition=Ready -l app=anvil pod --timeout 60s
+          kubectl wait --namespace ${{ env.namespace }} --for=condition=Ready -l app=anvil pod --timeout 120s
           echo "🚀 Anvil deployed successfully."
 
           echo "🔍 Extracting Anvil addresses from logs."
@@ -288,13 +276,7 @@ jobs:
       - name: Install Anvil
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: v0.3.0
-
-      - name: Download Rust target artifacts
-        uses: namespace-actions/download-artifact@v1
-        with:
-          name: rust-target
-          path: ./target/debug
+          version: v1.5.1
 
       - name: Restore executable permissions
         run: chmod +x ./target/debug/sequencer_node_setup ./target/debug/sequencer_simulator
@@ -302,30 +284,13 @@ jobs:
       - name: Create storage files
         run: ./target/debug/sequencer_node_setup --output-base-dir ./output --data-prefix-path /data --n-consolidated 1 --n-hybrid 0 --n-distributed 0
 
-      - name: Export application config dir
-        run: |
-          set -euo pipefail
-
-          # Get the config directory
-          app_config_dir=$(jq -r '.application_config_subdir' ${{ env.deployment_config_path }})
-
-          # Export to environment for the next step
-          echo "app_config_dir=$app_config_dir" >> $GITHUB_ENV
-          echo "app_config_dir is: $app_config_dir"
-
-      # TODO(Nadin): move the config definition out of the GitHub Actions secret section, since it no longer contains sensitive values.
-      - name: Inject Config Secrets
-        run: |
-          python ./scripts/system_tests/config_secrets_injector.py --deployment_config_path ${{ env.deployment_config_path }}
-
       - name: Generate k8s manifests
         working-directory: deployments/sequencer
         run: |
           pipenv install
           cdk8s import
-          echo "Generating Kubernetes manifests using deployment config at: ${{ env.deployment_config_path }}:"
-          cat "${{ env.deployment_config_path }}"
-          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.namespace }} --deployment-config-file ${{ env.deployment_config_path }} --deployment-image ${{ env.NSC_CONTAINER_REGISTRY }}/sequencer:${{ github.sha }}"
+          echo "Generating Kubernetes manifests using hybrid layout"
+          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.namespace }} -l ${{ env.layout }} -o ${{ env.overlay }} --image ${{ env.NSC_CONTAINER_REGISTRY }}/sequencer:${{ github.sha }}"
 
       - name: Deploy Sequencer
         working-directory: deployments/sequencer
@@ -338,34 +303,44 @@ jobs:
         run: kubectl config set-context --current --namespace ${{ env.namespace }}
 
       - name: Run readiness check
-        run: pipenv run python ./scripts/system_tests/readiness_check.py --deployment_config_path ${{ env.deployment_config_path }} --namespace ${{ env.namespace }}
-
-      - name: Get Config Dir
         run: |
-          set -euo pipefail
-
-          # Get the config directory
-          config_dir=$(jq -r '.application_config_subdir' ${{ env.deployment_config_path }})
-
-          echo "config_dir is: $config_dir"
-          # Export to environment for the next step.
-          echo "config_dir=$config_dir" >> $GITHUB_ENV
+          pipenv run python ./scripts/system_tests/readiness_check.py \
+            --layout ${{ env.layout }} \
+            --overlay ${{ env.overlay }} \
+            --namespace ${{ env.namespace }} \
+            --verbose
 
       - name: Test sequencer is alive
         env:
           initial_delay_sec: 10
           check_interval_sec: 2
-          check_timeout_sec: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.liveness_test_duration_sec || 10 }}
+          check_timeout_sec: 10
         run: |
-          # TODO(Nadin): Calculate config_dir dynamically in liveness_check.py based on deployment_config_path
           pipenv run python ./scripts/system_tests/liveness_check.py \
-            --deployment-config-path ${{ env.deployment_config_path }} \
-            --config-dir ${{ env.config_dir }} \
+            --layout ${{ env.layout }} \
+            --overlay ${{ env.overlay }} \
+            --namespace ${{ env.namespace }} \
             --timeout ${{ env.check_timeout_sec }} \
-            --interval ${{ env.check_interval_sec }}
+            --interval ${{ env.check_interval_sec }} \
+            --initial-delay ${{ env.initial_delay_sec }} \
+            --verbose
 
       - name: Copy state and restart pod
-        run: pipenv run python ./scripts/system_tests/copy_state_and_restart.py --deployment_config_path ${{ env.deployment_config_path }} --data-dir "./output/data/node_0"
+        run: |
+          pipenv run python ./scripts/system_tests/copy_state_and_restart.py \
+            --layout ${{ env.layout }} \
+            --overlay ${{ env.overlay }} \
+            --namespace ${{ env.namespace }} \
+            --data-dir "./output/data/node_0" \
+            --verbose
+
+      - name: Run readiness check
+        run: |
+          pipenv run python ./scripts/system_tests/readiness_check.py \
+            --layout ${{ env.layout }} \
+            --overlay ${{ env.overlay }} \
+            --namespace ${{ env.namespace }} \
+            --verbose
 
       - name: Port-forward Anvil pod to localhost:${{ env.anvil_port }}
         run: |
@@ -379,26 +354,70 @@ jobs:
           echo "⏳ Waiting a few seconds to ensure port-forward is established..."
           sleep 2
 
+      - name: Print Second ConfigMap on the list
+        run: |
+          CONFIGMAP_NAME=$(kubectl get configmap -n "${{ env.namespace }}" -o jsonpath='{.items[1].metadata.name}')
+          echo "ConfigMap: $CONFIGMAP_NAME"
+          kubectl get configmap "$CONFIGMAP_NAME" -n "${{ env.namespace }}" -o yaml
+
       - name: Send transactions test
-        run: pipenv run python ./scripts/system_tests/sequencer_simulator.py --deployment_config_path ${{ env.deployment_config_path }} --config_dir "${{ env.config_dir }}" --node_type "hybrid" --sender_address "${{ env.SENDER_ADDRESS }}" --receiver_address "${{ env.RECEIVER_ADDRESS }}"
+        env:
+          RUST_LOG: debug
+          RUST_BACKTRACE: full
+        run: pipenv run python ./scripts/system_tests/sequencer_simulator.py --state_sync_monitoring_endpoint_port 8082 --http_server_port 8080 --node_type "hybrid" --sender_address "${{ env.SENDER_ADDRESS }}" --receiver_address "${{ env.RECEIVER_ADDRESS }}"
+
+      - name: List all pods in namespace ${{ env.namespace }}
+        if: always()
+        run: |
+          # ============================================
+          # List all pods in the namespace
+          # ============================================
+          kubectl get pods -n "$namespace"
+          echo "---"
+          echo ""
+          echo "✅ Finished listing pods in namespace ${{ env.namespace }}"
+          echo "---------------------------------------------"
+          echo ""
 
       - name: Get container logs
         if: always()
         run: |
+          pods=$(kubectl get pods -n "$namespace" -o jsonpath='{.items[*].metadata.name}')
           echo "📥 Getting pod logs and descriptions from namespace: $namespace"
-
-          # List all pods in the namespace
-          kubectl get pods -n "$namespace"
-
-          # For each pod, get logs and description
-          for pod in $(kubectl get pods -n "$namespace" -o jsonpath='{.items[*].metadata.name}'); do
-            echo "----------------------------------------------"
-            echo "Logs for pod: $pod"
-            kubectl logs -n "$namespace" "$pod" || echo "⚠️ Failed to get logs for $pod"
-
-            # echo ""
-            # echo "Description for pod: $pod"
-            # kubectl describe pod -n "$namespace" "$pod" || echo "⚠️ Failed to describe pod $pod"
-            # echo "---------------------------------------------"
-            # echo ""
+          echo "---------------------------------------------"
+          echo ""
+          # ============================================
+          # Describe each pod
+          # ============================================
+          echo "## 🔍 Pod Descriptions"
+          echo "---------------------------------------------"
+          echo ""
+          for pod in $pods; do
+            echo "### Pod: \`$pod\`"
+            echo ""
+            echo '```'
+            kubectl describe pod -n "$namespace" "$pod" || echo "⚠️ Failed to describe pod $pod"
+            echo '```'
+            echo ""
+            echo "---"
+            echo ""
           done
+          # ============================================
+          # Get logs for each pod
+          # ============================================
+          echo "## 📜 Pod Logs"
+          echo "---------------------------------------------"
+          echo ""
+          for pod in $pods; do
+            echo "### Logs for pod: \`$pod\`"
+            echo ""
+            echo '```'
+            kubectl logs -n "$namespace" "$pod" --tail=1000 || echo "⚠️ Failed to get logs for $pod"
+            echo '```'
+            echo ""
+            echo "---"
+            echo ""
+          done
+          echo "✅ Finished collecting pod information"
+          echo "---------------------------------------------"
+          echo ""

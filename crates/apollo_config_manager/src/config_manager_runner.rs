@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 use std::future::pending;
+use std::path::{Path, PathBuf};
 
 use apollo_config::presentation::get_config_presentation;
+use apollo_config::validators::validate_path_exists;
+use apollo_config::{CONFIG_FILE_ARG, CONFIG_FILE_SHORT_ARG_NAME};
 use apollo_config_manager_config::config::ConfigManagerConfig;
 use apollo_config_manager_types::communication::SharedConfigManagerClient;
 use apollo_infra::component_definitions::{default_component_start_fn, ComponentStarter};
@@ -9,9 +12,15 @@ use apollo_infra::component_server::WrapperServer;
 use apollo_node_config::config_utils::load_and_validate_config;
 use apollo_node_config::node_config::NodeDynamicConfig;
 use async_trait::async_trait;
+use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
-use tokio::time::{interval, Duration as TokioDuration};
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration as TokioDuration, Interval};
 use tracing::{error, info};
+
+use crate::metrics::{register_metrics, CONFIG_MANAGER_UPDATE_ERRORS};
+
+const FS_EVENT_CHANNEL_CAPACITY: usize = 16;
 
 #[cfg(test)]
 #[path = "config_manager_runner_tests.rs"]
@@ -29,20 +38,16 @@ impl ComponentStarter for ConfigManagerRunner {
     async fn start(&mut self) {
         default_component_start_fn::<Self>().await;
 
-        info!("ConfigManagerRunner: starting periodic config updates");
+        info!("ConfigManagerRunner: starting filesystem watcher");
+
+        register_metrics();
 
         if self.config_manager_config.enable_config_updates {
-            // Trigger the periodic config update.
-            let mut update_interval = interval(TokioDuration::from_secs_f64(
+            let update_interval = interval(TokioDuration::from_secs_f64(
                 self.config_manager_config.config_update_interval_secs,
             ));
 
-            loop {
-                update_interval.tick().await;
-                if let Err(e) = self.update_config().await {
-                    error!("ConfigManagerRunner: failed to update config: {}", e);
-                }
-            }
+            self.run_watcher_loop(update_interval).await;
         } else {
             // Avoid returning, as this fn is expected to run perpetually.
             pending::<()>().await;
@@ -65,11 +70,65 @@ impl ConfigManagerRunner {
         }
     }
 
+    /// Monitors config files for changes via file system events and periodic polling.
+    pub(crate) async fn run_watcher_loop(&mut self, mut update_interval: Interval) {
+        // Channel to receive events in async context.
+        let (tx, mut rx) = mpsc::channel(FS_EVENT_CHANNEL_CAPACITY);
+
+        // Build watcher that sends into the channel.
+        let mut watcher = RecommendedWatcher::new(
+            move |res| {
+                let _ = tx.blocking_send(res);
+            },
+            NotifyConfig::default(),
+        )
+        .expect("Failed to create file watcher");
+
+        let config_file_paths = Self::extract_config_file_paths(&self.cli_args);
+        for path in config_file_paths {
+            watcher
+                .watch(&path, RecursiveMode::NonRecursive)
+                .unwrap_or_else(|_| error!("Failed to watch config file path: {path:?}"));
+        }
+
+        loop {
+            tokio::select! {
+                // File system event
+                Some(event) = rx.recv() => {
+                    match event {
+                        Ok(ev) => match ev.kind {
+                            EventKind::Modify(_)
+                            | EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Other => {
+                                info!("ConfigManagerRunner: file change detected, updating config");
+                                let _ = self.update_config().await;
+                            }
+                            _ => {}
+                        },
+                        Err(e) => {
+                            error!("ConfigManagerRunner: watcher error: {e}");
+                        }
+                    }
+                }
+                // Periodic tick
+                _ = update_interval.tick() => {
+                    info!("ConfigManagerRunner: periodic check triggered, updating config");
+                    let _ = self.update_config().await;
+                }
+            }
+        }
+    }
+
     // TODO(Nadin): Define a proper result type instead of Box<dyn std::error::Error + Send + Sync>
     pub(crate) async fn update_config(
         &mut self,
     ) -> Result<NodeDynamicConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let config = load_and_validate_config(self.cli_args.clone(), false)?;
+        let config = load_and_validate_config(self.cli_args.clone(), false).map_err(|e| {
+            CONFIG_MANAGER_UPDATE_ERRORS.increment(1);
+            error!("ConfigManagerRunner: failed to update config: {e}");
+            e
+        })?;
         let node_dynamic_config = NodeDynamicConfig::from(&config);
 
         // Compare the previous and the newly read node dynamic config.
@@ -90,10 +149,7 @@ impl ConfigManagerRunner {
                     info!("Successfully updated dynamic config");
                     Ok(node_dynamic_config)
                 }
-                Err(e) => {
-                    error!("Failed to update dynamic config: {:?}", e);
-                    Err(format!("Failed to update dynamic config: {:?}", e).into())
-                }
+                Err(e) => Err(format!("Failed to update dynamic config: {:?}", e).into()),
             }
         }
     }
@@ -116,6 +172,28 @@ impl ConfigManagerRunner {
                 info!("ConfigManagerRunner: {key} changed from {old_value} to {new_value}");
             }
         }
+    }
+
+    /// Extracts config file paths from CLI arguments.
+    /// Expects the format: --config_file path1 --config_file path2 ...
+    fn extract_config_file_paths(args: &[String]) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut i = 0;
+
+        while i < args.len() {
+            if args[i] == CONFIG_FILE_ARG || args[i] == format!("-{}", CONFIG_FILE_SHORT_ARG_NAME) {
+                // Next arg is the path
+                i += 1;
+                if i < args.len() {
+                    validate_path_exists(Path::new(&args[i]))
+                        .expect("Config file path does not exist");
+                    paths.push(PathBuf::from(&args[i]));
+                }
+            }
+            i += 1;
+        }
+
+        paths
     }
 }
 

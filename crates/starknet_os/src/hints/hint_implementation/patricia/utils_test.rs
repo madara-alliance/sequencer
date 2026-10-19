@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use assert_matches::assert_matches;
 use num_bigint::BigUint;
@@ -46,7 +47,7 @@ fn build_full_preimage_map(height: SubTreeHeight, root: HashOutput) -> PreimageM
     let left = HashOutput(root.0 * Felt::TWO);
     let right = HashOutput(left.0 + Felt::ONE);
 
-    preimage_map.insert(root, Preimage::Binary(BinaryData { left_hash: left, right_hash: right }));
+    preimage_map.insert(root, Preimage::Binary(BinaryData { left_data: left, right_data: right }));
 
     // We can stop at height 1, the leaf nodes are not relevant.
     if height.0 > 1 {
@@ -78,13 +79,13 @@ fn build_preimage_map_with_edge_node(height: SubTreeHeight, root: HashOutput) ->
     let next_height = SubTreeHeight(height.0 - 1);
     let bottom_hash = HashOutput(Felt::from(u128::try_from(right.0).unwrap() << next_height.0));
 
-    preimage_map.insert(root, Preimage::Binary(BinaryData { left_hash: left, right_hash: right }));
+    preimage_map.insert(root, Preimage::Binary(BinaryData { left_data: left, right_data: right }));
 
     preimage_map.extend(build_full_preimage_map(next_height, left));
     preimage_map.insert(
         right,
         Preimage::Edge(EdgeData {
-            bottom_hash,
+            bottom_data: bottom_hash,
             path_to_bottom: PathToBottom::new(
                 EdgePath::new_u128(0),
                 EdgePathLength::new(next_height.0).unwrap(),
@@ -104,8 +105,8 @@ fn build_full_tree(height: SubTreeHeight, path: Path) -> UpdateTree {
     }
 
     UpdateTree::InnerNode(InnerNode::Both(
-        Box::new(build_full_tree(SubTreeHeight(height.0 - 1), path.turn_left().unwrap())),
-        Box::new(build_full_tree(SubTreeHeight(height.0 - 1), path.turn_right().unwrap())),
+        Arc::new(build_full_tree(SubTreeHeight(height.0 - 1), path.turn_left().unwrap())),
+        Arc::new(build_full_tree(SubTreeHeight(height.0 - 1), path.turn_right().unwrap())),
     ))
 }
 
@@ -126,14 +127,14 @@ fn test_build_update_tree() {
 
     // expected_update_tree = (((None, 12), None), ((1000, None), (30, None)))
     let expected_update_tree = UpdateTree::InnerNode(InnerNode::Both(
-        Box::new(UpdateTree::InnerNode(InnerNode::Left(Box::new(UpdateTree::InnerNode(
-            InnerNode::Right(Box::new(UpdateTree::Leaf(HashOutput(Felt::from(12))))),
+        Arc::new(UpdateTree::InnerNode(InnerNode::Left(Arc::new(UpdateTree::InnerNode(
+            InnerNode::Right(Arc::new(UpdateTree::Leaf(HashOutput(Felt::from(12))))),
         ))))),
-        Box::new(UpdateTree::InnerNode(InnerNode::Both(
-            Box::new(UpdateTree::InnerNode(InnerNode::Left(Box::new(UpdateTree::Leaf(
+        Arc::new(UpdateTree::InnerNode(InnerNode::Both(
+            Arc::new(UpdateTree::InnerNode(InnerNode::Left(Arc::new(UpdateTree::Leaf(
                 HashOutput(Felt::from(1000)),
             ))))),
-            Box::new(UpdateTree::InnerNode(InnerNode::Left(Box::new(UpdateTree::Leaf(
+            Arc::new(UpdateTree::InnerNode(InnerNode::Left(Arc::new(UpdateTree::Leaf(
                 HashOutput(Felt::from(30)),
             ))))),
         ))),
@@ -148,7 +149,7 @@ fn test_inner_node() {
     let leaf_right = HashOutput(Felt::from(3000));
 
     // Left node.
-    let inner_node = InnerNode::Left(Box::new(UpdateTree::Leaf(leaf_left)));
+    let inner_node = InnerNode::Left(Arc::new(UpdateTree::Leaf(leaf_left)));
     let (left_child, right_child) = inner_node.get_children();
     let case = inner_node.case();
     assert_matches!(left_child, UpdateTree::Leaf(value) if value.0 == leaf_left.0);
@@ -156,7 +157,7 @@ fn test_inner_node() {
     assert_matches!(case, DecodeNodeCase::Left);
 
     // Right node.
-    let inner_node = InnerNode::Right(Box::new(UpdateTree::Leaf(leaf_right)));
+    let inner_node = InnerNode::Right(Arc::new(UpdateTree::Leaf(leaf_right)));
     let (left_child, right_child) = inner_node.get_children();
     let case = inner_node.case();
     assert_eq!(left_child, &UpdateTree::None);
@@ -165,8 +166,8 @@ fn test_inner_node() {
 
     // Two children.
     let inner_node = InnerNode::Both(
-        Box::new(UpdateTree::Leaf(leaf_left)),
-        Box::new(UpdateTree::Leaf(leaf_right)),
+        Arc::new(UpdateTree::Leaf(leaf_left)),
+        Arc::new(UpdateTree::Leaf(leaf_right)),
     );
     let (left_child, right_child) = inner_node.get_children();
     let case = inner_node.case();
@@ -190,7 +191,7 @@ fn test_new_canonic_node() {
     // Edge.
     let node_3 = CanonicNode::new(&preimage_map, &HashOutput(Felt::THREE));
     let edge_data_3 = EdgeData {
-        bottom_hash: HashOutput(Felt::from(12)),
+        bottom_data: HashOutput(Felt::from(12)),
         path_to_bottom: PathToBottom::new(EdgePath::new_u128(0), EdgePathLength::new(2).unwrap())
             .unwrap(),
     };
@@ -217,7 +218,7 @@ fn test_get_children() {
     let node_2 = CanonicNode::new(&preimage_map, &HashOutput(Felt::TWO));
     let node_3 = CanonicNode::new(&preimage_map, &HashOutput(Felt::THREE));
     let node_6 = CanonicNode::Edge(EdgeData {
-        bottom_hash: HashOutput(Felt::from(12)),
+        bottom_data: HashOutput(Felt::from(12)),
         path_to_bottom: PathToBottom::new(EdgePath::new_u128(0), EdgePathLength::new(1).unwrap())
             .unwrap(),
     });
@@ -362,9 +363,9 @@ fn test_guess_descents_update_one_leaf() {
 
     let mut preimage_map = PreimageMap::new();
     preimage_map
-        .insert(prev_root, Preimage::Edge(EdgeData { bottom_hash: prev_leaf, path_to_bottom }));
+        .insert(prev_root, Preimage::Edge(EdgeData { bottom_data: prev_leaf, path_to_bottom }));
     preimage_map
-        .insert(new_root, Preimage::Edge(EdgeData { bottom_hash: new_leaf, path_to_bottom }));
+        .insert(new_root, Preimage::Edge(EdgeData { bottom_data: new_leaf, path_to_bottom }));
 
     let descent_map =
         patricia_guess_descents(height, &update_tree, &preimage_map, prev_root, new_root).unwrap();
@@ -417,22 +418,22 @@ fn test_guess_descents_update_two_adjacent_leaves() {
     let mut preimage_map = PreimageMap::new();
     preimage_map.insert(
         prev_root,
-        Preimage::Edge(EdgeData { bottom_hash: prev_inner_node, path_to_bottom }),
+        Preimage::Edge(EdgeData { bottom_data: prev_inner_node, path_to_bottom }),
     );
     preimage_map
-        .insert(new_root, Preimage::Edge(EdgeData { bottom_hash: new_inner_node, path_to_bottom }));
+        .insert(new_root, Preimage::Edge(EdgeData { bottom_data: new_inner_node, path_to_bottom }));
     preimage_map.insert(
         prev_inner_node,
         Preimage::Binary(BinaryData {
-            left_hash: HashOutput(Felt::from(8)),
-            right_hash: HashOutput(Felt::from(9)),
+            left_data: HashOutput(Felt::from(8)),
+            right_data: HashOutput(Felt::from(9)),
         }),
     );
     preimage_map.insert(
         new_inner_node,
         Preimage::Binary(BinaryData {
-            left_hash: HashOutput(Felt::from(128)),
-            right_hash: HashOutput(Felt::from(129)),
+            left_data: HashOutput(Felt::from(128)),
+            right_data: HashOutput(Felt::from(129)),
         }),
     );
 
@@ -499,42 +500,42 @@ fn test_guess_descents_update_two_leaves() {
     preimage_map.insert(
         prev_root,
         Preimage::Binary(BinaryData {
-            left_hash: prev_left_inner_node,
-            right_hash: prev_right_inner_node,
+            left_data: prev_left_inner_node,
+            right_data: prev_right_inner_node,
         }),
     );
     preimage_map.insert(
         new_root,
         Preimage::Binary(BinaryData {
-            left_hash: new_left_inner_node,
-            right_hash: new_right_inner_node,
+            left_data: new_left_inner_node,
+            right_data: new_right_inner_node,
         }),
     );
     preimage_map.insert(
         prev_left_inner_node,
         Preimage::Edge(EdgeData {
-            bottom_hash: prev_left_leaf,
+            bottom_data: prev_left_leaf,
             path_to_bottom: left_path_to_bottom,
         }),
     );
     preimage_map.insert(
         new_left_inner_node,
         Preimage::Edge(EdgeData {
-            bottom_hash: new_left_leaf,
+            bottom_data: new_left_leaf,
             path_to_bottom: left_path_to_bottom,
         }),
     );
     preimage_map.insert(
         prev_right_inner_node,
         Preimage::Edge(EdgeData {
-            bottom_hash: prev_right_leaf,
+            bottom_data: prev_right_leaf,
             path_to_bottom: right_path_to_bottom,
         }),
     );
     preimage_map.insert(
         new_right_inner_node,
         Preimage::Edge(EdgeData {
-            bottom_hash: new_right_leaf,
+            bottom_data: new_right_leaf,
             path_to_bottom: right_path_to_bottom,
         }),
     );
@@ -609,11 +610,11 @@ fn test_guess_descents_change_leaf() {
     let mut preimage_map = PreimageMap::new();
     preimage_map.insert(
         prev_root,
-        Preimage::Edge(EdgeData { bottom_hash: prev_leaf, path_to_bottom: prev_path }),
+        Preimage::Edge(EdgeData { bottom_data: prev_leaf, path_to_bottom: prev_path }),
     );
     preimage_map.insert(
         new_root,
-        Preimage::Edge(EdgeData { bottom_hash: new_leaf, path_to_bottom: new_path }),
+        Preimage::Edge(EdgeData { bottom_data: new_leaf, path_to_bottom: new_path }),
     );
 
     let descent_map =
@@ -671,15 +672,15 @@ fn test_guess_descents_split_edge_node() {
     let mut preimage_map = PreimageMap::new();
     preimage_map.insert(
         prev_root,
-        Preimage::Edge(EdgeData { bottom_hash: left_leaf, path_to_bottom: prev_path }),
+        Preimage::Edge(EdgeData { bottom_data: left_leaf, path_to_bottom: prev_path }),
     );
     preimage_map.insert(
         new_root,
-        Preimage::Edge(EdgeData { bottom_hash: new_inner_node, path_to_bottom: new_path }),
+        Preimage::Edge(EdgeData { bottom_data: new_inner_node, path_to_bottom: new_path }),
     );
     preimage_map.insert(
         new_inner_node,
-        Preimage::Binary(BinaryData { left_hash: left_leaf, right_hash: right_leaf }),
+        Preimage::Binary(BinaryData { left_data: left_leaf, right_data: right_leaf }),
     );
 
     let descent_map =

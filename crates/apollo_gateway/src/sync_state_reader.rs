@@ -23,16 +23,17 @@ use blockifier::state::errors::StateError;
 use blockifier::state::global_cache::CompiledClasses;
 use blockifier::state::state_api::{StateReader as BlockifierStateReader, StateResult};
 use blockifier::state::state_reader_and_contract_manager::FetchCompiledClasses;
-use starknet_api::block::{BlockHash, BlockNumber};
+use starknet_api::block::{BlockHash, BlockHeader, BlockInfo, BlockNumber};
 use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::state::{SierraContractClass, StorageKey};
 use starknet_types_core::felt::Felt;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::gateway_fixed_block_state_reader::{
     GatewayFixedBlockStateReader,
     GatewayFixedBlockSyncStateClient,
+    StarknetResult,
 };
 use crate::metrics::{
     GATEWAY_VALIDATE_STATEFUL_TX_STORAGE_OPERATIONS,
@@ -87,10 +88,12 @@ impl SyncStateReader {
             .runtime
             .block_on(self.class_manager_client.get_executable(class_hash))
             .map_err(|e| StateError::StateReadError(e.to_string()))?
-            .expect(
-                "Class with hash {class_hash:?} doesn't appear in class manager even though it \
-                 was declared",
-            );
+            .unwrap_or_else(|| {
+                panic!(
+                    "Class with hash {class_hash:?} doesn't appear in class manager even though \
+                     it was declared"
+                )
+            });
 
         Ok(contract_class)
     }
@@ -278,6 +281,9 @@ impl StateSyncClient for SharedStateSyncClientMetricWrapper {
     async fn get_latest_block_number(&self) -> StateSyncClientResult<Option<BlockNumber>> {
         self.run_command_with_metrics(self.state_sync_client.get_latest_block_number()).await
     }
+    async fn get_latest_block_header(&self) -> StateSyncClientResult<Option<BlockHeader>> {
+        self.run_command_with_metrics(self.state_sync_client.get_latest_block_header()).await
+    }
     async fn is_cairo_1_class_declared_at(
         &self,
         block_number: BlockNumber,
@@ -312,6 +318,191 @@ impl Drop for SharedStateSyncClientMetricWrapper {
     }
 }
 
+/// A state reader for genesis/empty state. Returns default values for all queries.
+/// Used for bootstrap transactions when no blocks exist yet.
+pub(crate) struct GenesisStateReader;
+
+impl BlockifierStateReader for GenesisStateReader {
+    fn get_storage_at(
+        &self,
+        _contract_address: ContractAddress,
+        _key: StorageKey,
+    ) -> StateResult<Felt> {
+        Ok(Felt::default())
+    }
+
+    fn get_nonce_at(&self, _contract_address: ContractAddress) -> StateResult<Nonce> {
+        Ok(Nonce::default())
+    }
+
+    fn get_compiled_class(&self, class_hash: ClassHash) -> StateResult<RunnableCompiledClass> {
+        Err(StateError::UndeclaredClassHash(class_hash))
+    }
+
+    fn get_class_hash_at(&self, _contract_address: ContractAddress) -> StateResult<ClassHash> {
+        Ok(ClassHash::default())
+    }
+
+    fn get_compiled_class_hash(&self, _class_hash: ClassHash) -> StateResult<CompiledClassHash> {
+        Ok(CompiledClassHash::default())
+    }
+}
+
+impl FetchCompiledClasses for GenesisStateReader {
+    fn get_compiled_classes(&self, class_hash: ClassHash) -> StateResult<CompiledClasses> {
+        Err(StateError::UndeclaredClassHash(class_hash))
+    }
+
+    fn is_declared(&self, _class_hash: ClassHash) -> StateResult<bool> {
+        Ok(false)
+    }
+}
+
+impl GatewayStateReaderWithCompiledClasses for GenesisStateReader {}
+
+/// A fixed block state reader for genesis/empty state. Returns default genesis block info.
+/// Used for bootstrap transactions when no blocks exist yet.
+pub(crate) struct GenesisFixedBlockStateReader;
+
+#[async_trait]
+impl GatewayFixedBlockStateReader for GenesisFixedBlockStateReader {
+    // TODO(Tzahi): The returned block number is the same as in the first created block. Replace the
+    // impl and calls with API's that won't cause such inconsistent values.
+    async fn get_block_info(&self) -> StarknetResult<BlockInfo> {
+        // Return a genesis block info with default/minimal values.
+        // These values allow bootstrap transactions to pass validation.
+        Ok(BlockInfo::default())
+    }
+
+    async fn get_nonce(&self, _contract_address: ContractAddress) -> StarknetResult<Nonce> {
+        Ok(Nonce::default())
+    }
+}
+
+pub(crate) enum SyncOrGenesisStateReader {
+    Sync(SyncStateReader),
+    Genesis(GenesisStateReader),
+}
+
+impl From<SyncStateReader> for SyncOrGenesisStateReader {
+    fn from(state_reader: SyncStateReader) -> Self {
+        Self::Sync(state_reader)
+    }
+}
+
+impl From<GenesisStateReader> for SyncOrGenesisStateReader {
+    fn from(genesis_state_reader: GenesisStateReader) -> Self {
+        Self::Genesis(genesis_state_reader)
+    }
+}
+
+impl BlockifierStateReader for SyncOrGenesisStateReader {
+    fn get_storage_at(
+        &self,
+        contract_address: ContractAddress,
+        key: StorageKey,
+    ) -> StateResult<Felt> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_storage_at(contract_address, key),
+            Self::Genesis(genesis_state_reader) => {
+                genesis_state_reader.get_storage_at(contract_address, key)
+            }
+        }
+    }
+
+    fn get_nonce_at(&self, contract_address: ContractAddress) -> StateResult<Nonce> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_nonce_at(contract_address),
+            Self::Genesis(genesis_state_reader) => {
+                genesis_state_reader.get_nonce_at(contract_address)
+            }
+        }
+    }
+
+    fn get_class_hash_at(&self, contract_address: ContractAddress) -> StateResult<ClassHash> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_class_hash_at(contract_address),
+            Self::Genesis(genesis_state_reader) => {
+                genesis_state_reader.get_class_hash_at(contract_address)
+            }
+        }
+    }
+
+    fn get_compiled_class(&self, class_hash: ClassHash) -> StateResult<RunnableCompiledClass> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_compiled_class(class_hash),
+            Self::Genesis(genesis_state_reader) => {
+                genesis_state_reader.get_compiled_class(class_hash)
+            }
+        }
+    }
+
+    fn get_compiled_class_hash(&self, class_hash: ClassHash) -> StateResult<CompiledClassHash> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_compiled_class_hash(class_hash),
+            Self::Genesis(genesis_state_reader) => {
+                genesis_state_reader.get_compiled_class_hash(class_hash)
+            }
+        }
+    }
+}
+
+impl FetchCompiledClasses for SyncOrGenesisStateReader {
+    fn get_compiled_classes(&self, class_hash: ClassHash) -> StateResult<CompiledClasses> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_compiled_classes(class_hash),
+            Self::Genesis(genesis_state_reader) => {
+                genesis_state_reader.get_compiled_classes(class_hash)
+            }
+        }
+    }
+
+    fn is_declared(&self, class_hash: ClassHash) -> StateResult<bool> {
+        match self {
+            Self::Sync(state_reader) => state_reader.is_declared(class_hash),
+            Self::Genesis(genesis_state_reader) => genesis_state_reader.is_declared(class_hash),
+        }
+    }
+}
+
+impl GatewayStateReaderWithCompiledClasses for SyncOrGenesisStateReader {}
+
+pub(crate) enum SyncOrGenesisFixedBlockStateReader {
+    Sync(GatewayFixedBlockSyncStateClient),
+    Genesis(GenesisFixedBlockStateReader),
+}
+
+impl From<GatewayFixedBlockSyncStateClient> for SyncOrGenesisFixedBlockStateReader {
+    fn from(state_reader: GatewayFixedBlockSyncStateClient) -> Self {
+        Self::Sync(state_reader)
+    }
+}
+
+impl From<GenesisFixedBlockStateReader> for SyncOrGenesisFixedBlockStateReader {
+    fn from(genesis_state_reader: GenesisFixedBlockStateReader) -> Self {
+        Self::Genesis(genesis_state_reader)
+    }
+}
+
+#[async_trait]
+impl GatewayFixedBlockStateReader for SyncOrGenesisFixedBlockStateReader {
+    async fn get_block_info(&self) -> StarknetResult<BlockInfo> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_block_info().await,
+            Self::Genesis(genesis_state_reader) => genesis_state_reader.get_block_info().await,
+        }
+    }
+
+    async fn get_nonce(&self, contract_address: ContractAddress) -> StarknetResult<Nonce> {
+        match self {
+            Self::Sync(state_reader) => state_reader.get_nonce(contract_address).await,
+            Self::Genesis(genesis_state_reader) => {
+                genesis_state_reader.get_nonce(contract_address).await
+            }
+        }
+    }
+}
+
 pub(crate) struct SyncStateReaderFactory {
     pub shared_state_sync_client: SharedStateSyncClient,
     pub class_manager_client: SharedClassManagerClient,
@@ -321,20 +512,25 @@ pub(crate) struct SyncStateReaderFactory {
 /// Use any of these factory methods only once per transaction to make sure metrics are accurate.
 #[async_trait]
 impl StateReaderFactory for SyncStateReaderFactory {
+    type TGatewayStateReaderWithCompiledClasses = SyncOrGenesisStateReader;
+    type TGatewayFixedBlockStateReader = SyncOrGenesisFixedBlockStateReader;
+
     // TODO(guy.f): The call to `get_latest_block_number()` is not counted in the storage metrics as
     // it is done prior to the creation of SharedStateSyncClientMetricWrapper, directly via the
     // SharedStateSyncClient.
     async fn get_blockifier_state_reader_and_gateway_fixed_block_from_latest_block(
         &self,
     ) -> StateSyncClientResult<(
-        Box<dyn GatewayStateReaderWithCompiledClasses>,
-        Box<dyn GatewayFixedBlockStateReader>,
+        Self::TGatewayStateReaderWithCompiledClasses,
+        Self::TGatewayFixedBlockStateReader,
     )> {
-        let latest_block_number = self
-            .shared_state_sync_client
-            .get_latest_block_number()
-            .await?
-            .ok_or(StateSyncClientError::StateSyncError(StateSyncError::EmptyState))?;
+        let latest_block_number = self.shared_state_sync_client.get_latest_block_number().await?;
+
+        // If no blocks exist yet, return genesis state readers for bootstrap transactions.
+        let Some(latest_block_number) = latest_block_number else {
+            info!("No blocks found yet; using genesis state readers for bootstrap transactions.");
+            return Ok((GenesisStateReader.into(), GenesisFixedBlockStateReader.into()));
+        };
 
         let blockifier_state_reader = SyncStateReader::from_number(
             self.shared_state_sync_client.clone(),
@@ -346,6 +542,6 @@ impl StateReaderFactory for SyncStateReaderFactory {
             self.shared_state_sync_client.clone(),
             latest_block_number,
         );
-        Ok((Box::new(blockifier_state_reader), Box::new(gateway_fixed_block_sync_state_client)))
+        Ok((blockifier_state_reader.into(), gateway_fixed_block_sync_state_client.into()))
     }
 }

@@ -41,7 +41,11 @@ impl StatelessTransactionValidator {
         self.validate_tx_size(tx)?;
         self.validate_nonce_data_availability_mode(tx)?;
         self.validate_fee_data_availability_mode(tx)?;
-        self.validate_proof(tx)?;
+
+        if let RpcTransaction::Invoke(invoke_tx) = tx {
+            self.validate_client_side_proving_allowed(invoke_tx)?;
+            self.validate_proof_facts_and_proof_consistency(invoke_tx)?;
+        }
 
         if let RpcTransaction::Declare(declare_tx) = tx {
             self.validate_declare_tx(declare_tx)?;
@@ -136,31 +140,36 @@ impl StatelessTransactionValidator {
     }
 
     fn validate_tx_size(&self, tx: &RpcTransaction) -> StatelessTransactionValidatorResult<()> {
-        self.validate_tx_calldata_size(tx)?;
+        self.validate_tx_extended_calldata_size(tx)?;
         self.validate_tx_signature_size(tx)?;
+        if let RpcTransaction::Invoke(invoke_tx) = tx {
+            self.validate_proof_size(invoke_tx)?;
+        }
 
         Ok(())
     }
 
-    fn validate_tx_calldata_size(
+    /// Validates the transaction calldata size.
+    /// This includes client-side proof facts when present.
+    fn validate_tx_extended_calldata_size(
         &self,
         tx: &RpcTransaction,
     ) -> StatelessTransactionValidatorResult<()> {
-        let calldata = match tx {
-            RpcTransaction::Declare(_) => {
-                // Declare transaction has no calldata.
-                return Ok(());
-            }
+        let total_length = match tx {
+            RpcTransaction::Declare(_) => return Ok(()),
+
             RpcTransaction::DeployAccount(RpcDeployAccountTransaction::V3(tx)) => {
-                &tx.constructor_calldata
+                tx.constructor_calldata.0.len()
             }
-            RpcTransaction::Invoke(RpcInvokeTransaction::V3(tx)) => &tx.calldata,
+
+            RpcTransaction::Invoke(RpcInvokeTransaction::V3(tx)) => {
+                tx.calldata.0.len() + tx.proof_facts.0.len()
+            }
         };
 
-        let calldata_length = calldata.0.len();
-        if calldata_length > self.config.max_calldata_length {
+        if total_length > self.config.max_calldata_length {
             return Err(StatelessTransactionValidatorError::CalldataTooLong {
-                calldata_length,
+                calldata_length: total_length,
                 max_calldata_length: self.config.max_calldata_length,
             });
         }
@@ -219,8 +228,52 @@ impl StatelessTransactionValidator {
         Ok(())
     }
 
-    fn validate_proof(&self, _: &RpcTransaction) -> StatelessTransactionValidatorResult<()> {
-        // TODO(Einat): Implement proof validation.
+    fn validate_client_side_proving_allowed(
+        &self,
+        tx: &RpcInvokeTransaction,
+    ) -> StatelessTransactionValidatorResult<()> {
+        if self.config.allow_client_side_proving {
+            return Ok(());
+        }
+
+        // Reject V3 transactions with proofs when client-side proving is disabled.
+        let RpcInvokeTransaction::V3(tx) = tx;
+        let has_proof_data = !tx.proof_facts.is_empty() || !tx.proof.is_empty();
+        if has_proof_data {
+            return Err(StatelessTransactionValidatorError::ClientSideProvingNotAllowed);
+        }
+
+        Ok(())
+    }
+
+    fn validate_proof_facts_and_proof_consistency(
+        &self,
+        tx: &RpcInvokeTransaction,
+    ) -> StatelessTransactionValidatorResult<()> {
+        let RpcInvokeTransaction::V3(tx) = tx;
+        let has_proof_facts = !tx.proof_facts.is_empty();
+        let has_proof = !tx.proof.is_empty();
+        if has_proof_facts != has_proof {
+            return Err(StatelessTransactionValidatorError::ProofFactsAndProofConsistency {
+                has_proof_facts,
+                has_proof,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_proof_size(
+        &self,
+        tx: &RpcInvokeTransaction,
+    ) -> StatelessTransactionValidatorResult<()> {
+        let RpcInvokeTransaction::V3(tx) = tx;
+        let proof_size = tx.proof.0.len();
+        if proof_size > self.config.max_proof_size {
+            return Err(StatelessTransactionValidatorError::ProofTooLarge {
+                proof_size,
+                max_proof_size: self.config.max_proof_size,
+            });
+        }
         Ok(())
     }
 

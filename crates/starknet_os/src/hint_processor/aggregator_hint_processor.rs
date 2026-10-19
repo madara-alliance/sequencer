@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::boxed::Box;
 use std::path::PathBuf;
 
 use cairo_lang_casm::hints::{CoreHint, CoreHintBase, Hint as Cairo1Hint, StarknetHint};
@@ -7,8 +9,6 @@ use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_def
     HintProcessorData as Cairo0Hint,
 };
 use cairo_vm::hint_processor::hint_processor_definition::{HintExtension, HintProcessorLogic};
-use cairo_vm::stdlib::any::Any;
-use cairo_vm::stdlib::boxed::Box;
 use cairo_vm::types::exec_scope::ExecutionScopes;
 use cairo_vm::types::program::Program;
 use cairo_vm::vm::errors::hint_errors::HintError as VmHintError;
@@ -29,7 +29,7 @@ use crate::hint_processor::state_update_pointers::StateUpdatePointers;
 use crate::hint_processor::test_hint::test_aggregator_hint;
 use crate::hints::enum_definition::AllHints;
 use crate::hints::error::{OsHintError, OsHintResult};
-use crate::hints::types::{HintArgs, HintEnum};
+use crate::hints::types::{HintContext, HintEnum};
 use crate::{impl_common_hint_processor_getters, impl_common_hint_processor_logic};
 
 #[derive(Deserialize, Debug, Clone)]
@@ -94,8 +94,12 @@ impl HintProcessorLogic for AggregatorHintProcessor<'_> {
     impl_common_hint_processor_logic!();
 }
 
-impl<'program> CommonHintProcessor<'program> for AggregatorHintProcessor<'program> {
+impl CommonHintProcessor for AggregatorHintProcessor<'_> {
     impl_common_hint_processor_getters!();
+
+    fn get_public_keys(&self) -> Option<&[Felt]> {
+        self.input.public_keys.as_deref()
+    }
 
     fn get_rng(&mut self) -> &mut rand::rngs::StdRng {
         panic!("Aggregator should not use randomness.");
@@ -104,7 +108,7 @@ impl<'program> CommonHintProcessor<'program> for AggregatorHintProcessor<'progra
     fn execute_cairo0_unique_hint(
         &mut self,
         hint: &AllHints,
-        hint_args: HintArgs<'_>,
+        ctx: HintContext<'_>,
         _hint_str: &str,
     ) -> VmHintExtensionResult {
         match hint {
@@ -115,7 +119,7 @@ impl<'program> CommonHintProcessor<'program> for AggregatorHintProcessor<'progra
                 );
             }
             AllHints::AggregatorHint(aggregator_hint) => {
-                aggregator_hint.execute_hint(self, hint_args)?;
+                aggregator_hint.execute_hint(self, ctx)?;
             }
             AllHints::OsHint(_)
             | AllHints::DeprecatedSyscallHint(_)
@@ -124,7 +128,7 @@ impl<'program> CommonHintProcessor<'program> for AggregatorHintProcessor<'progra
             }
             #[cfg(any(test, feature = "testing"))]
             AllHints::TestHint => {
-                test_aggregator_hint(_hint_str, self, hint_args)?;
+                test_aggregator_hint(_hint_str, self, ctx)?;
             }
         }
         Ok(HintExtension::default())

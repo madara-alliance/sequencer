@@ -2,14 +2,16 @@ use std::sync::Arc;
 
 use apollo_infra::component_client::{ClientError, LocalComponentClient, RemoteComponentClient};
 use apollo_infra::component_definitions::{ComponentClient, PrioritizedRequest, RequestWrapper};
-use apollo_infra::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
-use apollo_proc_macros::handle_all_response_variants;
+use apollo_infra::{
+    handle_all_response_variants,
+    impl_debug_for_infra_requests_and_responses,
+    impl_labeled_request,
+};
 use async_trait::async_trait;
 #[cfg(any(feature = "testing", test))]
 use mockall::automock;
 use serde::{Deserialize, Serialize};
-use strum::EnumVariantNames;
-use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
+use strum::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr, VariantNames};
 use thiserror::Error;
 
 use crate::errors::GatewayError;
@@ -20,7 +22,7 @@ pub type RemoteGatewayClient = RemoteComponentClient<GatewayRequest, GatewayResp
 pub type GatewayClientResult<T> = Result<T, GatewayClientError>;
 pub type GatewayRequestWrapper = RequestWrapper<GatewayRequest, GatewayResponse>;
 pub type SharedGatewayClient = Arc<dyn GatewayClient>;
-use tracing::{error, instrument};
+use tracing::instrument;
 
 /// Serves as the gateway's shared interface. Requires `Send + Sync` to allow transferring
 /// and sharing resources (inputs, futures) across threads.
@@ -33,7 +35,7 @@ pub trait GatewayClient: Send + Sync {
 #[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
 #[strum_discriminants(
     name(GatewayRequestLabelValue),
-    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    derive(IntoStaticStr, EnumIter, VariantNames),
     strum(serialize_all = "snake_case")
 )]
 pub enum GatewayRequest {
@@ -66,6 +68,8 @@ where
     async fn add_tx(&self, gateway_input: GatewayInput) -> GatewayClientResult<GatewayOutput> {
         let request = GatewayRequest::AddTransaction(gateway_input);
         handle_all_response_variants!(
+            self,
+            request,
             GatewayResponse,
             AddTransaction,
             GatewayClientError,

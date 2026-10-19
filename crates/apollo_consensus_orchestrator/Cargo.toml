@@ -11,6 +11,7 @@ apollo_batcher.workspace = true
 apollo_batcher_types.workspace = true
 apollo_class_manager_types.workspace = true
 apollo_config.workspace = true
+apollo_config_manager_types.workspace = true
 apollo_consensus.workspace = true
 apollo_consensus_orchestrator_config.workspace = true
 apollo_infra_utils.workspace = true
@@ -18,10 +19,12 @@ apollo_l1_gas_price_types.workspace = true
 apollo_metrics.workspace = true
 apollo_network.workspace = true
 apollo_proc_macros.workspace = true
+apollo_proof_manager_types.workspace = true
 apollo_protobuf.workspace = true
 apollo_sizeof.workspace = true
 apollo_state_sync_types.workspace = true
 apollo_time = { workspace = true, features = ["tokio"] }
+apollo_transaction_converter.workspace = true
 async-trait.workspace = true
 blockifier.workspace = true
 cairo-lang-starknet-classes.workspace = true
@@ -39,8 +42,7 @@ serde_json = { workspace = true, features = ["arbitrary_precision"] }
 shared_execution_objects.workspace = true
 starknet-types-core.workspace = true
 starknet_api.workspace = true
-strum.workspace = true
-strum_macros.workspace = true
+strum = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -51,17 +53,19 @@ url = { workspace = true, features = ["serde"] }
 apollo_batcher.workspace = true
 apollo_batcher_types = { workspace = true, features = ["testing"] }
 apollo_class_manager_types = { workspace = true, features = ["testing"] }
-apollo_config.workspace = true
+apollo_config_manager_types = { workspace = true, features = ["testing"] }
 apollo_infra = { workspace = true, features = ["testing"] }
 apollo_infra_utils = { workspace = true, features = ["testing"] }
 apollo_l1_gas_price_types = { workspace = true, features = ["testing"] }
 apollo_metrics = { workspace = true, features = ["testing"] }
 apollo_network = { workspace = true, features = ["testing"] }
+apollo_proof_manager_types = { workspace = true, features = ["testing"] }
 apollo_starknet_client.workspace = true
 apollo_state_sync_types = { workspace = true, features = ["testing"] }
 apollo_storage = { workspace = true, features = ["testing"] }
 apollo_test_utils.workspace = true
 apollo_time = { workspace = true, features = ["testing", "tokio"] }
+apollo_transaction_converter = { workspace = true, features = ["testing"] }
 assert_matches.workspace = true
 blockifier = { workspace = true, features = ["testing"] }
 blockifier_test_utils = { workspace = true }

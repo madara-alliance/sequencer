@@ -7,22 +7,11 @@ use apollo_node_config::component_execution_config::{
     ReactiveComponentExecutionConfig,
 };
 use serde::Serialize;
-use strum::{Display, IntoEnumIterator};
-use strum_macros::{AsRefStr, EnumIter};
+use strum::{AsRefStr, Display, EnumIter, IntoEnumIterator};
 
-use crate::deployment_definitions::{
-    BusinessLogicServicePort,
-    ComponentConfigInService,
-    Environment,
-    InfraServicePort,
-    ServicePort,
-};
-use crate::k8s::{Controller, Ingress, IngressParams, Resource, Resources, Toleration};
+use crate::deployment_definitions::ComponentConfigInService;
 use crate::scale_policy::ScalePolicy;
 use crate::service::{GetComponentConfigs, NodeService, ServiceNameInner};
-use crate::update_strategy::UpdateStrategy;
-
-const TESTING_NODE_STORAGE: usize = 1;
 
 #[derive(Clone, Copy, Debug, Display, PartialEq, Eq, Hash, Serialize, AsRefStr, EnumIter)]
 #[strum(serialize_all = "snake_case")]
@@ -46,12 +35,6 @@ impl GetComponentConfigs for ConsolidatedNodeServiceName {
 }
 
 impl ServiceNameInner for ConsolidatedNodeServiceName {
-    fn get_controller(&self) -> Controller {
-        match self {
-            Self::Node => Controller::StatefulSet,
-        }
-    }
-
     fn get_scale_policy(&self) -> ScalePolicy {
         match self {
             Self::Node => ScalePolicy::StaticallyScaled,
@@ -64,78 +47,9 @@ impl ServiceNameInner for ConsolidatedNodeServiceName {
         }
     }
 
-    fn get_toleration(&self, _environment: &Environment) -> Option<Toleration> {
-        None
-    }
-
-    fn get_ingress(
-        &self,
-        _environment: &Environment,
-        _ingress_params: IngressParams,
-    ) -> Option<Ingress> {
-        None
-    }
-
-    fn has_p2p_interface(&self) -> bool {
-        true
-    }
-
-    fn get_storage(&self, _environment: &Environment) -> Option<usize> {
-        Some(TESTING_NODE_STORAGE)
-    }
-
-    fn get_resources(&self, _environment: &Environment) -> Resources {
-        Resources::new(Resource::new(1, 2), Resource::new(4, 8))
-    }
-
-    fn get_replicas(&self, _environment: &Environment) -> usize {
-        1
-    }
-
-    fn get_anti_affinity(&self, _environment: &Environment) -> bool {
-        false
-    }
-
-    fn get_service_ports(&self) -> BTreeSet<ServicePort> {
-        let mut service_ports = BTreeSet::new();
-        for service_port in ServicePort::iter() {
-            match service_port {
-                ServicePort::BusinessLogic(bl_port) => match bl_port {
-                    BusinessLogicServicePort::MonitoringEndpoint
-                    | BusinessLogicServicePort::HttpServer
-                    | BusinessLogicServicePort::ConsensusP2p
-                    | BusinessLogicServicePort::MempoolP2p => {
-                        service_ports.insert(service_port);
-                    }
-                },
-                ServicePort::Infra(infra_port) => match infra_port {
-                    InfraServicePort::Batcher
-                    | InfraServicePort::Mempool
-                    | InfraServicePort::ClassManager
-                    | InfraServicePort::Committer
-                    | InfraServicePort::Gateway
-                    | InfraServicePort::L1EndpointMonitor
-                    | InfraServicePort::L1GasPriceProvider
-                    | InfraServicePort::L1Provider
-                    | InfraServicePort::SierraCompiler
-                    | InfraServicePort::StateSync
-                    | InfraServicePort::SignatureManager => {}
-                },
-            }
-        }
-
-        service_ports
-    }
-
     fn get_components_in_service(&self) -> BTreeSet<ComponentConfigInService> {
         match self {
             Self::Node => ComponentConfigInService::iter().collect(),
-        }
-    }
-
-    fn get_update_strategy(&self) -> UpdateStrategy {
-        match self {
-            Self::Node => UpdateStrategy::RollingUpdate,
         }
     }
 }
@@ -151,7 +65,6 @@ fn get_consolidated_config() -> ComponentConfig {
         consensus_manager: ActiveComponentExecutionConfig::enabled(),
         gateway: base.clone(),
         http_server: ActiveComponentExecutionConfig::enabled(),
-        l1_endpoint_monitor: base.clone(),
         l1_provider: base.clone(),
         l1_scraper: ActiveComponentExecutionConfig::enabled(),
         l1_gas_price_provider: base.clone(),
@@ -159,6 +72,7 @@ fn get_consolidated_config() -> ComponentConfig {
         mempool: base.clone(),
         mempool_p2p: base.clone(),
         monitoring_endpoint: ActiveComponentExecutionConfig::enabled(),
+        proof_manager: base.clone(),
         sierra_compiler: base.clone(),
         signature_manager: base.clone(),
         state_sync: base.clone(),

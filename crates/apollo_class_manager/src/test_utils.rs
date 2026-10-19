@@ -52,7 +52,7 @@ impl FsClassStorageBuilderForTesting {
     pub fn build(self) -> (FsClassStorage, FsClassStorageConfig, Option<FileHandles>) {
         let Self { config, handles } = self;
         let class_hash_storage =
-            ClassHashStorage::new(config.class_hash_storage_config.clone()).unwrap();
+            ClassHashStorage::new_plain(config.class_hash_storage_config.clone()).unwrap();
         let fs_class_storage =
             FsClassStorage { persistent_root: config.persistent_root.clone(), class_hash_storage };
         (fs_class_storage, config, handles)

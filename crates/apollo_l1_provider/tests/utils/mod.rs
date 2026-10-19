@@ -1,3 +1,5 @@
+#![cfg(any(test, feature = "testing"))]
+#![allow(dead_code)]
 use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
@@ -15,6 +17,7 @@ use apollo_infra::component_server::{
     LocalComponentServer,
     LocalServerConfig,
 };
+use apollo_infra_utils::test_utils::{AvailablePortsGenerator, TestIdentifier};
 use apollo_l1_provider::l1_provider::L1Provider;
 use apollo_l1_provider::l1_scraper::L1Scraper;
 use apollo_l1_provider::metrics::L1_PROVIDER_INFRA_METRICS;
@@ -41,16 +44,16 @@ use starknet_api::transaction::TransactionHash;
 use tokio::sync::mpsc::channel;
 use tokio::time::Instant;
 
+pub(crate) const ROUND_TO_SEC_MARGIN_DURATION: Duration = Duration::from_secs(1);
 pub(crate) const POLLING_INTERVAL_DURATION: Duration = Duration::from_secs(10);
 pub(crate) const COOLDOWN_DURATION: Duration = Duration::from_secs(30);
 pub(crate) const TIMELOCK_DURATION: Duration = Duration::from_secs(30);
 pub(crate) const WAIT_FOR_ASYNC_PROCESSING_DURATION: Duration = Duration::from_millis(50);
 const NUMBER_OF_BLOCKS_TO_MINE: u64 = 100;
-const CHAIN_ID: ChainId = ChainId::Mainnet;
-pub(crate) const L1_CONTRACT_ADDRESS: &str = "0x12";
-pub(crate) const L2_ENTRY_POINT: &str = "0x34";
+pub(crate) const CHAIN_ID: ChainId = ChainId::Mainnet;
+pub(crate) const L1_CONTRACT_ADDRESS: u64 = 1;
+pub(crate) const L2_ENTRY_POINT: u64 = 34;
 pub(crate) const CALL_DATA: &[u8] = &[1_u8, 2_u8];
-#[allow(dead_code)]
 pub(crate) const CALL_DATA_2: &[u8] = &[3_u8, 4_u8];
 
 const START_L1_BLOCK: L1BlockReference = L1BlockReference { number: 0, hash: L1BlockHash([0; 32]) };
@@ -65,7 +68,11 @@ fn convert_call_data_to_u256(call_data: &[u8]) -> Vec<Uint<256, 4>> {
 // Need to allow dead code as this is only used in some of the test crates.
 #[allow(dead_code)]
 pub(crate) async fn setup_anvil_base_layer() -> AnvilBaseLayer {
-    let mut base_layer = AnvilBaseLayer::new(None).await;
+    let mut ports_gen = AvailablePortsGenerator::new(TestIdentifier::L1ProviderUnitTests.into());
+    let mut available_ports = ports_gen
+        .next()
+        .expect("Failed to get an AvailablePorts instance for L1 provider unit tests");
+    let mut base_layer = AnvilBaseLayer::new(None, Some(available_ports.get_next_port())).await;
     anvil_mine_blocks(base_layer.ethereum_base_layer.config.clone(), NUMBER_OF_BLOCKS_TO_MINE)
         .await;
     // We use a really long timeout because in the tests we sometimes advance the fake time by large
@@ -80,6 +87,7 @@ pub(crate) async fn setup_scraper_and_provider<
     E: Error + Send + Sync + Debug + 'static,
 >(
     base_layer: T,
+    l1_scraper_config: Option<L1ScraperConfig>,
 ) -> LocalComponentClient<L1ProviderRequest, L1ProviderResponse> {
     let fake_clock = Arc::new(TokioLinkedClock::new());
 
@@ -121,11 +129,11 @@ pub(crate) async fn setup_scraper_and_provider<
     });
 
     // Set up the L1 scraper and run it as a server.
-    let l1_scraper_config = L1ScraperConfig {
+    let l1_scraper_config = l1_scraper_config.unwrap_or_else(|| L1ScraperConfig {
         polling_interval_seconds: POLLING_INTERVAL_DURATION,
         chain_id: CHAIN_ID,
         ..Default::default()
-    };
+    });
     let mut scraper = L1Scraper::new(
         l1_scraper_config,
         Arc::new(l1_provider_client.clone()),
@@ -158,7 +166,7 @@ pub(crate) async fn setup_scraper_and_provider<
         }
     });
 
-    // Start the L1 provider's bootstrapping process up to the target L2 height
+    // Start the L1 provider's catching up process up to the target L2 height
     let expect_error =
         l1_provider_client.commit_block([].into(), [].into(), TARGET_L2_HEIGHT).await;
     assert!(expect_error.is_err());
@@ -182,11 +190,7 @@ pub(crate) async fn send_message_from_l1_to_l2(
     let call_data = convert_call_data_to_u256(call_data);
     let fee = 1_u8;
     let message_to_l2 = contract
-        .sendMessageToL2(
-            L1_CONTRACT_ADDRESS.parse().unwrap(),
-            L2_ENTRY_POINT.parse().unwrap(),
-            call_data,
-        )
+        .sendMessageToL2(U256::from(L1_CONTRACT_ADDRESS), U256::from(L2_ENTRY_POINT), call_data)
         .value(U256::from(fee));
     let receipt = message_to_l2.send().await.unwrap().get_receipt().await.unwrap();
 
@@ -239,8 +243,8 @@ pub(crate) async fn send_cancellation_request(
     let contract = &base_layer.ethereum_base_layer.contract;
     let call_data = convert_call_data_to_u256(call_data);
     let cancellation_request = contract.startL1ToL2MessageCancellation(
-        L1_CONTRACT_ADDRESS.parse().unwrap(),
-        L2_ENTRY_POINT.parse().unwrap(),
+        U256::from(L1_CONTRACT_ADDRESS),
+        U256::from(L2_ENTRY_POINT),
         call_data,
         nonce,
     );
@@ -261,8 +265,8 @@ pub(crate) async fn send_cancellation_finalization(
     let contract = &base_layer.ethereum_base_layer.contract;
     let call_data = convert_call_data_to_u256(call_data);
     let cancellation_finalization = contract.cancelL1ToL2Message(
-        L1_CONTRACT_ADDRESS.parse().unwrap(),
-        L2_ENTRY_POINT.parse().unwrap(),
+        U256::from(L1_CONTRACT_ADDRESS),
+        U256::from(L2_ENTRY_POINT),
         call_data,
         nonce,
     );

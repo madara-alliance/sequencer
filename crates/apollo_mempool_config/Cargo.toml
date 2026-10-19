@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+description = "Configuration types for the Apollo mempool component."
 
 [dependencies]
 apollo_config.workspace = true
 serde = { workspace = true, features = ["derive"] }
+url.workspace = true
 validator.workspace = true
 
 [lints]

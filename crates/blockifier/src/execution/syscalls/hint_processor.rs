@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use cairo_lang_casm::hints::Hint;
 use cairo_lang_runner::casm_run::execute_core_hint_base;
@@ -434,6 +434,9 @@ impl<'a> SyscallHintProcessor<'a> {
                 let (tx_account_deployment_data_start_ptr, tx_account_deployment_data_end_ptr) =
                     &self.allocate_data_segment(vm, &context.account_deployment_data.0)?;
 
+                let (tx_proof_facts_start_ptr, tx_proof_facts_end_ptr) =
+                    &self.allocate_data_segment(vm, &context.proof_facts.0)?;
+
                 tx_data.extend_from_slice(&[
                     tx_resource_bounds_start_ptr.into(),
                     tx_resource_bounds_end_ptr.into(),
@@ -444,6 +447,8 @@ impl<'a> SyscallHintProcessor<'a> {
                     Felt::from(context.fee_data_availability_mode).into(),
                     tx_account_deployment_data_start_ptr.into(),
                     tx_account_deployment_data_end_ptr.into(),
+                    tx_proof_facts_start_ptr.into(),
+                    tx_proof_facts_end_ptr.into(),
                 ]);
             }
             TransactionInfo::Deprecated(_) => {
@@ -457,7 +462,9 @@ impl<'a> SyscallHintProcessor<'a> {
                     zero_felt.clone(), // Nonce DA mode.
                     zero_felt.clone(), // Fee DA mode.
                     zero_felt.clone(), // Empty segment of account deployment data (start ptr).
-                    zero_felt,         // Empty segment of account deployment data (end ptr).
+                    zero_felt.clone(), // Empty segment of account deployment data (end ptr).
+                    zero_felt.clone(), // Empty segment of proof_facts (start ptr).
+                    zero_felt,         // Empty segment of proof_facts (end ptr).
                 ]);
             }
         };
@@ -592,7 +599,7 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         syscall_handler: &mut Self,
         _remaining_gas: &mut u64,
     ) -> Result<GetBlockHashResponse, Self::Error> {
-        let block_hash = BlockHash(syscall_handler.base.get_block_hash(request.block_number.0)?);
+        let block_hash = BlockHash(syscall_handler.base.get_block_hash(request.block_number)?);
         Ok(GetBlockHashResponse { block_hash })
     }
 
@@ -783,7 +790,8 @@ impl HintProcessorLogic for SyscallHintProcessor<'_> {
         _ap_tracking_data: &ApTracking,
         _reference_ids: &HashMap<String, usize>,
         _references: &[HintReference],
-        _constants: Rc<HashMap<String, Felt>>,
+        _accessible_scopes: &[String],
+        _constants: Arc<HashMap<String, Felt>>,
     ) -> Result<Box<dyn Any>, VirtualMachineError> {
         Ok(Box::new(self.hints[hint_code].clone()))
     }

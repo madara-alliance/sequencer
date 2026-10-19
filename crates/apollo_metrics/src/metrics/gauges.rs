@@ -3,6 +3,7 @@ use std::fmt::Debug;
 #[cfg(any(feature = "testing", test))]
 use std::str::FromStr;
 
+use apollo_time::time::{Clock, DefaultClock};
 use metrics::{describe_gauge, gauge, IntoF64};
 #[cfg(any(feature = "testing", test))]
 use num_traits::Num;
@@ -29,6 +30,10 @@ impl HasMetricFilterKind for LabeledMetricGauge {
 
 pub struct MetricGauge {
     metric: Metric,
+}
+
+pub fn set_unix_now_seconds(gauge: &MetricGauge) {
+    gauge.set_lossy(Clock::unix_now(&DefaultClock));
 }
 
 impl MetricGauge {
@@ -60,6 +65,24 @@ impl MetricGauge {
 
     pub fn set_lossy<T: LossyIntoF64>(&self, value: T) {
         gauge!(self.get_name()).set(value.into_f64());
+    }
+
+    pub fn set_with_labels<T: IntoF64>(
+        &self,
+        value: T,
+        label_key: &'static str,
+        label_value: String,
+    ) {
+        gauge!(self.get_name(), label_key => label_value).set(value.into_f64());
+    }
+
+    pub fn set_lossy_with_labels<T: LossyIntoF64>(
+        &self,
+        value: T,
+        label_key: &'static str,
+        label_value: String,
+    ) {
+        gauge!(self.get_name(), label_key => label_value).set(value.into_f64());
     }
 
     #[cfg(any(feature = "testing", test))]

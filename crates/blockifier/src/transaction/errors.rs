@@ -144,12 +144,16 @@ pub enum TransactionPreValidationError {
     StateError(#[from] StateError),
     #[error(transparent)]
     TransactionFeeError(#[from] Box<TransactionFeeError>),
+    #[error("Invalid proof facts: {0}")]
+    InvalidProofFacts(String),
 }
 
 #[derive(Debug, Error)]
 pub enum NumericConversionError {
     #[error("Conversion of {0} to u128 unsuccessful.")]
     U128ToUsizeError(u128),
+    #[error("Conversion of {0}: u32 to usize unsuccessful.")]
+    U32ToUsizeError(u32),
     #[error("Conversion of {0} to u64 unsuccessful.")]
     U64ToUsizeError(u64),
 }

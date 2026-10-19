@@ -11,9 +11,19 @@ pub type RemoteBatcherServer = RemoteComponentServer<BatcherRequest, BatcherResp
 #[async_trait]
 impl ComponentRequestHandler<BatcherRequest, BatcherResponse> for Batcher {
     async fn handle_request(&mut self, request: BatcherRequest) -> BatcherResponse {
+        let dynamic_config = self
+            .config_manager_client
+            .get_batcher_dynamic_config()
+            .await
+            .expect("Should be able to get batcher dynamic config");
+        self.update_dynamic_config(dynamic_config);
+
         match request {
             BatcherRequest::ProposeBlock(input) => {
                 BatcherResponse::ProposeBlock(self.propose_block(input).await)
+            }
+            BatcherRequest::GetBlockHash(block_number) => {
+                BatcherResponse::GetBlockHash(self.get_block_hash(block_number))
             }
             BatcherRequest::GetCurrentHeight => {
                 BatcherResponse::GetCurrentHeight(self.get_height().await)
@@ -38,6 +48,9 @@ impl ComponentRequestHandler<BatcherRequest, BatcherResponse> for Batcher {
             }
             BatcherRequest::RevertBlock(input) => {
                 BatcherResponse::RevertBlock(self.revert_block(input).await)
+            }
+            BatcherRequest::GetTimestamp => {
+                BatcherResponse::GetTimestamp(self.get_timestamp().await)
             }
         }
     }

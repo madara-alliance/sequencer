@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+use expect_test::{expect, Expect};
 use toml_test_utils::{
     CrateCargoToml,
     DependencyValue,
@@ -14,8 +15,9 @@ const PARENT_BRANCH: &str = include_str!("../scripts/parent_branch.txt");
 const MAIN_BRANCH: &str = "main";
 const EXPECTED_MAIN_VERSION: &str = "0.0.0";
 
-static ROOT_CRATES_FOR_PUBLISH: LazyLock<HashSet<&str>> =
-    LazyLock::new(|| HashSet::from(["blockifier", "apollo_starknet_os_program"]));
+static ROOT_CRATES_FOR_PUBLISH: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+    HashSet::from(["blockifier", "apollo_starknet_os_program", "starknet_proof_verifier"])
+});
 static CRATES_FOR_PUBLISH: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let publish_deps: HashSet<String> = ROOT_CRATES_FOR_PUBLISH
         .iter()
@@ -30,6 +32,33 @@ static CRATES_FOR_PUBLISH: LazyLock<HashSet<String>> = LazyLock::new(|| {
         .cloned()
         .collect()
 });
+
+const CRATES_FOR_PUBLISH_REGRESSION: Expect = expect![[r#"
+    [
+        "apollo_compilation_utils",
+        "apollo_compile_to_native",
+        "apollo_compile_to_native_types",
+        "apollo_config",
+        "apollo_infra_utils",
+        "apollo_metrics",
+        "apollo_proc_macros",
+        "apollo_sizeof",
+        "apollo_sizeof_macros",
+        "apollo_starknet_os_program",
+        "apollo_time",
+        "blockifier",
+        "blockifier_test_utils",
+        "starknet_api",
+        "starknet_proof_verifier",
+    ]
+"#]];
+
+#[test]
+fn test_crates_for_publish_regression() {
+    let mut sorted_crates = CRATES_FOR_PUBLISH.clone().into_iter().collect::<Vec<_>>();
+    sorted_crates.sort();
+    CRATES_FOR_PUBLISH_REGRESSION.assert_debug_eq(&sorted_crates);
+}
 
 /// All member crates listed in the root Cargo.toml should have a version field if and only if they
 /// are intended for publishing.
