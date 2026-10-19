@@ -352,6 +352,7 @@ impl<S: StateReader> WorkerExecutor<S> {
             CALLS_RUNNING_NATIVE.increment(call_summary.n_calls_running_native);
             // Ask the bouncer if there is room for the transaction in the block.
             let bouncer_result = self.bouncer.lock().expect("Bouncer lock failed.").try_update(
+                self.block_context.block_info.block_number,
                 &tx_versioned_state,
                 &tx_state_changes_keys,
                 &execution_summary,

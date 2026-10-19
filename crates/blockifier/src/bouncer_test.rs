@@ -7,6 +7,7 @@ use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use expect_test::expect;
 use rstest::{fixture, rstest};
+use starknet_api::block::BlockNumber;
 use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::core::{ClassHash, CompiledClassHash};
 use starknet_api::execution_resources::GasAmount;
@@ -15,6 +16,7 @@ use starknet_api::{class_hash, contract_address, felt, storage_key};
 
 use super::BouncerConfig;
 use crate::blockifier::transaction_executor::TransactionExecutorError;
+use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{
     cairo_primitives_to_gas,
     get_patricia_update_resources,
@@ -349,6 +351,7 @@ fn test_bouncer_try_update_gas_based(#[case] scenario: &'static str, block_conte
     let tx_state_changes_keys = transactional_state.to_state_diff().unwrap().state_maps.keys();
 
     let result = bouncer.try_update(
+        BlockNumber(0),
         &transactional_state,
         &tx_state_changes_keys,
         &execution_summary,
@@ -450,6 +453,7 @@ fn test_bouncer_try_update_n_txs(
     };
     // Try to update the bouncer.
     let mut result = bouncer.try_update(
+        BlockNumber(0),
         &first_transactional_state,
         &first_tx_state_changes_keys,
         &first_tx_execution_summary,
@@ -488,6 +492,7 @@ fn test_bouncer_try_update_n_txs(
         second_transactional_state.to_state_diff().unwrap().state_maps.keys();
 
     result = bouncer.try_update(
+        BlockNumber(0),
         &second_transactional_state,
         &second_tx_state_changes_keys,
         &ExecutionSummary::default(),
@@ -498,6 +503,49 @@ fn test_bouncer_try_update_n_txs(
     );
 
     assert_matches!(result, Err(TransactionExecutorError::BlockFull));
+}
+
+#[test]
+fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
+    let versioned_constants = VersionedConstants::create_for_account_testing();
+    assert!(versioned_constants.enable_stateful_compression);
+    let alias_contract_address =
+        versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+    let mut state_reader = DictStateReader::default();
+    state_reader.storage_view.insert(
+        (alias_contract_address, storage_key!(0_u128)),
+        felt!(0x80_u128),
+    );
+    // 0x200 already has an alias; 0x100 and 0x300 do not.
+    state_reader.storage_view.insert(
+        (alias_contract_address, storage_key!(0x200_u128)),
+        felt!(0x81_u128),
+    );
+
+    let state_changes_keys = StateChangesKeys {
+        storage_keys: HashSet::from([
+            (contract_address!(0x100_u128), storage_key!(0x200_u128)),
+            (contract_address!(0x100_u128), storage_key!(0x300_u128)),
+        ]),
+        modified_contracts: HashSet::from([contract_address!(0x100_u128)]),
+        ..StateChangesKeys::default()
+    };
+    let mut bouncer = Bouncer::empty();
+
+    bouncer
+        .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
+        .unwrap();
+    // Re-observing the same keys must not allocate/count them twice.
+    bouncer
+        .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
+        .unwrap();
+    bouncer.state_changes_keys.extend(&state_changes_keys);
+
+    let prediction = bouncer.snos_output_shadow_prediction(&versioned_constants);
+    assert_eq!(prediction.new_aliases, 2);
+    assert_eq!(prediction.modified_contracts, 2);
+    assert_eq!(prediction.storage_updates, 5);
+    assert_eq!(prediction.cells, 41);
 }
 
 /// This test verifies that `get_tx_weights` returns a reasonable casm hash computation data.
