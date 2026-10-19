@@ -115,8 +115,7 @@ impl<S: StateReader> TransactionExecutor<S> {
         )?;
         let preprocessed_state_changes_keys = block_state.to_state_diff()?.state_maps.keys();
         let executor = Self::new_with_pool(block_state, block_context, config, worker_pool);
-        lock_bouncer(&executor.bouncer)
-            .seed_snos_output_shadow(preprocessed_state_changes_keys);
+        lock_bouncer(&executor.bouncer).seed_snos_output_shadow(preprocessed_state_changes_keys);
         Ok(executor)
     }
 

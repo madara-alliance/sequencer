@@ -124,6 +124,7 @@ impl TryFrom<PyBouncerConfig> for BouncerConfig {
             builtin_weights: hash_map_into_builtin_weights(
                 py_bouncer_config.builtin_weights.clone(),
             )?,
+            ..Default::default()
         })
     }
 }

@@ -76,10 +76,28 @@ macro_rules! impl_field_wise_ops {
     };
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub const DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS: usize = 49_000;
+
+fn default_max_snos_full_output_cells() -> usize {
+    DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BouncerConfig {
     pub block_max_capacity: BouncerWeights,
     pub builtin_weights: BuiltinWeights,
+    #[serde(default = "default_max_snos_full_output_cells")]
+    pub max_snos_full_output_cells: usize,
+}
+
+impl Default for BouncerConfig {
+    fn default() -> Self {
+        Self {
+            block_max_capacity: BouncerWeights::default(),
+            builtin_weights: BuiltinWeights::default(),
+            max_snos_full_output_cells: DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+        }
+    }
 }
 
 impl BouncerConfig {
@@ -87,6 +105,7 @@ impl BouncerConfig {
         Self {
             block_max_capacity: BouncerWeights::empty(),
             builtin_weights: BuiltinWeights::empty(),
+            max_snos_full_output_cells: 0,
         }
     }
 
@@ -94,6 +113,7 @@ impl BouncerConfig {
         Self {
             block_max_capacity: BouncerWeights::max(),
             builtin_weights: BuiltinWeights::default(),
+            max_snos_full_output_cells: usize::MAX,
         }
     }
 
@@ -125,6 +145,12 @@ impl SerializeConfig for BouncerConfig {
         let mut dump =
             prepend_sub_config_name(self.block_max_capacity.dump(), "block_max_capacity");
         dump.append(&mut prepend_sub_config_name(self.builtin_weights.dump(), "builtin_weights"));
+        dump.append(&mut BTreeMap::from([ser_param(
+            "max_snos_full_output_cells",
+            &self.max_snos_full_output_cells,
+            "An upper bound on the predicted full SNOS output cells in a block.",
+            ParamPrivacyInput::Public,
+        )]));
         dump
     }
 }
@@ -564,18 +590,17 @@ struct SnosOutputShadowUpdate {
     newly_checked_aliases: Vec<(StorageKey, bool)>,
 }
 
-const MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS: usize = 49_000;
-
 fn ensure_snos_output_within_limit(
     predicted_output_cells: usize,
     current_n_txs: usize,
+    max_output_cells: usize,
 ) -> TransactionExecutorResult<()> {
-    if predicted_output_cells <= MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS {
+    if predicted_output_cells <= max_output_cells {
         return Ok(());
     }
     if current_n_txs == 0 {
         Err(TransactionExecutionError::TransactionTooLargeForProof {
-            max_output_cells: MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+            max_output_cells,
             predicted_output_cells,
         }
         .into())
@@ -707,9 +732,11 @@ impl Bouncer {
             &marginal_state_changes_keys,
             &tx_weights,
         );
-        if let Err(error) =
-            ensure_snos_output_within_limit(prediction.cells, self.get_bouncer_weights().n_txs)
-        {
+        if let Err(error) = ensure_snos_output_within_limit(
+            prediction.cells,
+            self.get_bouncer_weights().n_txs,
+            self.bouncer_config.max_snos_full_output_cells,
+        ) {
             self.rollback_snos_output_shadow(shadow_update);
             let tx_ordinal = next_accumulated_weights.n_txs;
             let empty_block = self.get_bouncer_weights().n_txs == 0;
@@ -720,7 +747,7 @@ impl Bouncer {
                 block_number,
                 tx_ordinal,
                 prediction.cells,
-                MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+                self.bouncer_config.max_snos_full_output_cells,
                 if empty_block { "transaction_too_large_for_proof" } else { "block_full" },
             );
             return Err(error);
@@ -733,7 +760,8 @@ impl Bouncer {
                 target: "snos_output_shadow",
                 "event=tx_prediction block_number={} tx_ordinal={} predicted_full_output_cells={} \
                  message_segment_length={} modified_contracts={} storage_updates={} \
-                 declared_class_updates={} new_aliases={} exceeds_49000={}",
+                 declared_class_updates={} new_aliases={} exceeds_49000={} \
+                 exceeds_configured_limit={} max_full_output_cells={}",
                 block_number,
                 self.get_bouncer_weights().n_txs,
                 prediction.cells,
@@ -742,7 +770,9 @@ impl Bouncer {
                 prediction.storage_updates,
                 prediction.declared_class_updates,
                 prediction.new_aliases,
-                prediction.cells > MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+                prediction.cells > DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+                prediction.cells > self.bouncer_config.max_snos_full_output_cells,
+                self.bouncer_config.max_snos_full_output_cells,
             );
         }
 
@@ -781,8 +811,7 @@ impl Bouncer {
         let counter_was_zero = match self.snos_output_shadow.alias_counter_was_zero {
             Some(value) => value,
             None => {
-                state_reader
-                    .get_storage_at(alias_contract_address, ALIAS_COUNTER_STORAGE_KEY)?
+                state_reader.get_storage_at(alias_contract_address, ALIAS_COUNTER_STORAGE_KEY)?
                     == Felt::ZERO
             }
         };
@@ -928,14 +957,17 @@ impl Bouncer {
             target: "snos_output_shadow",
             "event=block_prediction block_number={} predicted_full_output_cells={} \
              finalized_state_diff_cells={} prediction_minus_finalized={} undercount={} \
-             exceeds_49000={} message_segment_length={} modified_contracts={} storage_updates={} \
+             exceeds_49000={} exceeds_configured_limit={} max_full_output_cells={} \
+             message_segment_length={} modified_contracts={} storage_updates={} \
              declared_class_updates={} new_aliases={}",
             block_number,
             prediction.cells,
             actual_shape_cells,
             prediction.cells as i128 - actual_shape_cells as i128,
             prediction.cells < actual_shape_cells,
-            prediction.cells > MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+            prediction.cells > DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+            prediction.cells > self.bouncer_config.max_snos_full_output_cells,
+            self.bouncer_config.max_snos_full_output_cells,
             prediction.message_segment_length,
             prediction.modified_contracts,
             prediction.storage_updates,

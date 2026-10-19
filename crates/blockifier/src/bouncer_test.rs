@@ -11,10 +11,12 @@ use starknet_api::block::BlockNumber;
 use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::core::{ClassHash, CompiledClassHash};
 use starknet_api::execution_resources::GasAmount;
+use starknet_api::state::StorageKey;
 use starknet_api::transaction::fields::Fee;
 use starknet_api::{class_hash, contract_address, felt, storage_key};
+use starknet_types_core::felt::Felt;
 
-use super::BouncerConfig;
+use super::{BouncerConfig, DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS};
 use crate::blockifier::transaction_executor::TransactionExecutorError;
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{
@@ -30,7 +32,6 @@ use crate::bouncer::{
     CasmHashComputationData,
     CasmHashMigrationData,
     TxWeights,
-    MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
 };
 use crate::context::BlockContext;
 use crate::execution::call_info::{
@@ -44,6 +45,7 @@ use crate::execution::call_info::{
 use crate::fee::resources::{ComputationResources, TransactionResources};
 use crate::state::cached_state::{CachedState, StateChangesKeys, StateMaps, TransactionalState};
 use crate::state::state_api::StateReader;
+use crate::state::stateful_compression::ALIAS_COUNTER_STORAGE_KEY;
 use crate::test_utils::contracts::FeatureContractData;
 use crate::test_utils::dict_state_reader::DictStateReader;
 use crate::test_utils::initial_test_state::test_state;
@@ -81,7 +83,11 @@ fn block_max_capacity() -> BouncerWeights {
 
 #[fixture]
 fn bouncer_config(block_max_capacity: BouncerWeights) -> BouncerConfig {
-    BouncerConfig { block_max_capacity, builtin_weights: BuiltinWeights::default() }
+    BouncerConfig {
+        block_max_capacity,
+        builtin_weights: BuiltinWeights::default(),
+        ..Default::default()
+    }
 }
 
 #[rstest]
@@ -329,7 +335,8 @@ fn test_bouncer_try_update_gas_based(#[case] scenario: &'static str, block_conte
         proving_gas: proving_gas_max_capacity,
         receipt_l2_gas: GasAmount(20),
     };
-    let bouncer_config = BouncerConfig { block_max_capacity, builtin_weights };
+    let bouncer_config =
+        BouncerConfig { block_max_capacity, builtin_weights, ..Default::default() };
 
     let bouncer_weights = BouncerWeights {
         l1_gas: 10,
@@ -515,15 +522,13 @@ fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
     let alias_contract_address =
         versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
     let mut state_reader = DictStateReader::default();
-    state_reader.storage_view.insert(
-        (alias_contract_address, storage_key!(0_u128)),
-        felt!(0x80_u128),
-    );
+    state_reader
+        .storage_view
+        .insert((alias_contract_address, storage_key!(0_u128)), felt!(0x80_u128));
     // 0x200 already has an alias; 0x100 and 0x300 do not.
-    state_reader.storage_view.insert(
-        (alias_contract_address, storage_key!(0x200_u128)),
-        felt!(0x81_u128),
-    );
+    state_reader
+        .storage_view
+        .insert((alias_contract_address, storage_key!(0x200_u128)), felt!(0x81_u128));
 
     let state_changes_keys = StateChangesKeys {
         storage_keys: HashSet::from([
@@ -573,20 +578,91 @@ fn test_snos_output_shadow_prediction_includes_preprocessed_state_changes() {
 
 #[test]
 fn test_snos_output_admission_closes_block_or_rejects_oversized_transaction() {
-    assert!(ensure_snos_output_within_limit(MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS, 1).is_ok());
+    let max_output_cells = 49_000;
+    assert!(ensure_snos_output_within_limit(max_output_cells, 1, max_output_cells).is_ok());
     assert_matches!(
-        ensure_snos_output_within_limit(MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS + 1, 1),
+        ensure_snos_output_within_limit(max_output_cells + 1, 1, max_output_cells),
         Err(TransactionExecutorError::BlockFull)
     );
     assert_matches!(
-        ensure_snos_output_within_limit(MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS + 1, 0),
+        ensure_snos_output_within_limit(max_output_cells + 1, 0, max_output_cells),
         Err(TransactionExecutorError::TransactionExecutionError(
             TransactionExecutionError::TransactionTooLargeForProof {
-                max_output_cells: MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+                max_output_cells: 49_000,
                 predicted_output_cells: 49_001,
             }
         ))
     );
+}
+
+#[test]
+fn test_snos_output_admission_rolls_back_rejected_transaction() {
+    let versioned_constants = VersionedConstants::create_for_account_testing();
+    let alias_contract_address =
+        versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+    let mut state_reader = DictStateReader::default();
+    state_reader
+        .storage_view
+        .insert((alias_contract_address, ALIAS_COUNTER_STORAGE_KEY), Felt::ONE);
+    let state_changes_keys = StateChangesKeys {
+        storage_keys: (0..16_327)
+            .map(|key| (contract_address!(0x1_u128), StorageKey::from(key as u128)))
+            .collect(),
+        modified_contracts: HashSet::from([contract_address!(0x1_u128)]),
+        ..StateChangesKeys::default()
+    };
+
+    for current_n_txs in [0, 1] {
+        let mut bouncer = Bouncer::new(BouncerConfig {
+            max_snos_full_output_cells: 49_000,
+            ..BouncerConfig::max()
+        });
+        bouncer.set_bouncer_weights(BouncerWeights {
+            n_txs: current_n_txs,
+            ..BouncerWeights::empty()
+        });
+        let result = bouncer.try_update(
+            BlockNumber(0),
+            &state_reader,
+            &state_changes_keys,
+            &ExecutionSummary::default(),
+            &CairoPrimitiveCounterMap::default(),
+            &TransactionResources::default(),
+            &versioned_constants,
+            GasAmount::ZERO,
+        );
+
+        if current_n_txs == 0 {
+            assert_matches!(
+                result,
+                Err(TransactionExecutorError::TransactionExecutionError(
+                    TransactionExecutionError::TransactionTooLargeForProof {
+                        max_output_cells: 49_000,
+                        predicted_output_cells: 49_001,
+                    }
+                ))
+            );
+        } else {
+            assert_matches!(result, Err(TransactionExecutorError::BlockFull));
+        }
+        assert_eq!(bouncer.get_bouncer_weights().n_txs, current_n_txs);
+        assert!(bouncer.state_changes_keys.storage_keys.is_empty());
+        assert_eq!(bouncer.snos_output_shadow.alias_counter_was_zero, None);
+    }
+}
+
+#[test]
+fn test_snos_output_limit_config_defaults_and_max() {
+    assert_eq!(
+        BouncerConfig::default().max_snos_full_output_cells,
+        DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS
+    );
+    assert_eq!(BouncerConfig::max().max_snos_full_output_cells, usize::MAX);
+
+    let mut legacy_config = serde_json::to_value(BouncerConfig::default()).unwrap();
+    legacy_config.as_object_mut().unwrap().remove("max_snos_full_output_cells");
+    let deserialized: BouncerConfig = serde_json::from_value(legacy_config).unwrap();
+    assert_eq!(deserialized.max_snos_full_output_cells, DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS);
 }
 
 /// This test verifies that `get_tx_weights` returns a reasonable casm hash computation data.
