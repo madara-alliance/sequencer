@@ -31,6 +31,7 @@ use crate::metrics::{
 };
 use crate::state::cached_state::{ContractClassMapping, StateMaps, TransactionalState};
 use crate::state::state_api::{StateReader, UpdatableState};
+use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::{TransactionExecutionInfo, TransactionExecutionResult};
 use crate::transaction::transaction_execution::Transaction;
 use crate::transaction::transactions::ExecutableTransaction;
@@ -364,6 +365,18 @@ impl<S: StateReader> WorkerExecutor<S> {
             if let Err(error) = bouncer_result {
                 match error {
                     TransactionExecutorError::BlockFull => return Ok(CommitResult::NoRoomInBlock),
+                    TransactionExecutorError::TransactionExecutionError(
+                        error @ TransactionExecutionError::TransactionTooLargeForProof { .. },
+                    ) => {
+                        tx_versioned_state.delete_writes(
+                            &execution_output.state_diff,
+                            &execution_output.contract_classes,
+                        )?;
+                        execution_output.state_diff = StateMaps::default();
+                        execution_output.contract_classes = HashMap::default();
+                        execution_output.result = Err(error);
+                        return Ok(CommitResult::Success);
+                    }
                     _ => {
                         // TODO(Avi, 01/07/2024): Consider propagating the error.
                         panic!("Bouncer update failed. {error:?}: {error}");
