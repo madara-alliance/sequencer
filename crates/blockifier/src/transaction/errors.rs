@@ -115,6 +115,11 @@ pub enum TransactionExecutionError {
          transaction size: {}.", *max_capacity, *tx_size
     )]
     TransactionTooLarge { max_capacity: Box<BouncerWeights>, tx_size: Box<BouncerWeights> },
+    #[error(
+        "Transaction is too large for proof. Maximum predicted full SNOS output: \
+         {max_output_cells} cells, transaction prediction: {predicted_output_cells} cells."
+    )]
+    TransactionTooLargeForProof { max_output_cells: usize, predicted_output_cells: usize },
     #[error("{}", gen_tx_execution_error_trace(self))]
     ValidateTransactionError {
         error: Box<EntryPointExecutionError>,

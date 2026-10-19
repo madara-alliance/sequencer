@@ -19,6 +19,7 @@ use crate::blockifier::transaction_executor::TransactionExecutorError;
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{
     cairo_primitives_to_gas,
+    ensure_snos_output_within_limit,
     get_patricia_update_resources,
     get_tx_weights,
     map_class_hash_to_casm_hash_computation_resources,
@@ -29,6 +30,7 @@ use crate::bouncer::{
     CasmHashComputationData,
     CasmHashMigrationData,
     TxWeights,
+    MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
 };
 use crate::context::BlockContext;
 use crate::execution::call_info::{
@@ -567,6 +569,24 @@ fn test_snos_output_shadow_prediction_includes_preprocessed_state_changes() {
     assert_eq!(prediction.modified_contracts, 1);
     assert_eq!(prediction.storage_updates, 1);
     assert_eq!(prediction.cells, 23);
+}
+
+#[test]
+fn test_snos_output_admission_closes_block_or_rejects_oversized_transaction() {
+    assert!(ensure_snos_output_within_limit(MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS, 1).is_ok());
+    assert_matches!(
+        ensure_snos_output_within_limit(MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS + 1, 1),
+        Err(TransactionExecutorError::BlockFull)
+    );
+    assert_matches!(
+        ensure_snos_output_within_limit(MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS + 1, 0),
+        Err(TransactionExecutorError::TransactionExecutionError(
+            TransactionExecutionError::TransactionTooLargeForProof {
+                max_output_cells: MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+                predicted_output_cells: 49_001,
+            }
+        ))
+    );
 }
 
 /// This test verifies that `get_tx_weights` returns a reasonable casm hash computation data.

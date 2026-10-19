@@ -558,6 +558,32 @@ struct SnosOutputShadowPrediction {
     new_aliases: usize,
 }
 
+#[derive(Debug, Default)]
+struct SnosOutputShadowUpdate {
+    previous_alias_counter_was_zero: Option<bool>,
+    newly_checked_aliases: Vec<(StorageKey, bool)>,
+}
+
+const MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS: usize = 49_000;
+
+fn ensure_snos_output_within_limit(
+    predicted_output_cells: usize,
+    current_n_txs: usize,
+) -> TransactionExecutorResult<()> {
+    if predicted_output_cells <= MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS {
+        return Ok(());
+    }
+    if current_n_txs == 0 {
+        Err(TransactionExecutionError::TransactionTooLargeForProof {
+            max_output_cells: MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+            predicted_output_cells,
+        }
+        .into())
+    } else {
+        Err(TransactionExecutorError::BlockFull)
+    }
+}
+
 impl Bouncer {
     pub fn new(bouncer_config: BouncerConfig) -> Self {
         Bouncer { bouncer_config, ..Self::empty() }
@@ -671,18 +697,38 @@ impl Bouncer {
             Err(TransactionExecutorError::BlockFull)?
         }
 
-        if log::log_enabled!(target: "snos_output_shadow", log::Level::Info) {
-            self.update_snos_output_shadow(
-                state_reader,
-                &marginal_state_changes_keys,
-                versioned_constants,
-            )?;
+        let shadow_update = self.update_snos_output_shadow(
+            state_reader,
+            &marginal_state_changes_keys,
+            versioned_constants,
+        )?;
+        let prediction = self.snos_output_shadow_prediction_with_pending(
+            versioned_constants,
+            &marginal_state_changes_keys,
+            &tx_weights,
+        );
+        if let Err(error) =
+            ensure_snos_output_within_limit(prediction.cells, self.get_bouncer_weights().n_txs)
+        {
+            self.rollback_snos_output_shadow(shadow_update);
+            let tx_ordinal = next_accumulated_weights.n_txs;
+            let empty_block = self.get_bouncer_weights().n_txs == 0;
+            log::info!(
+                target: "snos_output_shadow",
+                "event=tx_prediction_rejected block_number={} tx_ordinal={} \
+                 predicted_full_output_cells={} max_full_output_cells={} reason={}",
+                block_number,
+                tx_ordinal,
+                prediction.cells,
+                MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
+                if empty_block { "transaction_too_large_for_proof" } else { "block_full" },
+            );
+            return Err(error);
         }
 
         self.update(tx_weights, tx_execution_summary, &marginal_state_changes_keys);
 
         if log::log_enabled!(target: "snos_output_shadow", log::Level::Info) {
-            let prediction = self.snos_output_shadow_prediction(versioned_constants);
             log::info!(
                 target: "snos_output_shadow",
                 "event=tx_prediction block_number={} tx_ordinal={} predicted_full_output_cells={} \
@@ -696,7 +742,7 @@ impl Bouncer {
                 prediction.storage_updates,
                 prediction.declared_class_updates,
                 prediction.new_aliases,
-                prediction.cells > 49_000,
+                prediction.cells > MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
             );
         }
 
@@ -708,9 +754,9 @@ impl Bouncer {
         state_reader: &S,
         marginal_state_changes_keys: &StateChangesKeys,
         versioned_constants: &VersionedConstants,
-    ) -> TransactionExecutorResult<()> {
+    ) -> TransactionExecutorResult<SnosOutputShadowUpdate> {
         if !versioned_constants.enable_stateful_compression {
-            return Ok(());
+            return Ok(SnosOutputShadowUpdate::default());
         }
 
         let alias_contract_address =
@@ -749,19 +795,55 @@ impl Bouncer {
             }
         }
 
+        let update = SnosOutputShadowUpdate {
+            previous_alias_counter_was_zero: self.snos_output_shadow.alias_counter_was_zero,
+            newly_checked_aliases: newly_checked,
+        };
         self.snos_output_shadow.alias_counter_was_zero = Some(counter_was_zero);
-        for (candidate, needs_alias) in newly_checked {
-            self.snos_output_shadow.checked_alias_candidates.insert(candidate);
-            if needs_alias {
-                self.snos_output_shadow.new_alias_keys.insert(candidate);
+        for (candidate, needs_alias) in &update.newly_checked_aliases {
+            self.snos_output_shadow.checked_alias_candidates.insert(*candidate);
+            if *needs_alias {
+                self.snos_output_shadow.new_alias_keys.insert(*candidate);
             }
         }
-        Ok(())
+        Ok(update)
+    }
+
+    fn rollback_snos_output_shadow(&mut self, update: SnosOutputShadowUpdate) {
+        self.snos_output_shadow.alias_counter_was_zero = update.previous_alias_counter_was_zero;
+        for (candidate, needs_alias) in update.newly_checked_aliases {
+            self.snos_output_shadow.checked_alias_candidates.remove(&candidate);
+            if needs_alias {
+                self.snos_output_shadow.new_alias_keys.remove(&candidate);
+            }
+        }
     }
 
     fn snos_output_shadow_prediction(
         &self,
         versioned_constants: &VersionedConstants,
+    ) -> SnosOutputShadowPrediction {
+        self.snos_output_shadow_prediction_inner(versioned_constants, None, None)
+    }
+
+    fn snos_output_shadow_prediction_with_pending(
+        &self,
+        versioned_constants: &VersionedConstants,
+        pending_state_changes_keys: &StateChangesKeys,
+        pending_tx_weights: &TxWeights,
+    ) -> SnosOutputShadowPrediction {
+        self.snos_output_shadow_prediction_inner(
+            versioned_constants,
+            Some(pending_state_changes_keys),
+            Some(pending_tx_weights),
+        )
+    }
+
+    fn snos_output_shadow_prediction_inner(
+        &self,
+        versioned_constants: &VersionedConstants,
+        pending_state_changes_keys: Option<&StateChangesKeys>,
+        pending_tx_weights: Option<&TxWeights>,
     ) -> SnosOutputShadowPrediction {
         let mut storage_updates =
             self.snos_output_shadow.preprocessed_state_changes_keys.storage_keys.clone();
@@ -769,6 +851,21 @@ impl Bouncer {
         let mut modified_contracts =
             self.snos_output_shadow.preprocessed_state_changes_keys.modified_contracts.clone();
         modified_contracts.extend(self.state_changes_keys.modified_contracts.iter().copied());
+        let mut compiled_class_hashes = self.state_changes_keys.compiled_class_hash_keys.clone();
+        let mut migrated_class_hashes = self
+            .accumulated_weights
+            .class_hashes_to_migrate
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        if let Some(pending) = pending_state_changes_keys {
+            storage_updates.extend(pending.storage_keys.iter().copied());
+            modified_contracts.extend(pending.modified_contracts.iter().copied());
+            compiled_class_hashes.extend(pending.compiled_class_hash_keys.iter().copied());
+        }
+        if let Some(pending) = pending_tx_weights {
+            migrated_class_hashes.extend(pending.class_hashes_to_migrate.keys().copied());
+        }
 
         if versioned_constants.enable_stateful_compression {
             let alias_contract_address =
@@ -786,9 +883,15 @@ impl Bouncer {
             }
         }
 
-        let message_segment_length = self.get_bouncer_weights().message_segment_length;
-        let declared_class_updates = self.state_changes_keys.compiled_class_hash_keys.len()
-            + self.accumulated_weights.class_hashes_to_migrate.len();
+        let message_segment_length = pending_tx_weights
+            .map(|pending| {
+                self.get_bouncer_weights()
+                    .checked_add(pending.bouncer_weights)
+                    .expect("Bouncer weights were already checked for overflow")
+                    .message_segment_length
+            })
+            .unwrap_or(self.get_bouncer_weights().message_segment_length);
+        let declared_class_updates = compiled_class_hashes.len() + migrated_class_hashes.len();
         let cells = 14
             + message_segment_length
             + 6 * modified_contracts.len()
@@ -832,7 +935,7 @@ impl Bouncer {
             actual_shape_cells,
             prediction.cells as i128 - actual_shape_cells as i128,
             prediction.cells < actual_shape_cells,
-            prediction.cells > 49_000,
+            prediction.cells > MAX_PREDICTED_FULL_SNOS_OUTPUT_CELLS,
             prediction.message_segment_length,
             prediction.modified_contracts,
             prediction.storage_updates,
