@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Instant;
 
 use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
 use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
@@ -561,6 +562,18 @@ pub struct Bouncer {
     pub bouncer_config: BouncerConfig,
     accumulated_weights: TxWeights,
     snos_output_shadow: SnosOutputShadowTracker,
+    last_snos_output_timing: Option<SnosOutputTiming>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SnosOutputTiming {
+    pub alias_detection_ns: u128,
+    pub output_accounting_ns: u128,
+    pub snos_admission_total_ns: u128,
+    pub alias_candidates_checked: usize,
+    pub new_aliases_discovered: usize,
+    pub new_aliases_total: usize,
+    pub predicted_full_output_cells: usize,
 }
 
 /// Shadow-only prediction of the full SNOS output size. This is deliberately not a bouncer
@@ -621,11 +634,16 @@ impl Bouncer {
             bouncer_config: BouncerConfig::empty(),
             accumulated_weights: TxWeights::empty(),
             snos_output_shadow: SnosOutputShadowTracker::default(),
+            last_snos_output_timing: None,
         }
     }
 
     pub fn get_bouncer_weights(&self) -> &BouncerWeights {
         &self.accumulated_weights.bouncer_weights
+    }
+
+    pub(crate) fn take_last_snos_output_timing(&mut self) -> Option<SnosOutputTiming> {
+        self.last_snos_output_timing.take()
     }
 
     pub(crate) fn seed_snos_output_shadow(
@@ -722,24 +740,62 @@ impl Bouncer {
             Err(TransactionExecutorError::BlockFull)?
         }
 
+        let snos_admission_started_at = Instant::now();
+        let alias_detection_started_at = Instant::now();
         let shadow_update = self.update_snos_output_shadow(
             state_reader,
             &marginal_state_changes_keys,
             versioned_constants,
         )?;
+        let alias_detection_ns = alias_detection_started_at.elapsed().as_nanos();
+        let alias_candidates_checked = shadow_update.newly_checked_aliases.len();
+        let new_aliases_discovered = shadow_update
+            .newly_checked_aliases
+            .iter()
+            .filter(|(_, needs_alias)| *needs_alias)
+            .count();
+        let output_accounting_started_at = Instant::now();
         let prediction = self.snos_output_shadow_prediction_with_pending(
             versioned_constants,
             &marginal_state_changes_keys,
             &tx_weights,
         );
-        if let Err(error) = ensure_snos_output_within_limit(
+        let output_accounting_ns = output_accounting_started_at.elapsed().as_nanos();
+        let limit_result = ensure_snos_output_within_limit(
             prediction.cells,
             self.get_bouncer_weights().n_txs,
             self.bouncer_config.max_snos_full_output_cells,
-        ) {
+        );
+        let snos_admission_total_ns = snos_admission_started_at.elapsed().as_nanos();
+        let tx_ordinal = next_accumulated_weights.n_txs;
+        let snos_output_timing = SnosOutputTiming {
+            alias_detection_ns,
+            output_accounting_ns,
+            snos_admission_total_ns,
+            alias_candidates_checked,
+            new_aliases_discovered,
+            new_aliases_total: prediction.new_aliases,
+            predicted_full_output_cells: prediction.cells,
+        };
+        if let Err(error) = limit_result {
             self.rollback_snos_output_shadow(shadow_update);
-            let tx_ordinal = next_accumulated_weights.n_txs;
             let empty_block = self.get_bouncer_weights().n_txs == 0;
+            log::info!(
+                target: "snos_output_timing",
+                "event=snos_admission_timing block_number={} tx_ordinal={} accepted=false \
+                 alias_detection_ns={} output_accounting_ns={} snos_admission_total_ns={} \
+                 alias_candidates_checked={} new_aliases_discovered={} new_aliases_total={} \
+                 predicted_full_output_cells={}",
+                block_number,
+                tx_ordinal,
+                snos_output_timing.alias_detection_ns,
+                snos_output_timing.output_accounting_ns,
+                snos_output_timing.snos_admission_total_ns,
+                snos_output_timing.alias_candidates_checked,
+                snos_output_timing.new_aliases_discovered,
+                snos_output_timing.new_aliases_total,
+                snos_output_timing.predicted_full_output_cells,
+            );
             log::info!(
                 target: "snos_output_shadow",
                 "event=tx_prediction_rejected block_number={} tx_ordinal={} \
@@ -752,29 +808,9 @@ impl Bouncer {
             );
             return Err(error);
         }
+        self.last_snos_output_timing = Some(snos_output_timing);
 
         self.update(tx_weights, tx_execution_summary, &marginal_state_changes_keys);
-
-        if log::log_enabled!(target: "snos_output_shadow", log::Level::Info) {
-            log::info!(
-                target: "snos_output_shadow",
-                "event=tx_prediction block_number={} tx_ordinal={} predicted_full_output_cells={} \
-                 message_segment_length={} modified_contracts={} storage_updates={} \
-                 declared_class_updates={} new_aliases={} exceeds_49000={} \
-                 exceeds_configured_limit={} max_full_output_cells={}",
-                block_number,
-                self.get_bouncer_weights().n_txs,
-                prediction.cells,
-                prediction.message_segment_length,
-                prediction.modified_contracts,
-                prediction.storage_updates,
-                prediction.declared_class_updates,
-                prediction.new_aliases,
-                prediction.cells > DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
-                prediction.cells > self.bouncer_config.max_snos_full_output_cells,
-                self.bouncer_config.max_snos_full_output_cells,
-            );
-        }
 
         Ok(())
     }

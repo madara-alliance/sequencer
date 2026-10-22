@@ -166,19 +166,26 @@ impl<S: StateReader> TransactionExecutor<S> {
         &mut self,
         tx: &Transaction,
     ) -> TransactionExecutorResult<TransactionExecutionOutput> {
+        let total_started_at = Instant::now();
         let mut transactional_state = TransactionalState::create_transactional(
             self.block_state.as_mut().expect(BLOCK_STATE_ACCESS_ERR),
         );
 
         // Executing a single transaction cannot be done in a concurrent mode.
         let concurrency_mode = false;
+        let execute_raw_started_at = Instant::now();
         let tx_execution_result =
             tx.execute_raw(&mut transactional_state, &self.block_context, concurrency_mode);
+        let execute_raw_ns = execute_raw_started_at.elapsed().as_nanos();
         match tx_execution_result {
             Ok(tx_execution_info) => {
+                let state_diff_started_at = Instant::now();
                 let state_diff = transactional_state.to_state_diff()?.state_maps;
+                let state_diff_ns = state_diff_started_at.elapsed().as_nanos();
                 let tx_state_changes_keys = state_diff.keys();
-                lock_bouncer(&self.bouncer).try_update(
+                let bouncer_started_at = Instant::now();
+                let mut bouncer = lock_bouncer(&self.bouncer);
+                bouncer.try_update(
                     self.block_context.block_info.block_number,
                     &transactional_state,
                     &tx_state_changes_keys,
@@ -188,7 +195,39 @@ impl<S: StateReader> TransactionExecutor<S> {
                     &self.block_context.versioned_constants,
                     tx_execution_info.receipt.gas.l2_gas,
                 )?;
+                let tx_ordinal = bouncer.get_bouncer_weights().n_txs;
+                let snos_timing = bouncer
+                    .take_last_snos_output_timing()
+                    .expect("Successful bouncer update should record SNOS output timing");
+                drop(bouncer);
+                let bouncer_ns = bouncer_started_at.elapsed().as_nanos();
+
+                let commit_started_at = Instant::now();
                 transactional_state.commit();
+                let commit_ns = commit_started_at.elapsed().as_nanos();
+                let total_ns = total_started_at.elapsed().as_nanos();
+                log::info!(
+                    target: "snos_output_timing",
+                    "event=tx_execution_timing block_number={} tx_ordinal={} execute_raw_ns={} \
+                     state_diff_ns={} bouncer_ns={} commit_ns={} total_ns={} alias_detection_ns={} \
+                     output_accounting_ns={} snos_admission_total_ns={} \
+                     alias_candidates_checked={} new_aliases_discovered={} new_aliases_total={} \
+                     predicted_full_output_cells={}",
+                    self.block_context.block_info.block_number,
+                    tx_ordinal,
+                    execute_raw_ns,
+                    state_diff_ns,
+                    bouncer_ns,
+                    commit_ns,
+                    total_ns,
+                    snos_timing.alias_detection_ns,
+                    snos_timing.output_accounting_ns,
+                    snos_timing.snos_admission_total_ns,
+                    snos_timing.alias_candidates_checked,
+                    snos_timing.new_aliases_discovered,
+                    snos_timing.new_aliases_total,
+                    snos_timing.predicted_full_output_cells,
+                );
 
                 Ok((tx_execution_info, state_diff))
             }

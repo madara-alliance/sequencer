@@ -218,6 +218,7 @@ fn test_block_weights_has_room_n_txs(
     ]),
 },
     snos_output_shadow: Default::default(),
+    last_snos_output_timing: None,
 })]
 fn test_bouncer_update(#[case] initial_bouncer: Bouncer) {
     // TODO(Aviv): Use expect! to avoid magic numbers.
