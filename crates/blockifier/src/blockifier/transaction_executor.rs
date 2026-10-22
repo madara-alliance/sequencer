@@ -15,12 +15,12 @@ use crate::bouncer::{Bouncer, BouncerWeights, CasmHashComputationData};
 use crate::concurrency::worker_logic::WorkerExecutor;
 use crate::concurrency::worker_pool::WorkerPool;
 use crate::context::BlockContext;
-use crate::metrics::{record_transaction_executor_metrics, TransactionExecutorMetrics};
+use crate::metrics::{TransactionExecutorMetrics, record_transaction_executor_metrics};
 use crate::state::cached_state::{CachedState, CommitmentStateDiff, StateMaps, TransactionalState};
 use crate::state::compiled_class_hash_migration::CompiledClassHashMigrationUpdater;
 use crate::state::errors::StateError;
 use crate::state::state_api::{StateReader, StateResult};
-use crate::state::stateful_compression::{allocate_aliases_in_storage, compress, CompressionError};
+use crate::state::stateful_compression::{CompressionError, allocate_aliases_in_storage, compress};
 use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::TransactionExecutionInfo;
 use crate::transaction::transaction_execution::Transaction;
@@ -302,6 +302,7 @@ pub(crate) fn finalize_block<S: StateReader>(
     block_state: &mut CachedState<S>,
     block_context: &BlockContext,
 ) -> TransactionExecutorResult<BlockExecutionSummary> {
+    let finalize_started_at = Instant::now();
     let bouncer = lock_bouncer(bouncer);
     log::info!(
         "Block {} final weights: {:?}.",
@@ -314,10 +315,13 @@ pub(crate) fn finalize_block<S: StateReader>(
         .os_constants
         .os_contract_addresses
         .alias_contract_address();
+    let alias_allocation_started_at = Instant::now();
     if block_context.versioned_constants.enable_stateful_compression {
         allocate_aliases_in_storage(block_state, alias_contract_address)?;
     }
+    let alias_allocation_ns = alias_allocation_started_at.elapsed().as_nanos();
 
+    let class_hash_migration_started_at = Instant::now();
     let mut bouncer = bouncer;
     let class_hashes_to_migrate = mem::take(bouncer.get_mut_class_hashes_to_migrate());
     #[cfg(any(test, feature = "testing"))]
@@ -335,8 +339,11 @@ pub(crate) fn finalize_block<S: StateReader>(
         );
     }
     block_state.set_compiled_class_hash_migration(&class_hashes_to_migrate)?;
+    let class_hash_migration_ns = class_hash_migration_started_at.elapsed().as_nanos();
 
+    let state_diff_started_at = Instant::now();
     let state_diff = block_state.to_state_diff()?.state_maps;
+    let state_diff_ns = state_diff_started_at.elapsed().as_nanos();
 
     bouncer.log_snos_output_shadow_final(
         block_context.block_info.block_number,
@@ -344,11 +351,13 @@ pub(crate) fn finalize_block<S: StateReader>(
         &block_context.versioned_constants,
     );
 
+    let compression_started_at = Instant::now();
     let compressed_state_diff = if block_context.versioned_constants.enable_stateful_compression {
         Some(compress(&state_diff, block_state, alias_contract_address)?.into())
     } else {
         None
     };
+    let compression_ns = compression_started_at.elapsed().as_nanos();
 
     // Take CasmHashComputationData from bouncer,
     // and verify that class hashes are the same.
@@ -366,6 +375,19 @@ pub(crate) fn finalize_block<S: StateReader>(
             .class_hash_to_casm_hash_computation_gas
             .keys()
             .collect::<std::collections::HashSet<_>>()
+    );
+
+    let finalize_total_ns = finalize_started_at.elapsed().as_nanos();
+    log::info!(
+        target: "snos_output_timing",
+        "event=block_finalize_timing block_number={} alias_allocation_ns={} \
+         class_hash_migration_ns={} state_diff_ns={} compression_ns={} finalize_total_ns={}",
+        block_context.block_info.block_number,
+        alias_allocation_ns,
+        class_hash_migration_ns,
+        state_diff_ns,
+        compression_ns,
+        finalize_total_ns,
     );
 
     Ok(BlockExecutionSummary {
@@ -397,16 +419,19 @@ impl<S: StateReader + Send> TransactionExecutor<S> {
                     // when running Cairo natively, the real stack is used and could get overflowed
                     // (unlike the VM where the stack is simulated in the heap as a memory segment).
                     //
-                    // We pre-allocate the stack here, and not during Native execution (not trivial), so it
-                    // needs to be big enough ahead.
+                    // We pre-allocate the stack here, and not during Native execution (not
+                    // trivial), so it needs to be big enough ahead.
                     // However, making it very big is wasteful (especially with multi-threading).
-                    // So, the stack size should support calls with a reasonable gas limit, for extremely deep
-                    // recursions to reach out-of-gas before hitting the bottom of the recursion.
+                    // So, the stack size should support calls with a reasonable gas limit, for
+                    // extremely deep recursions to reach out-of-gas before
+                    // hitting the bottom of the recursion.
                     //
-                    // The gas upper bound is MAX_POSSIBLE_SIERRA_GAS, and sequencers must not raise it without
-                    // adjusting the stack size.
+                    // The gas upper bound is MAX_POSSIBLE_SIERRA_GAS, and sequencers must not raise
+                    // it without adjusting the stack size.
                     .stack_size(self.config.stack_size)
-                    .spawn_scoped(s, || self.execute_txs_sequentially_inner(&txs, execution_deadline))
+                    .spawn_scoped(s, || {
+                        self.execute_txs_sequentially_inner(&txs, execution_deadline)
+                    })
                     .expect("Failed to spawn thread")
                     .join()
                     .expect("Failed to join thread.")

@@ -20,27 +20,27 @@ use super::{BouncerConfig, DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS};
 use crate::blockifier::transaction_executor::TransactionExecutorError;
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{
-    cairo_primitives_to_gas,
-    ensure_snos_output_within_limit,
-    get_patricia_update_resources,
-    get_tx_weights,
-    map_class_hash_to_casm_hash_computation_resources,
-    verify_tx_weights_within_max_capacity,
     Bouncer,
     BouncerWeights,
     BuiltinWeights,
     CasmHashComputationData,
     CasmHashMigrationData,
     TxWeights,
+    cairo_primitives_to_gas,
+    ensure_snos_output_within_limit,
+    get_patricia_update_resources,
+    get_tx_weights,
+    map_class_hash_to_casm_hash_computation_resources,
+    verify_tx_weights_within_max_capacity,
 };
 use crate::context::BlockContext;
 use crate::execution::call_info::{
-    cairo_primitive_counter_map,
     CairoPrimitiveCounterMap,
     CairoPrimitiveName,
     ExecutionSummary,
     ExtendedExecutionResources,
     OpcodeCounterMap,
+    cairo_primitive_counter_map,
 };
 use crate::fee::resources::{ComputationResources, TransactionResources};
 use crate::state::cached_state::{CachedState, StateChangesKeys, StateMaps, TransactionalState};
@@ -52,8 +52,8 @@ use crate::test_utils::initial_test_state::test_state;
 use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::ExecutionResourcesTraits;
 use crate::transaction::test_utils::{
-    create_init_data_for_compiled_class_hash_migration_test,
     TestInitData,
+    create_init_data_for_compiled_class_hash_migration_test,
 };
 use crate::utils::{add_maps, u64_from_usize};
 
@@ -541,14 +541,25 @@ fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
     };
     let mut bouncer = Bouncer::empty();
 
-    bouncer
+    let mut first_update = bouncer
         .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
         .unwrap();
+    bouncer.apply_snos_output_shadow_accounting(
+        &versioned_constants,
+        &state_changes_keys,
+        &TxWeights::default(),
+        &mut first_update,
+    );
     // Re-observing the same keys must not allocate/count them twice.
-    bouncer
+    let mut second_update = bouncer
         .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
         .unwrap();
-    bouncer.state_changes_keys.extend(&state_changes_keys);
+    bouncer.apply_snos_output_shadow_accounting(
+        &versioned_constants,
+        &state_changes_keys,
+        &TxWeights::default(),
+        &mut second_update,
+    );
 
     let prediction = bouncer.snos_output_shadow_prediction(&versioned_constants);
     assert_eq!(prediction.new_aliases, 2);
@@ -649,6 +660,10 @@ fn test_snos_output_admission_rolls_back_rejected_transaction() {
         assert_eq!(bouncer.get_bouncer_weights().n_txs, current_n_txs);
         assert!(bouncer.state_changes_keys.storage_keys.is_empty());
         assert_eq!(bouncer.snos_output_shadow.alias_counter_was_zero, None);
+        assert!(bouncer.snos_output_shadow.storage_updates.is_empty());
+        assert!(bouncer.snos_output_shadow.modified_contracts.is_empty());
+        assert!(bouncer.snos_output_shadow.compiled_class_hashes.is_empty());
+        assert!(bouncer.snos_output_shadow.migrated_class_hashes.is_empty());
     }
 }
 
@@ -874,7 +889,9 @@ fn test_proving_gas_minus_sierra_gas_equals_builtin_gas(
                 .builtin_weights
                 .gas_costs
                 .get_cairo_primitive_gas_cost(&CairoPrimitiveName::Builtin(*name))
-                .unwrap_or_else(|_| panic!("Builtin name {:?} is not supported in the bouncer weights.", name));
+                .unwrap_or_else(|_| {
+                    panic!("Builtin name {:?} is not supported in the bouncer weights.", name)
+                });
             let stone_gas = block_context
                 .versioned_constants
                 .os_constants
