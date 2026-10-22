@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
+use apollo_config::dumping::{SerializeConfig, prepend_sub_config_name, ser_param};
 use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use serde::{Deserialize, Serialize};
 use starknet_api::block::BlockNumber;
-use starknet_api::core::ClassHash;
+use starknet_api::core::{ClassHash, ContractAddress};
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::state::StorageKey;
 use starknet_types_core::felt::Felt;
@@ -18,11 +18,11 @@ use crate::blockifier::transaction_executor::{
 };
 use crate::blockifier_versioned_constants::{BuiltinGasCosts, VersionedConstants};
 use crate::execution::call_info::{
-    cairo_primitive_counter_map,
     BuiltinCounterMap,
     CairoPrimitiveCounterMap,
     ExecutionSummary,
     ExtendedExecutionResources,
+    cairo_primitive_counter_map,
 };
 use crate::fee::gas_usage::get_onchain_data_segment_length;
 use crate::fee::resources::TransactionResources;
@@ -568,7 +568,10 @@ pub struct Bouncer {
 #[derive(Debug, Default, PartialEq)]
 #[cfg_attr(test, derive(Clone))]
 struct SnosOutputShadowTracker {
-    preprocessed_state_changes_keys: StateChangesKeys,
+    storage_updates: HashSet<StorageEntry>,
+    modified_contracts: HashSet<ContractAddress>,
+    compiled_class_hashes: HashSet<ClassHash>,
+    migrated_class_hashes: HashSet<ClassHash>,
     checked_alias_candidates: HashSet<StorageKey>,
     new_alias_keys: HashSet<StorageKey>,
     alias_counter_was_zero: Option<bool>,
@@ -588,6 +591,10 @@ struct SnosOutputShadowPrediction {
 struct SnosOutputShadowUpdate {
     previous_alias_counter_was_zero: Option<bool>,
     newly_checked_aliases: Vec<(StorageKey, bool)>,
+    inserted_storage_updates: Vec<StorageEntry>,
+    inserted_modified_contracts: Vec<ContractAddress>,
+    inserted_compiled_class_hashes: Vec<ClassHash>,
+    inserted_migrated_class_hashes: Vec<ClassHash>,
 }
 
 fn ensure_snos_output_within_limit(
@@ -632,7 +639,11 @@ impl Bouncer {
         &mut self,
         preprocessed_state_changes_keys: StateChangesKeys,
     ) {
-        self.snos_output_shadow.preprocessed_state_changes_keys = preprocessed_state_changes_keys;
+        self.snos_output_shadow.storage_updates = preprocessed_state_changes_keys.storage_keys;
+        self.snos_output_shadow.modified_contracts =
+            preprocessed_state_changes_keys.modified_contracts;
+        self.snos_output_shadow.compiled_class_hashes =
+            preprocessed_state_changes_keys.compiled_class_hash_keys;
     }
 
     pub fn get_mut_casm_hash_computation_data_sierra_gas(
@@ -722,16 +733,19 @@ impl Bouncer {
             Err(TransactionExecutorError::BlockFull)?
         }
 
-        let shadow_update = self.update_snos_output_shadow(
+        let mut shadow_update = self.update_snos_output_shadow(
             state_reader,
             &marginal_state_changes_keys,
             versioned_constants,
         )?;
-        let prediction = self.snos_output_shadow_prediction_with_pending(
+        self.apply_snos_output_shadow_accounting(
             versioned_constants,
             &marginal_state_changes_keys,
             &tx_weights,
+            &mut shadow_update,
         );
+        let prediction =
+            self.snos_output_shadow_prediction_with_pending(versioned_constants, &tx_weights);
         if let Err(error) = ensure_snos_output_within_limit(
             prediction.cells,
             self.get_bouncer_weights().n_txs,
@@ -791,7 +805,10 @@ impl Bouncer {
 
         let alias_contract_address =
             versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
-        let mut candidates = BTreeSet::new();
+        let mut candidates = HashSet::with_capacity(
+            marginal_state_changes_keys.modified_contracts.len()
+                + marginal_state_changes_keys.storage_keys.len(),
+        );
 
         for contract_address in &marginal_state_changes_keys.modified_contracts {
             let candidate = StorageKey(contract_address.0);
@@ -815,7 +832,7 @@ impl Bouncer {
                     == Felt::ZERO
             }
         };
-        let mut newly_checked = Vec::new();
+        let mut newly_checked = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if !self.snos_output_shadow.checked_alias_candidates.contains(&candidate) {
                 let needs_alias =
@@ -827,6 +844,7 @@ impl Bouncer {
         let update = SnosOutputShadowUpdate {
             previous_alias_counter_was_zero: self.snos_output_shadow.alias_counter_was_zero,
             newly_checked_aliases: newly_checked,
+            ..SnosOutputShadowUpdate::default()
         };
         self.snos_output_shadow.alias_counter_was_zero = Some(counter_was_zero);
         for (candidate, needs_alias) in &update.newly_checked_aliases {
@@ -846,72 +864,94 @@ impl Bouncer {
                 self.snos_output_shadow.new_alias_keys.remove(&candidate);
             }
         }
+        for entry in update.inserted_storage_updates {
+            self.snos_output_shadow.storage_updates.remove(&entry);
+        }
+        for contract_address in update.inserted_modified_contracts {
+            self.snos_output_shadow.modified_contracts.remove(&contract_address);
+        }
+        for class_hash in update.inserted_compiled_class_hashes {
+            self.snos_output_shadow.compiled_class_hashes.remove(&class_hash);
+        }
+        for class_hash in update.inserted_migrated_class_hashes {
+            self.snos_output_shadow.migrated_class_hashes.remove(&class_hash);
+        }
+    }
+
+    fn apply_snos_output_shadow_accounting(
+        &mut self,
+        versioned_constants: &VersionedConstants,
+        marginal_state_changes_keys: &StateChangesKeys,
+        tx_weights: &TxWeights,
+        update: &mut SnosOutputShadowUpdate,
+    ) {
+        for entry in &marginal_state_changes_keys.storage_keys {
+            if self.snos_output_shadow.storage_updates.insert(*entry) {
+                update.inserted_storage_updates.push(*entry);
+            }
+        }
+        for contract_address in &marginal_state_changes_keys.modified_contracts {
+            if self.snos_output_shadow.modified_contracts.insert(*contract_address) {
+                update.inserted_modified_contracts.push(*contract_address);
+            }
+        }
+        for class_hash in &marginal_state_changes_keys.compiled_class_hash_keys {
+            if self.snos_output_shadow.compiled_class_hashes.insert(*class_hash) {
+                update.inserted_compiled_class_hashes.push(*class_hash);
+            }
+        }
+        for class_hash in tx_weights.class_hashes_to_migrate.keys() {
+            if self.snos_output_shadow.migrated_class_hashes.insert(*class_hash) {
+                update.inserted_migrated_class_hashes.push(*class_hash);
+            }
+        }
+
+        if !versioned_constants.enable_stateful_compression {
+            return;
+        }
+
+        let alias_contract_address =
+            versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+        for (alias_key, needs_alias) in &update.newly_checked_aliases {
+            if *needs_alias {
+                let entry = (alias_contract_address, *alias_key);
+                if self.snos_output_shadow.storage_updates.insert(entry) {
+                    update.inserted_storage_updates.push(entry);
+                }
+            }
+        }
+        let counter_changes = self.snos_output_shadow.alias_counter_was_zero == Some(true)
+            || !self.snos_output_shadow.new_alias_keys.is_empty();
+        if counter_changes {
+            let entry = (alias_contract_address, ALIAS_COUNTER_STORAGE_KEY);
+            if self.snos_output_shadow.storage_updates.insert(entry) {
+                update.inserted_storage_updates.push(entry);
+            }
+            if self.snos_output_shadow.modified_contracts.insert(alias_contract_address) {
+                update.inserted_modified_contracts.push(alias_contract_address);
+            }
+        }
     }
 
     fn snos_output_shadow_prediction(
         &self,
-        versioned_constants: &VersionedConstants,
+        _versioned_constants: &VersionedConstants,
     ) -> SnosOutputShadowPrediction {
-        self.snos_output_shadow_prediction_inner(versioned_constants, None, None)
+        self.snos_output_shadow_prediction_inner(None)
     }
 
     fn snos_output_shadow_prediction_with_pending(
         &self,
-        versioned_constants: &VersionedConstants,
-        pending_state_changes_keys: &StateChangesKeys,
+        _versioned_constants: &VersionedConstants,
         pending_tx_weights: &TxWeights,
     ) -> SnosOutputShadowPrediction {
-        self.snos_output_shadow_prediction_inner(
-            versioned_constants,
-            Some(pending_state_changes_keys),
-            Some(pending_tx_weights),
-        )
+        self.snos_output_shadow_prediction_inner(Some(pending_tx_weights))
     }
 
     fn snos_output_shadow_prediction_inner(
         &self,
-        versioned_constants: &VersionedConstants,
-        pending_state_changes_keys: Option<&StateChangesKeys>,
         pending_tx_weights: Option<&TxWeights>,
     ) -> SnosOutputShadowPrediction {
-        let mut storage_updates =
-            self.snos_output_shadow.preprocessed_state_changes_keys.storage_keys.clone();
-        storage_updates.extend(self.state_changes_keys.storage_keys.iter().copied());
-        let mut modified_contracts =
-            self.snos_output_shadow.preprocessed_state_changes_keys.modified_contracts.clone();
-        modified_contracts.extend(self.state_changes_keys.modified_contracts.iter().copied());
-        let mut compiled_class_hashes = self.state_changes_keys.compiled_class_hash_keys.clone();
-        let mut migrated_class_hashes = self
-            .accumulated_weights
-            .class_hashes_to_migrate
-            .keys()
-            .copied()
-            .collect::<HashSet<_>>();
-        if let Some(pending) = pending_state_changes_keys {
-            storage_updates.extend(pending.storage_keys.iter().copied());
-            modified_contracts.extend(pending.modified_contracts.iter().copied());
-            compiled_class_hashes.extend(pending.compiled_class_hash_keys.iter().copied());
-        }
-        if let Some(pending) = pending_tx_weights {
-            migrated_class_hashes.extend(pending.class_hashes_to_migrate.keys().copied());
-        }
-
-        if versioned_constants.enable_stateful_compression {
-            let alias_contract_address =
-                versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
-            for alias_key in &self.snos_output_shadow.new_alias_keys {
-                storage_updates.insert((alias_contract_address, *alias_key));
-            }
-            let counter_changes = self.snos_output_shadow.alias_counter_was_zero == Some(true)
-                || !self.snos_output_shadow.new_alias_keys.is_empty();
-            if counter_changes {
-                storage_updates.insert((alias_contract_address, ALIAS_COUNTER_STORAGE_KEY));
-            }
-            if storage_updates.iter().any(|(address, _)| address == &alias_contract_address) {
-                modified_contracts.insert(alias_contract_address);
-            }
-        }
-
         let message_segment_length = pending_tx_weights
             .map(|pending| {
                 self.get_bouncer_weights()
@@ -920,18 +960,19 @@ impl Bouncer {
                     .message_segment_length
             })
             .unwrap_or(self.get_bouncer_weights().message_segment_length);
-        let declared_class_updates = compiled_class_hashes.len() + migrated_class_hashes.len();
+        let declared_class_updates = self.snos_output_shadow.compiled_class_hashes.len()
+            + self.snos_output_shadow.migrated_class_hashes.len();
         let cells = 14
             + message_segment_length
-            + 6 * modified_contracts.len()
-            + 3 * storage_updates.len()
+            + 6 * self.snos_output_shadow.modified_contracts.len()
+            + 3 * self.snos_output_shadow.storage_updates.len()
             + 3 * declared_class_updates;
 
         SnosOutputShadowPrediction {
             cells,
             message_segment_length,
-            modified_contracts: modified_contracts.len(),
-            storage_updates: storage_updates.len(),
+            modified_contracts: self.snos_output_shadow.modified_contracts.len(),
+            storage_updates: self.snos_output_shadow.storage_updates.len(),
             declared_class_updates,
             new_aliases: self.snos_output_shadow.new_alias_keys.len(),
         }
