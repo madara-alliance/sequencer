@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use apollo_config::dumping::{SerializeConfig, prepend_sub_config_name, ser_param};
@@ -841,7 +841,10 @@ impl Bouncer {
 
         let alias_contract_address =
             versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
-        let mut candidates = BTreeSet::new();
+        let mut candidates = HashSet::with_capacity(
+            marginal_state_changes_keys.modified_contracts.len()
+                + marginal_state_changes_keys.storage_keys.len(),
+        );
 
         for contract_address in &marginal_state_changes_keys.modified_contracts {
             let candidate = StorageKey(contract_address.0);
@@ -865,7 +868,7 @@ impl Bouncer {
                     == Felt::ZERO
             }
         };
-        let mut newly_checked = Vec::new();
+        let mut newly_checked = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if !self.snos_output_shadow.checked_alias_candidates.contains(&candidate) {
                 let needs_alias =
