@@ -769,26 +769,24 @@ impl Bouncer {
 
         self.update(tx_weights, tx_execution_summary, &marginal_state_changes_keys);
 
-        if log::log_enabled!(target: "snos_output_shadow", log::Level::Info) {
-            log::info!(
-                target: "snos_output_shadow",
-                "event=tx_prediction block_number={} tx_ordinal={} predicted_full_output_cells={} \
-                 message_segment_length={} modified_contracts={} storage_updates={} \
-                 declared_class_updates={} new_aliases={} exceeds_49000={} \
-                 exceeds_configured_limit={} max_full_output_cells={}",
-                block_number,
-                self.get_bouncer_weights().n_txs,
-                prediction.cells,
-                prediction.message_segment_length,
-                prediction.modified_contracts,
-                prediction.storage_updates,
-                prediction.declared_class_updates,
-                prediction.new_aliases,
-                prediction.cells > DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
-                prediction.cells > self.bouncer_config.max_snos_full_output_cells,
-                self.bouncer_config.max_snos_full_output_cells,
-            );
-        }
+        log::debug!(
+            target: "snos_output_shadow",
+            "event=tx_prediction block_number={} tx_ordinal={} predicted_full_output_cells={} \
+             message_segment_length={} modified_contracts={} storage_updates={} \
+             declared_class_updates={} new_aliases={} exceeds_49000={} \
+             exceeds_configured_limit={} max_full_output_cells={}",
+            block_number,
+            self.get_bouncer_weights().n_txs,
+            prediction.cells,
+            prediction.message_segment_length,
+            prediction.modified_contracts,
+            prediction.storage_updates,
+            prediction.declared_class_updates,
+            prediction.new_aliases,
+            prediction.cells > DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+            prediction.cells > self.bouncer_config.max_snos_full_output_cells,
+            self.bouncer_config.max_snos_full_output_cells,
+        );
 
         Ok(())
     }
@@ -824,22 +822,45 @@ impl Bouncer {
             }
         }
 
-        // Complete all fallible reads before mutating the tracker.
-        let counter_was_zero = match self.snos_output_shadow.alias_counter_was_zero {
-            Some(value) => value,
-            None => {
-                state_reader.get_storage_at(alias_contract_address, ALIAS_COUNTER_STORAGE_KEY)?
-                    == Felt::ZERO
-            }
-        };
-        let mut newly_checked = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            if !self.snos_output_shadow.checked_alias_candidates.contains(&candidate) {
-                let needs_alias =
-                    state_reader.get_storage_at(alias_contract_address, candidate)? == Felt::ZERO;
-                newly_checked.push((candidate, needs_alias));
-            }
+        // Complete all fallible reads before mutating the tracker. Keep the
+        // counter in the same batch so a cold transaction pays lookup setup once.
+        let read_counter = self.snos_output_shadow.alias_counter_was_zero.is_none();
+        let unchecked_candidates = candidates
+            .into_iter()
+            .filter(|candidate| {
+                !self.snos_output_shadow.checked_alias_candidates.contains(candidate)
+            })
+            .collect::<Vec<_>>();
+        let mut storage_reads =
+            Vec::with_capacity(unchecked_candidates.len() + usize::from(read_counter));
+        if read_counter {
+            storage_reads.push((alias_contract_address, ALIAS_COUNTER_STORAGE_KEY));
         }
+        storage_reads.extend(
+            unchecked_candidates.iter().map(|candidate| (alias_contract_address, *candidate)),
+        );
+        let storage_values = state_reader.get_storage_many(&storage_reads)?;
+        assert_eq!(
+            storage_values.len(),
+            storage_reads.len(),
+            "StateReader bulk result length mismatch"
+        );
+
+        let (counter_was_zero, candidate_values) = if read_counter {
+            (storage_values[0] == Felt::ZERO, &storage_values[1..])
+        } else {
+            (
+                self.snos_output_shadow
+                    .alias_counter_was_zero
+                    .expect("Alias counter presence was checked above"),
+                storage_values.as_slice(),
+            )
+        };
+        let newly_checked = unchecked_candidates
+            .into_iter()
+            .zip(candidate_values)
+            .map(|(candidate, value)| (candidate, *value == Felt::ZERO))
+            .collect();
 
         let update = SnosOutputShadowUpdate {
             previous_alias_counter_was_zero: self.snos_output_shadow.alias_counter_was_zero,
