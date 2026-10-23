@@ -7,47 +7,53 @@ use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use expect_test::expect;
 use rstest::{fixture, rstest};
+use starknet_api::block::BlockNumber;
 use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::core::{ClassHash, CompiledClassHash};
 use starknet_api::execution_resources::GasAmount;
+use starknet_api::state::StorageKey;
 use starknet_api::transaction::fields::Fee;
 use starknet_api::{class_hash, contract_address, felt, storage_key};
+use starknet_types_core::felt::Felt;
 
-use super::BouncerConfig;
+use super::{BouncerConfig, DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS};
 use crate::blockifier::transaction_executor::TransactionExecutorError;
+use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{
-    cairo_primitives_to_gas,
-    get_patricia_update_resources,
-    get_tx_weights,
-    map_class_hash_to_casm_hash_computation_resources,
-    verify_tx_weights_within_max_capacity,
     Bouncer,
     BouncerWeights,
     BuiltinWeights,
     CasmHashComputationData,
     CasmHashMigrationData,
     TxWeights,
+    cairo_primitives_to_gas,
+    ensure_snos_output_within_limit,
+    get_patricia_update_resources,
+    get_tx_weights,
+    map_class_hash_to_casm_hash_computation_resources,
+    verify_tx_weights_within_max_capacity,
 };
 use crate::context::BlockContext;
 use crate::execution::call_info::{
-    cairo_primitive_counter_map,
     CairoPrimitiveCounterMap,
     CairoPrimitiveName,
     ExecutionSummary,
     ExtendedExecutionResources,
     OpcodeCounterMap,
+    cairo_primitive_counter_map,
 };
 use crate::fee::resources::{ComputationResources, TransactionResources};
 use crate::state::cached_state::{CachedState, StateChangesKeys, StateMaps, TransactionalState};
 use crate::state::state_api::StateReader;
+use crate::state::stateful_compression::ALIAS_COUNTER_STORAGE_KEY;
 use crate::test_utils::contracts::FeatureContractData;
 use crate::test_utils::dict_state_reader::DictStateReader;
 use crate::test_utils::initial_test_state::test_state;
 use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::ExecutionResourcesTraits;
 use crate::transaction::test_utils::{
-    create_init_data_for_compiled_class_hash_migration_test,
     TestInitData,
+    create_init_data_for_compiled_class_hash_migration_test,
 };
 use crate::utils::{add_maps, u64_from_usize};
 
@@ -77,7 +83,11 @@ fn block_max_capacity() -> BouncerWeights {
 
 #[fixture]
 fn bouncer_config(block_max_capacity: BouncerWeights) -> BouncerConfig {
-    BouncerConfig { block_max_capacity, builtin_weights: BuiltinWeights::default() }
+    BouncerConfig {
+        block_max_capacity,
+        builtin_weights: BuiltinWeights::default(),
+        ..Default::default()
+    }
 }
 
 #[rstest]
@@ -206,7 +216,8 @@ fn test_block_weights_has_room_n_txs(
     class_hashes_to_migrate: HashMap::from([
         (class_hash!(0_u128), (CompiledClassHash(felt!(2_u128)), CompiledClassHash(felt!(1_u128)))),
     ]),
-}
+},
+    snos_output_shadow: Default::default(),
 })]
 fn test_bouncer_update(#[case] initial_bouncer: Bouncer) {
     // TODO(Aviv): Use expect! to avoid magic numbers.
@@ -324,7 +335,8 @@ fn test_bouncer_try_update_gas_based(#[case] scenario: &'static str, block_conte
         proving_gas: proving_gas_max_capacity,
         receipt_l2_gas: GasAmount(20),
     };
-    let bouncer_config = BouncerConfig { block_max_capacity, builtin_weights };
+    let bouncer_config =
+        BouncerConfig { block_max_capacity, builtin_weights, ..Default::default() };
 
     let bouncer_weights = BouncerWeights {
         l1_gas: 10,
@@ -349,6 +361,7 @@ fn test_bouncer_try_update_gas_based(#[case] scenario: &'static str, block_conte
     let tx_state_changes_keys = transactional_state.to_state_diff().unwrap().state_maps.keys();
 
     let result = bouncer.try_update(
+        BlockNumber(0),
         &transactional_state,
         &tx_state_changes_keys,
         &execution_summary,
@@ -450,6 +463,7 @@ fn test_bouncer_try_update_n_txs(
     };
     // Try to update the bouncer.
     let mut result = bouncer.try_update(
+        BlockNumber(0),
         &first_transactional_state,
         &first_tx_state_changes_keys,
         &first_tx_execution_summary,
@@ -488,6 +502,7 @@ fn test_bouncer_try_update_n_txs(
         second_transactional_state.to_state_diff().unwrap().state_maps.keys();
 
     result = bouncer.try_update(
+        BlockNumber(0),
         &second_transactional_state,
         &second_tx_state_changes_keys,
         &ExecutionSummary::default(),
@@ -498,6 +513,171 @@ fn test_bouncer_try_update_n_txs(
     );
 
     assert_matches!(result, Err(TransactionExecutorError::BlockFull));
+}
+
+#[test]
+fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
+    let versioned_constants = VersionedConstants::create_for_account_testing();
+    assert!(versioned_constants.enable_stateful_compression);
+    let alias_contract_address =
+        versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+    let mut state_reader = DictStateReader::default();
+    state_reader
+        .storage_view
+        .insert((alias_contract_address, storage_key!(0_u128)), felt!(0x80_u128));
+    // 0x200 already has an alias; 0x100 and 0x300 do not.
+    state_reader
+        .storage_view
+        .insert((alias_contract_address, storage_key!(0x200_u128)), felt!(0x81_u128));
+
+    let state_changes_keys = StateChangesKeys {
+        storage_keys: HashSet::from([
+            (contract_address!(0x100_u128), storage_key!(0x200_u128)),
+            (contract_address!(0x100_u128), storage_key!(0x300_u128)),
+        ]),
+        modified_contracts: HashSet::from([contract_address!(0x100_u128)]),
+        ..StateChangesKeys::default()
+    };
+    let mut bouncer = Bouncer::empty();
+
+    let mut first_update = bouncer
+        .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
+        .unwrap();
+    bouncer.apply_snos_output_shadow_accounting(
+        &versioned_constants,
+        &state_changes_keys,
+        &TxWeights::default(),
+        &mut first_update,
+    );
+    // Re-observing the same keys must not allocate/count them twice.
+    let mut second_update = bouncer
+        .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
+        .unwrap();
+    bouncer.apply_snos_output_shadow_accounting(
+        &versioned_constants,
+        &state_changes_keys,
+        &TxWeights::default(),
+        &mut second_update,
+    );
+
+    let prediction = bouncer.snos_output_shadow_prediction(&versioned_constants);
+    assert_eq!(prediction.new_aliases, 2);
+    assert_eq!(prediction.modified_contracts, 2);
+    assert_eq!(prediction.storage_updates, 5);
+    assert_eq!(prediction.cells, 41);
+}
+
+#[test]
+fn test_snos_output_shadow_prediction_includes_preprocessed_state_changes() {
+    let versioned_constants = VersionedConstants::create_for_account_testing();
+    let contract_address = contract_address!(0x1_u128);
+    let storage_key = storage_key!(0x123_u128);
+    let preprocessed_state_changes_keys = StateChangesKeys {
+        storage_keys: HashSet::from([(contract_address, storage_key)]),
+        modified_contracts: HashSet::from([contract_address]),
+        ..StateChangesKeys::default()
+    };
+    let mut bouncer = Bouncer::empty();
+
+    bouncer.seed_snos_output_shadow(preprocessed_state_changes_keys);
+
+    let prediction = bouncer.snos_output_shadow_prediction(&versioned_constants);
+    assert_eq!(prediction.modified_contracts, 1);
+    assert_eq!(prediction.storage_updates, 1);
+    assert_eq!(prediction.cells, 23);
+}
+
+#[test]
+fn test_snos_output_admission_closes_block_or_rejects_oversized_transaction() {
+    let max_output_cells = 49_000;
+    assert!(ensure_snos_output_within_limit(max_output_cells, 1, max_output_cells).is_ok());
+    assert_matches!(
+        ensure_snos_output_within_limit(max_output_cells + 1, 1, max_output_cells),
+        Err(TransactionExecutorError::BlockFull)
+    );
+    assert_matches!(
+        ensure_snos_output_within_limit(max_output_cells + 1, 0, max_output_cells),
+        Err(TransactionExecutorError::TransactionExecutionError(
+            TransactionExecutionError::TransactionTooLargeForProof {
+                max_output_cells: 49_000,
+                predicted_output_cells: 49_001,
+            }
+        ))
+    );
+}
+
+#[test]
+fn test_snos_output_admission_rolls_back_rejected_transaction() {
+    let versioned_constants = VersionedConstants::create_for_account_testing();
+    let alias_contract_address =
+        versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+    let mut state_reader = DictStateReader::default();
+    state_reader
+        .storage_view
+        .insert((alias_contract_address, ALIAS_COUNTER_STORAGE_KEY), Felt::ONE);
+    let state_changes_keys = StateChangesKeys {
+        storage_keys: (0..16_327)
+            .map(|key| (contract_address!(0x1_u128), StorageKey::from(key as u128)))
+            .collect(),
+        modified_contracts: HashSet::from([contract_address!(0x1_u128)]),
+        ..StateChangesKeys::default()
+    };
+
+    for current_n_txs in [0, 1] {
+        let mut bouncer = Bouncer::new(BouncerConfig {
+            max_snos_full_output_cells: 49_000,
+            ..BouncerConfig::max()
+        });
+        bouncer.set_bouncer_weights(BouncerWeights {
+            n_txs: current_n_txs,
+            ..BouncerWeights::empty()
+        });
+        let result = bouncer.try_update(
+            BlockNumber(0),
+            &state_reader,
+            &state_changes_keys,
+            &ExecutionSummary::default(),
+            &CairoPrimitiveCounterMap::default(),
+            &TransactionResources::default(),
+            &versioned_constants,
+            GasAmount::ZERO,
+        );
+
+        if current_n_txs == 0 {
+            assert_matches!(
+                result,
+                Err(TransactionExecutorError::TransactionExecutionError(
+                    TransactionExecutionError::TransactionTooLargeForProof {
+                        max_output_cells: 49_000,
+                        predicted_output_cells: 49_001,
+                    }
+                ))
+            );
+        } else {
+            assert_matches!(result, Err(TransactionExecutorError::BlockFull));
+        }
+        assert_eq!(bouncer.get_bouncer_weights().n_txs, current_n_txs);
+        assert!(bouncer.state_changes_keys.storage_keys.is_empty());
+        assert_eq!(bouncer.snos_output_shadow.alias_counter_was_zero, None);
+        assert!(bouncer.snos_output_shadow.storage_updates.is_empty());
+        assert!(bouncer.snos_output_shadow.modified_contracts.is_empty());
+        assert!(bouncer.snos_output_shadow.compiled_class_hashes.is_empty());
+        assert!(bouncer.snos_output_shadow.migrated_class_hashes.is_empty());
+    }
+}
+
+#[test]
+fn test_snos_output_limit_config_defaults_and_max() {
+    assert_eq!(
+        BouncerConfig::default().max_snos_full_output_cells,
+        DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS
+    );
+    assert_eq!(BouncerConfig::max().max_snos_full_output_cells, usize::MAX);
+
+    let mut legacy_config = serde_json::to_value(BouncerConfig::default()).unwrap();
+    legacy_config.as_object_mut().unwrap().remove("max_snos_full_output_cells");
+    let deserialized: BouncerConfig = serde_json::from_value(legacy_config).unwrap();
+    assert_eq!(deserialized.max_snos_full_output_cells, DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS);
 }
 
 /// This test verifies that `get_tx_weights` returns a reasonable casm hash computation data.
@@ -708,7 +888,9 @@ fn test_proving_gas_minus_sierra_gas_equals_builtin_gas(
                 .builtin_weights
                 .gas_costs
                 .get_cairo_primitive_gas_cost(&CairoPrimitiveName::Builtin(*name))
-                .unwrap_or_else(|_| panic!("Builtin name {:?} is not supported in the bouncer weights.", name));
+                .unwrap_or_else(|_| {
+                    panic!("Builtin name {:?} is not supported in the bouncer weights.", name)
+                });
             let stone_gas = block_context
                 .versioned_constants
                 .os_constants

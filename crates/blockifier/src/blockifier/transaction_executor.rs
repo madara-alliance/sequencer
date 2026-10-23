@@ -113,7 +113,10 @@ impl<S: StateReader> TransactionExecutor<S> {
             block_context.block_info().block_number,
             &block_context.versioned_constants.os_constants,
         )?;
-        Ok(Self::new_with_pool(block_state, block_context, config, worker_pool))
+        let preprocessed_state_changes_keys = block_state.to_state_diff()?.state_maps.keys();
+        let executor = Self::new_with_pool(block_state, block_context, config, worker_pool);
+        lock_bouncer(&executor.bouncer).seed_snos_output_shadow(preprocessed_state_changes_keys);
+        Ok(executor)
     }
 
     // TODO(Yoni): consider making this c-tor private.
@@ -143,6 +146,19 @@ impl<S: StateReader> TransactionExecutor<S> {
         }
     }
 
+    /// Seeds the SNOS output predictor with state changes applied before transaction execution.
+    pub fn seed_snos_output_shadow_from_block_state(&mut self) -> StateResult<()> {
+        let state_changes_keys = self
+            .block_state
+            .as_mut()
+            .expect("Blockifier block context has been taken")
+            .to_state_diff()?
+            .state_maps
+            .keys();
+        lock_bouncer(&self.bouncer).seed_snos_output_shadow(state_changes_keys);
+        Ok(())
+    }
+
     /// Executes the given transaction on the state maintained by the executor.
     /// Returns the execution result (info or error) if there is room for the transaction;
     /// Otherwise, returns BlockFull error.
@@ -163,6 +179,7 @@ impl<S: StateReader> TransactionExecutor<S> {
                 let state_diff = transactional_state.to_state_diff()?.state_maps;
                 let tx_state_changes_keys = state_diff.keys();
                 lock_bouncer(&self.bouncer).try_update(
+                    self.block_context.block_info.block_number,
                     &transactional_state,
                     &tx_state_changes_keys,
                     &tx_execution_info.summarize(&self.block_context.versioned_constants),
@@ -281,6 +298,12 @@ pub(crate) fn finalize_block<S: StateReader>(
     block_state.set_compiled_class_hash_migration(&class_hashes_to_migrate)?;
 
     let state_diff = block_state.to_state_diff()?.state_maps;
+
+    bouncer.log_snos_output_shadow_final(
+        block_context.block_info.block_number,
+        &state_diff,
+        &block_context.versioned_constants,
+    );
 
     let compressed_state_diff = if block_context.versioned_constants.enable_stateful_compression {
         Some(compress(&state_diff, block_state, alias_contract_address)?.into())

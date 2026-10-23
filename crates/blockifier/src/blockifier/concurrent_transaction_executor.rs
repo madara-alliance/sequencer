@@ -47,13 +47,16 @@ impl<S: StateReader + Send + 'static> ConcurrentTransactionExecutor<S> {
             block_context.block_info().block_number,
             &block_context.versioned_constants.os_constants,
         )?;
+        let preprocessed_state_changes_keys = block_state.to_state_diff()?.state_maps.keys();
 
         let bouncer_config = block_context.bouncer_config.clone();
+        let mut bouncer = Bouncer::new(bouncer_config);
+        bouncer.seed_snos_output_shadow(preprocessed_state_changes_keys);
         let worker_executor = Arc::new(WorkerExecutor::initialize(
             block_state,
             vec![],
             block_context.into(),
-            Mutex::new(Bouncer::new(bouncer_config)).into(),
+            Mutex::new(bouncer).into(),
             block_deadline,
         ));
         worker_pool.run(worker_executor.clone());

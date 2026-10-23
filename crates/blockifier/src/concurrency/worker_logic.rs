@@ -31,6 +31,7 @@ use crate::metrics::{
 };
 use crate::state::cached_state::{ContractClassMapping, StateMaps, TransactionalState};
 use crate::state::state_api::{StateReader, UpdatableState};
+use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::{TransactionExecutionInfo, TransactionExecutionResult};
 use crate::transaction::transaction_execution::Transaction;
 use crate::transaction::transactions::ExecutableTransaction;
@@ -352,6 +353,7 @@ impl<S: StateReader> WorkerExecutor<S> {
             CALLS_RUNNING_NATIVE.increment(call_summary.n_calls_running_native);
             // Ask the bouncer if there is room for the transaction in the block.
             let bouncer_result = self.bouncer.lock().expect("Bouncer lock failed.").try_update(
+                self.block_context.block_info.block_number,
                 &tx_versioned_state,
                 &tx_state_changes_keys,
                 &execution_summary,
@@ -363,6 +365,18 @@ impl<S: StateReader> WorkerExecutor<S> {
             if let Err(error) = bouncer_result {
                 match error {
                     TransactionExecutorError::BlockFull => return Ok(CommitResult::NoRoomInBlock),
+                    TransactionExecutorError::TransactionExecutionError(
+                        error @ TransactionExecutionError::TransactionTooLargeForProof { .. },
+                    ) => {
+                        tx_versioned_state.delete_writes(
+                            &execution_output.state_diff,
+                            &execution_output.contract_classes,
+                        )?;
+                        execution_output.state_diff = StateMaps::default();
+                        execution_output.contract_classes = HashMap::default();
+                        execution_output.result = Err(error);
+                        return Ok(CommitResult::Success);
+                    }
                     _ => {
                         // TODO(Avi, 01/07/2024): Consider propagating the error.
                         panic!("Bouncer update failed. {error:?}: {error}");
@@ -435,8 +449,8 @@ impl<U: UpdatableState> WorkerExecutor<U> {
         record_transaction_executor_metrics(metrics);
         log::debug!(
             "Concurrent execution done. Number of transactions: {n_txs}; Committed chunk size: \
-             {n_committed_txs}; Execute counter: {}; Validate counter: {}; Abort counter: {}; Abort \
-             in commit counter: {}",
+             {n_committed_txs}; Execute counter: {}; Validate counter: {}; Abort counter: {}; \
+             Abort in commit counter: {}",
             metrics.execution_attempts,
             metrics.validation_attempts,
             metrics.aborts,
