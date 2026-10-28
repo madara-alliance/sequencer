@@ -13,7 +13,13 @@ use blockifier::blockifier::config::{
 };
 use blockifier::blockifier::transaction_executor::CompiledClassHashesForMigration;
 use blockifier::blockifier_versioned_constants::{BuiltinGasCosts, VersionedConstantsOverrides};
-use blockifier::bouncer::{BouncerConfig, BouncerWeights, BuiltinWeights, CasmHashComputationData};
+use blockifier::bouncer::{
+    BouncerConfig,
+    BouncerWeights,
+    BuiltinWeights,
+    CasmHashComputationData,
+    DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+};
 use blockifier::state::contract_class_manager::DEFAULT_COMPILATION_REQUEST_CHANNEL_SIZE;
 use blockifier::state::global_cache::GLOBAL_CONTRACT_CACHE_SIZE_FOR_TEST;
 use blockifier::utils::u64_from_usize;
@@ -108,10 +114,28 @@ impl From<PyVersionedConstantsOverrides> for VersionedConstantsOverrides {
     }
 }
 
-#[derive(Clone, Debug, FromPyObject)]
+#[derive(Clone, Debug)]
 pub struct PyBouncerConfig {
     pub full_total_weights: HashMap<String, usize>,
     pub builtin_weights: HashMap<String, usize>,
+    pub max_snos_full_output_cells: usize,
+}
+
+impl<'py> FromPyObject<'py> for PyBouncerConfig {
+    fn extract(ob: &'py PyAny) -> PyResult<Self> {
+        let max_snos_full_output_cells = match ob.getattr("max_snos_full_output_cells") {
+            Ok(value) => value.extract()?,
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(ob.py()) => {
+                DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            full_total_weights: ob.getattr("full_total_weights")?.extract()?,
+            builtin_weights: ob.getattr("builtin_weights")?.extract()?,
+            max_snos_full_output_cells,
+        })
+    }
 }
 
 impl TryFrom<PyBouncerConfig> for BouncerConfig {
@@ -124,7 +148,7 @@ impl TryFrom<PyBouncerConfig> for BouncerConfig {
             builtin_weights: hash_map_into_builtin_weights(
                 py_bouncer_config.builtin_weights.clone(),
             )?,
-            ..Default::default()
+            max_snos_full_output_cells: py_bouncer_config.max_snos_full_output_cells,
         })
     }
 }
