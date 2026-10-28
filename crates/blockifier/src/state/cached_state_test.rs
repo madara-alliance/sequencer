@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use assert_matches::assert_matches;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
@@ -18,12 +19,16 @@ use starknet_api::{
     storage_key,
 };
 
-use crate::context::{BlockContext, ChainInfo};
+use crate::context::{BlockContext, ChainInfo, TransactionContext};
+use crate::execution::call_info::CallInfo;
+use crate::fee::fee_utils::get_sequencer_balance_keys;
+use crate::fee::receipt::TransactionReceipt;
 use crate::state::cached_state::*;
 use crate::test_utils::contracts::FeatureContractTrait;
 use crate::test_utils::dict_state_reader::DictStateReader;
 use crate::test_utils::initial_test_state::test_state;
 use crate::test_utils::BALANCE;
+use crate::transaction::objects::{TransactionExecutionInfo, TransactionInfo};
 use crate::transaction::test_utils::{default_all_resource_bounds, run_invoke_tx, STORAGE_WRITE};
 const CONTRACT_ADDRESS: &str = "0x100";
 
@@ -725,6 +730,26 @@ fn test_state_changes_keys() {
             ]),
         }
     )
+}
+
+#[test]
+fn concurrent_fee_reserves_both_sequencer_balance_words() {
+    let block_context = Arc::new(BlockContext::create_for_account_testing());
+    let (low, high) = get_sequencer_balance_keys(&block_context);
+    let tx_context = TransactionContext { block_context, tx_info: TransactionInfo::default() };
+    let execution_info = TransactionExecutionInfo {
+        fee_transfer_call_info: Some(CallInfo::default()),
+        receipt: TransactionReceipt { fee: Fee(1), ..Default::default() },
+        ..Default::default()
+    };
+    let mut keys = StateChangesKeys::default();
+
+    keys.update_sequencer_key_in_storage(&tx_context, &execution_info, true);
+
+    assert_eq!(
+        keys.storage_keys,
+        HashSet::from([(tx_context.fee_token_address(), low), (tx_context.fee_token_address(), high)])
+    );
 }
 
 #[rstest]

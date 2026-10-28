@@ -9,6 +9,7 @@ use starknet_types_core::felt::Felt;
 
 use crate::context::TransactionContext;
 use crate::execution::contract_class::RunnableCompiledClass;
+use crate::fee::fee_utils::get_sequencer_balance_keys;
 use crate::state::errors::StateError;
 use crate::state::state_api::{State, StateReader, StateResult, UpdatableState};
 use crate::transaction::objects::TransactionExecutionInfo;
@@ -804,15 +805,18 @@ impl StateChangesKeys {
         concurrency_mode: bool,
     ) {
         let actual_fee = tx_result.receipt.fee.0;
-        let sequencer_address = tx_context.block_context.block_info.sequencer_address;
         if concurrency_mode
             && !tx_context.is_sequencer_the_sender()
             && tx_result.fee_transfer_call_info.is_some()
             && actual_fee > 0
         {
-            // Add the deleted sequencer balance key to the storage keys.
-            let sequencer_balance_low = get_fee_token_var_address(sequencer_address);
-            self.storage_keys.insert((tx_context.fee_token_address(), sequencer_balance_low));
+            // Concurrent fee completion may carry into the high word after admission.
+            let (sequencer_balance_low, sequencer_balance_high) =
+                get_sequencer_balance_keys(&tx_context.block_context);
+            self.storage_keys.extend([
+                (tx_context.fee_token_address(), sequencer_balance_low),
+                (tx_context.fee_token_address(), sequencer_balance_high),
+            ]);
         }
     }
 
