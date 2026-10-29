@@ -77,6 +77,18 @@ macro_rules! impl_field_wise_ops {
 }
 
 pub const DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS: usize = 49_000;
+pub const SNOS_OUTPUT_FIXED_CELLS: usize = 14;
+
+/// Combines two independently predicted full-output blocks into one SNOS output budget, counting
+/// the batch-level header only once.
+pub fn accumulate_snos_full_output_cells(
+    current_cells: usize,
+    next_block_cells: usize,
+) -> Option<usize> {
+    next_block_cells
+        .checked_sub(SNOS_OUTPUT_FIXED_CELLS)
+        .and_then(|additional| current_cells.checked_add(additional))
+}
 
 fn default_max_snos_full_output_cells() -> usize {
     DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS
@@ -959,6 +971,14 @@ impl Bouncer {
         self.output_builtin_prediction_inner(None)
     }
 
+    /// Returns the block-wide full SNOS output-cell prediction after all accepted work so far.
+    ///
+    /// This is exposed for end-to-end comparison with the real Starknet OS output vector; block
+    /// admission uses the same retained tracker through `try_update`.
+    pub fn predicted_snos_full_output_cells(&self) -> usize {
+        self.output_builtin_prediction_inner(None).cells
+    }
+
     fn output_builtin_prediction_with_pending(
         &self,
         _versioned_constants: &VersionedConstants,
@@ -981,7 +1001,7 @@ impl Bouncer {
             .unwrap_or(self.get_bouncer_weights().message_segment_length);
         let declared_class_updates = self.output_builtin.compiled_class_hashes.len()
             + self.output_builtin.migrated_class_hashes.len();
-        let cells = 14
+        let cells = SNOS_OUTPUT_FIXED_CELLS
             + message_segment_length
             + 6 * self.output_builtin.modified_contracts.len()
             + 3 * self.output_builtin.storage_updates.len()
