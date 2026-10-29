@@ -79,6 +79,20 @@ macro_rules! impl_field_wise_ops {
 pub const DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS: usize = 49_000;
 pub const SNOS_OUTPUT_FIXED_CELLS: usize = 14;
 
+/// Returns the serialized full SNOS output size for the supplied output-shape counts.
+pub fn snos_full_output_cells_from_counts(
+    message_segment_length: usize,
+    modified_contracts: usize,
+    storage_updates: usize,
+    declared_class_updates: usize,
+) -> Option<usize> {
+    SNOS_OUTPUT_FIXED_CELLS
+        .checked_add(message_segment_length)?
+        .checked_add(modified_contracts.checked_mul(6)?)?
+        .checked_add(storage_updates.checked_mul(3)?)?
+        .checked_add(declared_class_updates.checked_mul(3)?)
+}
+
 /// Combines two independently predicted full-output blocks into one SNOS output budget, counting
 /// the batch-level header only once.
 pub fn accumulate_snos_full_output_cells(
@@ -1001,11 +1015,13 @@ impl Bouncer {
             .unwrap_or(self.get_bouncer_weights().message_segment_length);
         let declared_class_updates = self.output_builtin.compiled_class_hashes.len()
             + self.output_builtin.migrated_class_hashes.len();
-        let cells = SNOS_OUTPUT_FIXED_CELLS
-            + message_segment_length
-            + 6 * self.output_builtin.modified_contracts.len()
-            + 3 * self.output_builtin.storage_updates.len()
-            + 3 * declared_class_updates;
+        let cells = snos_full_output_cells_from_counts(
+            message_segment_length,
+            self.output_builtin.modified_contracts.len(),
+            self.output_builtin.storage_updates.len(),
+            declared_class_updates,
+        )
+        .unwrap_or(usize::MAX);
 
         OutputBuiltinPrediction {
             cells,
@@ -1028,11 +1044,13 @@ impl Bouncer {
         }
 
         let prediction = self.output_builtin_prediction(versioned_constants);
-        let actual_shape_cells = 14
-            + self.get_bouncer_weights().message_segment_length
-            + 6 * state_diff.get_contract_addresses().len()
-            + 3 * state_diff.storage.len()
-            + 3 * state_diff.compiled_class_hashes.len();
+        let actual_shape_cells = snos_full_output_cells_from_counts(
+            self.get_bouncer_weights().message_segment_length,
+            state_diff.get_contract_addresses().len(),
+            state_diff.storage.len(),
+            state_diff.compiled_class_hashes.len(),
+        )
+        .unwrap_or(usize::MAX);
         log::info!(
             target: "output_builtin",
             "event=block_prediction block_number={} predicted_full_output_cells={} \

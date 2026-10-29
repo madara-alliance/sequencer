@@ -16,7 +16,11 @@ use starknet_api::transaction::fields::Fee;
 use starknet_api::{class_hash, contract_address, felt, storage_key};
 use starknet_types_core::felt::Felt;
 
-use super::{BouncerConfig, DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS};
+use super::{
+    snos_full_output_cells_from_counts,
+    BouncerConfig,
+    DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+};
 use crate::blockifier::transaction_executor::TransactionExecutorError;
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{
@@ -658,6 +662,12 @@ fn test_snos_output_admission_closes_block_or_rejects_oversized_transaction() {
             }
         ))
     );
+}
+
+#[test]
+fn snos_full_output_counting_is_checked() {
+    assert_eq!(snos_full_output_cells_from_counts(11, 4, 3, 4), Some(70));
+    assert_eq!(snos_full_output_cells_from_counts(usize::MAX, 0, 0, 0), None);
 }
 
 #[test]
