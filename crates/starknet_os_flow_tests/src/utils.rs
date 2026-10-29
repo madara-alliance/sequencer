@@ -37,6 +37,7 @@ use crate::tests::NON_TRIVIAL_RESOURCE_BOUNDS;
 pub(crate) struct ExecutionOutput<S: StateReader + Send> {
     pub(crate) execution_outputs: Vec<TransactionExecutionOutput>,
     pub(crate) final_state: CachedState<S>,
+    pub(crate) predicted_snos_full_output_cells: usize,
 }
 
 /// Executes the given transactions on the given state and block context with default execution
@@ -86,8 +87,10 @@ pub(crate) fn execute_transactions<S: StateReader + Send>(
         executor.finalize().expect("Failed to finalize block.");
     }
 
+    let predicted_snos_full_output_cells =
+        executor.bouncer.lock().unwrap().predicted_snos_full_output_cells();
     let final_state = executor.block_state.unwrap();
-    ExecutionOutput { execution_outputs, final_state }
+    ExecutionOutput { execution_outputs, final_state, predicted_snos_full_output_cells }
 }
 
 pub(crate) fn create_cairo1_bootstrap_declare_tx(

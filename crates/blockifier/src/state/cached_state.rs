@@ -9,6 +9,7 @@ use starknet_types_core::felt::Felt;
 
 use crate::context::TransactionContext;
 use crate::execution::contract_class::RunnableCompiledClass;
+use crate::fee::fee_utils::get_sequencer_balance_keys;
 use crate::state::errors::StateError;
 use crate::state::state_api::{State, StateReader, StateResult, UpdatableState};
 use crate::transaction::objects::TransactionExecutionInfo;
@@ -137,6 +138,45 @@ impl<S: StateReader> StateReader for CachedState<S> {
             panic!("Cannot retrieve '{contract_address:?}' and '{key:?}' from the cache.")
         });
         Ok(*value)
+    }
+
+    fn get_storage_many(&self, keys: &[(ContractAddress, StorageKey)]) -> StateResult<Vec<Felt>> {
+        let mut values = vec![None; keys.len()];
+        let mut misses = Vec::new();
+        {
+            let cache = self.cache.borrow();
+            for (index, (contract_address, key)) in keys.iter().copied().enumerate() {
+                if let Some(value) = cache.get_storage_at(contract_address, key) {
+                    values[index] = Some(*value);
+                } else {
+                    misses.push((index, contract_address, key));
+                }
+            }
+        }
+
+        if !misses.is_empty() {
+            let missing_keys = misses
+                .iter()
+                .map(|(_, contract_address, key)| (*contract_address, *key))
+                .collect::<Vec<_>>();
+            let missing_values = self.state.get_storage_many(&missing_keys)?;
+            assert_eq!(
+                missing_values.len(),
+                misses.len(),
+                "StateReader bulk result length mismatch"
+            );
+
+            let mut cache = self.cache.borrow_mut();
+            for ((index, contract_address, key), value) in misses.into_iter().zip(missing_values) {
+                cache.set_storage_initial_value(contract_address, key, value);
+                values[index] = Some(value);
+            }
+        }
+
+        Ok(values
+            .into_iter()
+            .map(|value| value.expect("Every bulk storage read must be populated"))
+            .collect())
     }
 
     fn get_nonce_at(&self, contract_address: ContractAddress) -> StateResult<Nonce> {
@@ -611,6 +651,10 @@ impl<S: StateReader + ?Sized> StateReader for MutRefState<'_, S> {
         self.0.get_storage_at(contract_address, key)
     }
 
+    fn get_storage_many(&self, keys: &[(ContractAddress, StorageKey)]) -> StateResult<Vec<Felt>> {
+        self.0.get_storage_many(keys)
+    }
+
     fn get_nonce_at(&self, contract_address: ContractAddress) -> StateResult<Nonce> {
         self.0.get_nonce_at(contract_address)
     }
@@ -759,15 +803,18 @@ impl StateChangesKeys {
         concurrency_mode: bool,
     ) {
         let actual_fee = tx_result.receipt.fee.0;
-        let sequencer_address = tx_context.block_context.block_info.sequencer_address;
         if concurrency_mode
             && !tx_context.is_sequencer_the_sender()
             && tx_result.fee_transfer_call_info.is_some()
             && actual_fee > 0
         {
-            // Add the deleted sequencer balance key to the storage keys.
-            let sequencer_balance_low = get_fee_token_var_address(sequencer_address);
-            self.storage_keys.insert((tx_context.fee_token_address(), sequencer_balance_low));
+            // Concurrent fee completion may carry into the high word after admission.
+            let (sequencer_balance_low, sequencer_balance_high) =
+                get_sequencer_balance_keys(&tx_context.block_context);
+            self.storage_keys.extend([
+                (tx_context.fee_token_address(), sequencer_balance_low),
+                (tx_context.fee_token_address(), sequencer_balance_high),
+            ]);
         }
     }
 

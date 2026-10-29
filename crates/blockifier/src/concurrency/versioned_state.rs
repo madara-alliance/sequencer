@@ -349,6 +349,32 @@ impl<S: StateReader> StateReader for VersionedStateProxy<S> {
         }
     }
 
+    fn get_storage_many(&self, keys: &[(ContractAddress, StorageKey)]) -> StateResult<Vec<Felt>> {
+        let mut state_opt = self.state();
+        let state = state_opt.inner_mut()?;
+        let mut values = vec![None; keys.len()];
+        let mut missing = Vec::new();
+
+        for (index, key) in keys.iter().copied().enumerate() {
+            match state.storage.read(self.tx_index, key) {
+                Some(value) => values[index] = Some(value),
+                None => missing.push((index, key)),
+            }
+        }
+
+        let missing_keys: Vec<_> = missing.iter().map(|(_, key)| *key).collect();
+        let missing_values = state.initial_state.get_storage_many(&missing_keys)?;
+        for ((index, key), value) in missing.into_iter().zip(missing_values) {
+            state.storage.set_initial_value(key, value);
+            values[index] = Some(value);
+        }
+
+        Ok(values
+            .into_iter()
+            .map(|value| value.expect("Every storage read must be populated"))
+            .collect())
+    }
+
     fn get_nonce_at(&self, contract_address: ContractAddress) -> StateResult<Nonce> {
         let mut state_opt = self.state();
         let state = state_opt.inner_mut()?;

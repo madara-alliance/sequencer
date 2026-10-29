@@ -222,6 +222,44 @@ fn test_versioned_state_proxy() {
     );
 }
 
+#[test]
+fn versioned_state_proxy_bulk_reads_preserve_versioned_writes_and_order() {
+    let contract_address = contract_address!("0x1");
+    let first_key = storage_key!(0x10_u8);
+    let second_key = storage_key!(0x11_u8);
+    let initial_first = felt!(1_u8);
+    let initial_second = felt!(2_u8);
+    let written_second = felt!(3_u8);
+    let initial_state = CachedState::new(DictStateReader {
+        storage_view: HashMap::from([
+            ((contract_address, first_key), initial_first),
+            ((contract_address, second_key), initial_second),
+        ]),
+        ..Default::default()
+    });
+    let versioned_state =
+        ThreadSafeVersionedState(Arc::new(Mutex::new(OptionalVersionedState::new(initial_state))));
+    versioned_state.pin_version(0).apply_writes(
+        &StateMaps {
+            storage: HashMap::from([((contract_address, second_key), written_second)]),
+            ..Default::default()
+        },
+        &HashMap::default(),
+    );
+
+    assert_eq!(
+        versioned_state
+            .pin_version(1)
+            .get_storage_many(&[
+                (contract_address, second_key),
+                (contract_address, first_key),
+                (contract_address, first_key),
+            ])
+            .unwrap(),
+        vec![written_second, initial_first, initial_first]
+    );
+}
+
 #[rstest]
 // Test parallel execution of two transactions that use the same versioned state.
 fn test_run_parallel_txs(default_all_resource_bounds: ValidResourceBounds) {

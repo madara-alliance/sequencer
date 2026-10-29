@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock};
 use assert_matches::assert_matches;
 use blockifier::abi::constants::STORED_BLOCK_HASH_BUFFER;
 use blockifier::blockifier_versioned_constants::VersionedConstants;
+use blockifier::bouncer::accumulate_snos_full_output_cells;
 use blockifier::execution::call_info::OpcodeName;
 use blockifier::test_utils::contracts::FeatureContractTrait;
 use blockifier::test_utils::dict_state_reader::DictStateReader;
@@ -224,6 +225,27 @@ async fn declare_deploy_scenario(
     test_builder.add_funded_account_invoke(invoke_tx_args! { calldata: deploy_contract_calldata });
     test_builder.divide_transactions_into_n_blocks(n_blocks);
     let test_output = test_builder.build_and_run().await;
+
+    if full_output {
+        let actual_output_cells = test_output.runner_output.raw_os_output.len();
+        let predicted_output_cells = test_output
+            .predicted_snos_full_output_cells_per_block
+            .iter()
+            .copied()
+            .reduce(|accumulated, block| {
+                accumulate_snos_full_output_cells(accumulated, block)
+                    .expect("SNOS output prediction must not overflow")
+            })
+            .expect("OS flow must contain at least one block");
+        assert!(
+            predicted_output_cells >= actual_output_cells,
+            "Blockifier prediction must cover the actual serialized SNOS output: \
+             predicted={predicted_output_cells}, actual={actual_output_cells}"
+        );
+        if n_blocks == 1 {
+            assert_eq!(predicted_output_cells, actual_output_cells);
+        }
+    }
 
     let partial_state_diff = StateDiff {
         // Deployed contract.
