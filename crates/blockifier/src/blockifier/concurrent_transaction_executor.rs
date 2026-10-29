@@ -51,7 +51,7 @@ impl<S: StateReader + Send + 'static> ConcurrentTransactionExecutor<S> {
 
         let bouncer_config = block_context.bouncer_config.clone();
         let mut bouncer = Bouncer::new(bouncer_config);
-        bouncer.seed_snos_output_shadow(preprocessed_state_changes_keys);
+        bouncer.seed_output_builtin(preprocessed_state_changes_keys);
         let worker_executor = Arc::new(WorkerExecutor::initialize(
             block_state,
             vec![],

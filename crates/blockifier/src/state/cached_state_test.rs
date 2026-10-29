@@ -114,7 +114,10 @@ fn get_storage_many_preserves_order_and_cached_writes() {
             .unwrap(),
         vec![written_value, first_value, first_value]
     );
-    assert_eq!(state.cache.borrow().initial_reads.storage.get(&(contract_address, first_key)), Some(&first_value));
+    assert_eq!(
+        state.cache.borrow().initial_reads.storage.get(&(contract_address, first_key)),
+        Some(&first_value)
+    );
 }
 
 #[test]
@@ -748,7 +751,10 @@ fn concurrent_fee_reserves_both_sequencer_balance_words() {
 
     assert_eq!(
         keys.storage_keys,
-        HashSet::from([(tx_context.fee_token_address(), low), (tx_context.fee_token_address(), high)])
+        HashSet::from([
+            (tx_context.fee_token_address(), low),
+            (tx_context.fee_token_address(), high)
+        ])
     );
 }
 

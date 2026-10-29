@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use apollo_config::dumping::{SerializeConfig, prepend_sub_config_name, ser_param};
+use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
 use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
@@ -18,11 +18,11 @@ use crate::blockifier::transaction_executor::{
 };
 use crate::blockifier_versioned_constants::{BuiltinGasCosts, VersionedConstants};
 use crate::execution::call_info::{
+    cairo_primitive_counter_map,
     BuiltinCounterMap,
     CairoPrimitiveCounterMap,
     ExecutionSummary,
     ExtendedExecutionResources,
-    cairo_primitive_counter_map,
 };
 use crate::fee::gas_usage::get_onchain_data_segment_length;
 use crate::fee::resources::TransactionResources;
@@ -560,14 +560,15 @@ pub struct Bouncer {
     pub state_changes_keys: StateChangesKeys,
     pub bouncer_config: BouncerConfig,
     accumulated_weights: TxWeights,
-    snos_output_shadow: SnosOutputShadowTracker,
+    output_builtin: OutputBuiltinTracker,
 }
 
-/// Shadow-only prediction of the full SNOS output size. This is deliberately not a bouncer
-/// weight yet: phase one observes and validates the estimate without changing block production.
+/// Tracks the block-wide state required to enforce the full SNOS output-cell limit.
+/// This remains separate from additive bouncer weights because aliases and state keys are
+/// deduplicated across the complete block.
 #[derive(Debug, Default, PartialEq)]
 #[cfg_attr(test, derive(Clone))]
-struct SnosOutputShadowTracker {
+struct OutputBuiltinTracker {
     storage_updates: HashSet<StorageEntry>,
     modified_contracts: HashSet<ContractAddress>,
     compiled_class_hashes: HashSet<ClassHash>,
@@ -578,7 +579,7 @@ struct SnosOutputShadowTracker {
 }
 
 #[derive(Debug)]
-struct SnosOutputShadowPrediction {
+struct OutputBuiltinPrediction {
     cells: usize,
     message_segment_length: usize,
     modified_contracts: usize,
@@ -588,7 +589,7 @@ struct SnosOutputShadowPrediction {
 }
 
 #[derive(Debug, Default)]
-struct SnosOutputShadowUpdate {
+struct OutputBuiltinUpdate {
     previous_alias_counter_was_zero: Option<bool>,
     newly_checked_aliases: Vec<(StorageKey, bool)>,
     inserted_storage_updates: Vec<StorageEntry>,
@@ -627,7 +628,7 @@ impl Bouncer {
             state_changes_keys: StateChangesKeys::default(),
             bouncer_config: BouncerConfig::empty(),
             accumulated_weights: TxWeights::empty(),
-            snos_output_shadow: SnosOutputShadowTracker::default(),
+            output_builtin: OutputBuiltinTracker::default(),
         }
     }
 
@@ -635,14 +636,13 @@ impl Bouncer {
         &self.accumulated_weights.bouncer_weights
     }
 
-    pub(crate) fn seed_snos_output_shadow(
+    pub(crate) fn seed_output_builtin(
         &mut self,
         preprocessed_state_changes_keys: StateChangesKeys,
     ) {
-        self.snos_output_shadow.storage_updates = preprocessed_state_changes_keys.storage_keys;
-        self.snos_output_shadow.modified_contracts =
-            preprocessed_state_changes_keys.modified_contracts;
-        self.snos_output_shadow.compiled_class_hashes =
+        self.output_builtin.storage_updates = preprocessed_state_changes_keys.storage_keys;
+        self.output_builtin.modified_contracts = preprocessed_state_changes_keys.modified_contracts;
+        self.output_builtin.compiled_class_hashes =
             preprocessed_state_changes_keys.compiled_class_hash_keys;
     }
 
@@ -733,29 +733,29 @@ impl Bouncer {
             Err(TransactionExecutorError::BlockFull)?
         }
 
-        let mut shadow_update = self.update_snos_output_shadow(
+        let mut output_update = self.update_output_builtin(
             state_reader,
             &marginal_state_changes_keys,
             versioned_constants,
         )?;
-        self.apply_snos_output_shadow_accounting(
+        self.apply_output_builtin_accounting(
             versioned_constants,
             &marginal_state_changes_keys,
             &tx_weights,
-            &mut shadow_update,
+            &mut output_update,
         );
         let prediction =
-            self.snos_output_shadow_prediction_with_pending(versioned_constants, &tx_weights);
+            self.output_builtin_prediction_with_pending(versioned_constants, &tx_weights);
         if let Err(error) = ensure_snos_output_within_limit(
             prediction.cells,
             self.get_bouncer_weights().n_txs,
             self.bouncer_config.max_snos_full_output_cells,
         ) {
-            self.rollback_snos_output_shadow(shadow_update);
+            self.rollback_output_builtin(output_update);
             let tx_ordinal = next_accumulated_weights.n_txs;
             let empty_block = self.get_bouncer_weights().n_txs == 0;
             log::info!(
-                target: "snos_output_shadow",
+                target: "output_builtin",
                 "event=tx_prediction_rejected block_number={} tx_ordinal={} \
                  predicted_full_output_cells={} max_full_output_cells={} reason={}",
                 block_number,
@@ -770,7 +770,7 @@ impl Bouncer {
         self.update(tx_weights, tx_execution_summary, &marginal_state_changes_keys);
 
         log::debug!(
-            target: "snos_output_shadow",
+            target: "output_builtin",
             "event=tx_prediction block_number={} tx_ordinal={} predicted_full_output_cells={} \
              message_segment_length={} modified_contracts={} storage_updates={} \
              declared_class_updates={} new_aliases={} exceeds_49000={} \
@@ -791,14 +791,14 @@ impl Bouncer {
         Ok(())
     }
 
-    fn update_snos_output_shadow<S: StateReader>(
+    fn update_output_builtin<S: StateReader>(
         &mut self,
         state_reader: &S,
         marginal_state_changes_keys: &StateChangesKeys,
         versioned_constants: &VersionedConstants,
-    ) -> TransactionExecutorResult<SnosOutputShadowUpdate> {
+    ) -> TransactionExecutorResult<OutputBuiltinUpdate> {
         if !versioned_constants.enable_stateful_compression {
-            return Ok(SnosOutputShadowUpdate::default());
+            return Ok(OutputBuiltinUpdate::default());
         }
 
         let alias_contract_address =
@@ -824,12 +824,10 @@ impl Bouncer {
 
         // Complete all fallible reads before mutating the tracker. Keep the
         // counter in the same batch so a cold transaction pays lookup setup once.
-        let read_counter = self.snos_output_shadow.alias_counter_was_zero.is_none();
+        let read_counter = self.output_builtin.alias_counter_was_zero.is_none();
         let unchecked_candidates = candidates
             .into_iter()
-            .filter(|candidate| {
-                !self.snos_output_shadow.checked_alias_candidates.contains(candidate)
-            })
+            .filter(|candidate| !self.output_builtin.checked_alias_candidates.contains(candidate))
             .collect::<Vec<_>>();
         let mut storage_reads =
             Vec::with_capacity(unchecked_candidates.len() + usize::from(read_counter));
@@ -850,7 +848,7 @@ impl Bouncer {
             (storage_values[0] == Felt::ZERO, &storage_values[1..])
         } else {
             (
-                self.snos_output_shadow
+                self.output_builtin
                     .alias_counter_was_zero
                     .expect("Alias counter presence was checked above"),
                 storage_values.as_slice(),
@@ -862,67 +860,67 @@ impl Bouncer {
             .map(|(candidate, value)| (candidate, *value == Felt::ZERO))
             .collect();
 
-        let update = SnosOutputShadowUpdate {
-            previous_alias_counter_was_zero: self.snos_output_shadow.alias_counter_was_zero,
+        let update = OutputBuiltinUpdate {
+            previous_alias_counter_was_zero: self.output_builtin.alias_counter_was_zero,
             newly_checked_aliases: newly_checked,
-            ..SnosOutputShadowUpdate::default()
+            ..OutputBuiltinUpdate::default()
         };
-        self.snos_output_shadow.alias_counter_was_zero = Some(counter_was_zero);
+        self.output_builtin.alias_counter_was_zero = Some(counter_was_zero);
         for (candidate, needs_alias) in &update.newly_checked_aliases {
-            self.snos_output_shadow.checked_alias_candidates.insert(*candidate);
+            self.output_builtin.checked_alias_candidates.insert(*candidate);
             if *needs_alias {
-                self.snos_output_shadow.new_alias_keys.insert(*candidate);
+                self.output_builtin.new_alias_keys.insert(*candidate);
             }
         }
         Ok(update)
     }
 
-    fn rollback_snos_output_shadow(&mut self, update: SnosOutputShadowUpdate) {
-        self.snos_output_shadow.alias_counter_was_zero = update.previous_alias_counter_was_zero;
+    fn rollback_output_builtin(&mut self, update: OutputBuiltinUpdate) {
+        self.output_builtin.alias_counter_was_zero = update.previous_alias_counter_was_zero;
         for (candidate, needs_alias) in update.newly_checked_aliases {
-            self.snos_output_shadow.checked_alias_candidates.remove(&candidate);
+            self.output_builtin.checked_alias_candidates.remove(&candidate);
             if needs_alias {
-                self.snos_output_shadow.new_alias_keys.remove(&candidate);
+                self.output_builtin.new_alias_keys.remove(&candidate);
             }
         }
         for entry in update.inserted_storage_updates {
-            self.snos_output_shadow.storage_updates.remove(&entry);
+            self.output_builtin.storage_updates.remove(&entry);
         }
         for contract_address in update.inserted_modified_contracts {
-            self.snos_output_shadow.modified_contracts.remove(&contract_address);
+            self.output_builtin.modified_contracts.remove(&contract_address);
         }
         for class_hash in update.inserted_compiled_class_hashes {
-            self.snos_output_shadow.compiled_class_hashes.remove(&class_hash);
+            self.output_builtin.compiled_class_hashes.remove(&class_hash);
         }
         for class_hash in update.inserted_migrated_class_hashes {
-            self.snos_output_shadow.migrated_class_hashes.remove(&class_hash);
+            self.output_builtin.migrated_class_hashes.remove(&class_hash);
         }
     }
 
-    fn apply_snos_output_shadow_accounting(
+    fn apply_output_builtin_accounting(
         &mut self,
         versioned_constants: &VersionedConstants,
         marginal_state_changes_keys: &StateChangesKeys,
         tx_weights: &TxWeights,
-        update: &mut SnosOutputShadowUpdate,
+        update: &mut OutputBuiltinUpdate,
     ) {
         for entry in &marginal_state_changes_keys.storage_keys {
-            if self.snos_output_shadow.storage_updates.insert(*entry) {
+            if self.output_builtin.storage_updates.insert(*entry) {
                 update.inserted_storage_updates.push(*entry);
             }
         }
         for contract_address in &marginal_state_changes_keys.modified_contracts {
-            if self.snos_output_shadow.modified_contracts.insert(*contract_address) {
+            if self.output_builtin.modified_contracts.insert(*contract_address) {
                 update.inserted_modified_contracts.push(*contract_address);
             }
         }
         for class_hash in &marginal_state_changes_keys.compiled_class_hash_keys {
-            if self.snos_output_shadow.compiled_class_hashes.insert(*class_hash) {
+            if self.output_builtin.compiled_class_hashes.insert(*class_hash) {
                 update.inserted_compiled_class_hashes.push(*class_hash);
             }
         }
         for class_hash in tx_weights.class_hashes_to_migrate.keys() {
-            if self.snos_output_shadow.migrated_class_hashes.insert(*class_hash) {
+            if self.output_builtin.migrated_class_hashes.insert(*class_hash) {
                 update.inserted_migrated_class_hashes.push(*class_hash);
             }
         }
@@ -936,43 +934,43 @@ impl Bouncer {
         for (alias_key, needs_alias) in &update.newly_checked_aliases {
             if *needs_alias {
                 let entry = (alias_contract_address, *alias_key);
-                if self.snos_output_shadow.storage_updates.insert(entry) {
+                if self.output_builtin.storage_updates.insert(entry) {
                     update.inserted_storage_updates.push(entry);
                 }
             }
         }
-        let counter_changes = self.snos_output_shadow.alias_counter_was_zero == Some(true)
-            || !self.snos_output_shadow.new_alias_keys.is_empty();
+        let counter_changes = self.output_builtin.alias_counter_was_zero == Some(true)
+            || !self.output_builtin.new_alias_keys.is_empty();
         if counter_changes {
             let entry = (alias_contract_address, ALIAS_COUNTER_STORAGE_KEY);
-            if self.snos_output_shadow.storage_updates.insert(entry) {
+            if self.output_builtin.storage_updates.insert(entry) {
                 update.inserted_storage_updates.push(entry);
             }
-            if self.snos_output_shadow.modified_contracts.insert(alias_contract_address) {
+            if self.output_builtin.modified_contracts.insert(alias_contract_address) {
                 update.inserted_modified_contracts.push(alias_contract_address);
             }
         }
     }
 
-    fn snos_output_shadow_prediction(
+    fn output_builtin_prediction(
         &self,
         _versioned_constants: &VersionedConstants,
-    ) -> SnosOutputShadowPrediction {
-        self.snos_output_shadow_prediction_inner(None)
+    ) -> OutputBuiltinPrediction {
+        self.output_builtin_prediction_inner(None)
     }
 
-    fn snos_output_shadow_prediction_with_pending(
+    fn output_builtin_prediction_with_pending(
         &self,
         _versioned_constants: &VersionedConstants,
         pending_tx_weights: &TxWeights,
-    ) -> SnosOutputShadowPrediction {
-        self.snos_output_shadow_prediction_inner(Some(pending_tx_weights))
+    ) -> OutputBuiltinPrediction {
+        self.output_builtin_prediction_inner(Some(pending_tx_weights))
     }
 
-    fn snos_output_shadow_prediction_inner(
+    fn output_builtin_prediction_inner(
         &self,
         pending_tx_weights: Option<&TxWeights>,
-    ) -> SnosOutputShadowPrediction {
+    ) -> OutputBuiltinPrediction {
         let message_segment_length = pending_tx_weights
             .map(|pending| {
                 self.get_bouncer_weights()
@@ -981,42 +979,42 @@ impl Bouncer {
                     .message_segment_length
             })
             .unwrap_or(self.get_bouncer_weights().message_segment_length);
-        let declared_class_updates = self.snos_output_shadow.compiled_class_hashes.len()
-            + self.snos_output_shadow.migrated_class_hashes.len();
+        let declared_class_updates = self.output_builtin.compiled_class_hashes.len()
+            + self.output_builtin.migrated_class_hashes.len();
         let cells = 14
             + message_segment_length
-            + 6 * self.snos_output_shadow.modified_contracts.len()
-            + 3 * self.snos_output_shadow.storage_updates.len()
+            + 6 * self.output_builtin.modified_contracts.len()
+            + 3 * self.output_builtin.storage_updates.len()
             + 3 * declared_class_updates;
 
-        SnosOutputShadowPrediction {
+        OutputBuiltinPrediction {
             cells,
             message_segment_length,
-            modified_contracts: self.snos_output_shadow.modified_contracts.len(),
-            storage_updates: self.snos_output_shadow.storage_updates.len(),
+            modified_contracts: self.output_builtin.modified_contracts.len(),
+            storage_updates: self.output_builtin.storage_updates.len(),
             declared_class_updates,
-            new_aliases: self.snos_output_shadow.new_alias_keys.len(),
+            new_aliases: self.output_builtin.new_alias_keys.len(),
         }
     }
 
-    pub(crate) fn log_snos_output_shadow_final(
+    pub(crate) fn log_output_builtin_final(
         &self,
         block_number: BlockNumber,
         state_diff: &crate::state::cached_state::StateMaps,
         versioned_constants: &VersionedConstants,
     ) {
-        if !log::log_enabled!(target: "snos_output_shadow", log::Level::Info) {
+        if !log::log_enabled!(target: "output_builtin", log::Level::Info) {
             return;
         }
 
-        let prediction = self.snos_output_shadow_prediction(versioned_constants);
+        let prediction = self.output_builtin_prediction(versioned_constants);
         let actual_shape_cells = 14
             + self.get_bouncer_weights().message_segment_length
             + 6 * state_diff.get_contract_addresses().len()
             + 3 * state_diff.storage.len()
             + 3 * state_diff.compiled_class_hashes.len();
         log::info!(
-            target: "snos_output_shadow",
+            target: "output_builtin",
             "event=block_prediction block_number={} predicted_full_output_cells={} \
              finalized_state_diff_cells={} prediction_minus_finalized={} undercount={} \
              exceeds_49000={} exceeds_configured_limit={} max_full_output_cells={} \

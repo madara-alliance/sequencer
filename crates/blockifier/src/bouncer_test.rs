@@ -20,40 +20,40 @@ use super::{BouncerConfig, DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS};
 use crate::blockifier::transaction_executor::TransactionExecutorError;
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{
-    Bouncer,
-    BouncerWeights,
-    BuiltinWeights,
-    CasmHashComputationData,
-    CasmHashMigrationData,
-    TxWeights,
     cairo_primitives_to_gas,
     ensure_snos_output_within_limit,
     get_patricia_update_resources,
     get_tx_weights,
     map_class_hash_to_casm_hash_computation_resources,
     verify_tx_weights_within_max_capacity,
+    Bouncer,
+    BouncerWeights,
+    BuiltinWeights,
+    CasmHashComputationData,
+    CasmHashMigrationData,
+    TxWeights,
 };
 use crate::context::BlockContext;
 use crate::execution::call_info::{
+    cairo_primitive_counter_map,
     CairoPrimitiveCounterMap,
     CairoPrimitiveName,
     ExecutionSummary,
     ExtendedExecutionResources,
     OpcodeCounterMap,
-    cairo_primitive_counter_map,
 };
 use crate::fee::resources::{ComputationResources, TransactionResources};
 use crate::state::cached_state::{CachedState, StateChangesKeys, StateMaps, TransactionalState};
-use crate::state::state_api::StateReader;
-use crate::state::stateful_compression::ALIAS_COUNTER_STORAGE_KEY;
+use crate::state::state_api::{State, StateReader};
+use crate::state::stateful_compression::{allocate_aliases_in_storage, ALIAS_COUNTER_STORAGE_KEY};
 use crate::test_utils::contracts::FeatureContractData;
 use crate::test_utils::dict_state_reader::DictStateReader;
 use crate::test_utils::initial_test_state::test_state;
 use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::ExecutionResourcesTraits;
 use crate::transaction::test_utils::{
-    TestInitData,
     create_init_data_for_compiled_class_hash_migration_test,
+    TestInitData,
 };
 use crate::utils::{add_maps, u64_from_usize};
 
@@ -217,7 +217,7 @@ fn test_block_weights_has_room_n_txs(
         (class_hash!(0_u128), (CompiledClassHash(felt!(2_u128)), CompiledClassHash(felt!(1_u128)))),
     ]),
 },
-    snos_output_shadow: Default::default(),
+    output_builtin: Default::default(),
 })]
 fn test_bouncer_update(#[case] initial_bouncer: Bouncer) {
     // TODO(Aviv): Use expect! to avoid magic numbers.
@@ -516,7 +516,7 @@ fn test_bouncer_try_update_n_txs(
 }
 
 #[test]
-fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
+fn test_output_builtin_prediction_deduplicates_new_aliases() {
     let versioned_constants = VersionedConstants::create_for_account_testing();
     assert!(versioned_constants.enable_stateful_compression);
     let alias_contract_address =
@@ -541,9 +541,9 @@ fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
     let mut bouncer = Bouncer::empty();
 
     let mut first_update = bouncer
-        .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
+        .update_output_builtin(&state_reader, &state_changes_keys, &versioned_constants)
         .unwrap();
-    bouncer.apply_snos_output_shadow_accounting(
+    bouncer.apply_output_builtin_accounting(
         &versioned_constants,
         &state_changes_keys,
         &TxWeights::default(),
@@ -551,16 +551,16 @@ fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
     );
     // Re-observing the same keys must not allocate/count them twice.
     let mut second_update = bouncer
-        .update_snos_output_shadow(&state_reader, &state_changes_keys, &versioned_constants)
+        .update_output_builtin(&state_reader, &state_changes_keys, &versioned_constants)
         .unwrap();
-    bouncer.apply_snos_output_shadow_accounting(
+    bouncer.apply_output_builtin_accounting(
         &versioned_constants,
         &state_changes_keys,
         &TxWeights::default(),
         &mut second_update,
     );
 
-    let prediction = bouncer.snos_output_shadow_prediction(&versioned_constants);
+    let prediction = bouncer.output_builtin_prediction(&versioned_constants);
     assert_eq!(prediction.new_aliases, 2);
     assert_eq!(prediction.modified_contracts, 2);
     assert_eq!(prediction.storage_updates, 5);
@@ -568,7 +568,7 @@ fn test_snos_output_shadow_prediction_deduplicates_new_aliases() {
 }
 
 #[test]
-fn test_snos_output_shadow_prediction_includes_preprocessed_state_changes() {
+fn test_output_builtin_prediction_includes_preprocessed_state_changes() {
     let versioned_constants = VersionedConstants::create_for_account_testing();
     let contract_address = contract_address!(0x1_u128);
     let storage_key = storage_key!(0x123_u128);
@@ -579,12 +579,66 @@ fn test_snos_output_shadow_prediction_includes_preprocessed_state_changes() {
     };
     let mut bouncer = Bouncer::empty();
 
-    bouncer.seed_snos_output_shadow(preprocessed_state_changes_keys);
+    bouncer.seed_output_builtin(preprocessed_state_changes_keys);
 
-    let prediction = bouncer.snos_output_shadow_prediction(&versioned_constants);
+    let prediction = bouncer.output_builtin_prediction(&versioned_constants);
     assert_eq!(prediction.modified_contracts, 1);
     assert_eq!(prediction.storage_updates, 1);
     assert_eq!(prediction.cells, 23);
+}
+
+#[test]
+fn output_builtin_prediction_matches_finalized_alias_state_shape() {
+    let versioned_constants = VersionedConstants::create_for_account_testing();
+    let alias_contract_address =
+        versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+    let historical_contract = contract_address!(0x1_u128);
+    let transaction_contract = contract_address!(0x100_u128);
+    let transaction_key = storage_key!(0x200_u128);
+    let class_hash = ClassHash(felt!(0xabc_u128));
+    let mut state = CachedState::new(DictStateReader::default());
+
+    // Mirrors the historical block-hash write applied before executor creation.
+    state.set_storage_at(historical_contract, storage_key!(0x10_u128), Felt::ONE).unwrap();
+    let mut bouncer = Bouncer::empty();
+    bouncer.seed_output_builtin(state.to_state_diff().unwrap().state_maps.keys());
+
+    state.set_storage_at(transaction_contract, transaction_key, Felt::TWO).unwrap();
+    // A real declare execution reads the previous compiled-class hash before writing it.
+    state.get_compiled_class_hash(class_hash).unwrap();
+    state.set_compiled_class_hash(class_hash, CompiledClassHash(felt!(0xdef_u128))).unwrap();
+    let transaction_changes = StateChangesKeys {
+        storage_keys: HashSet::from([(transaction_contract, transaction_key)]),
+        modified_contracts: HashSet::from([transaction_contract]),
+        compiled_class_hash_keys: HashSet::from([class_hash]),
+        ..StateChangesKeys::default()
+    };
+    let mut update =
+        bouncer.update_output_builtin(&state, &transaction_changes, &versioned_constants).unwrap();
+    bouncer.apply_output_builtin_accounting(
+        &versioned_constants,
+        &transaction_changes,
+        &TxWeights::default(),
+        &mut update,
+    );
+    bouncer.set_bouncer_weights(BouncerWeights {
+        message_segment_length: 11,
+        n_txs: 1,
+        ..BouncerWeights::empty()
+    });
+
+    // Run the same finalization routine that materializes alias and counter writes.
+    allocate_aliases_in_storage(&mut state, alias_contract_address).unwrap();
+    let finalized = state.to_state_diff().unwrap().state_maps;
+    let finalized_cells = 14
+        + 11
+        + 6 * finalized.get_contract_addresses().len()
+        + 3 * finalized.storage.len()
+        + 3 * finalized.compiled_class_hashes.len();
+
+    let prediction = bouncer.output_builtin_prediction(&versioned_constants);
+    assert_eq!(prediction.new_aliases, 2);
+    assert_eq!(prediction.cells, finalized_cells);
 }
 
 #[test]
@@ -658,11 +712,11 @@ fn test_snos_output_admission_rolls_back_rejected_transaction() {
         }
         assert_eq!(bouncer.get_bouncer_weights().n_txs, current_n_txs);
         assert!(bouncer.state_changes_keys.storage_keys.is_empty());
-        assert_eq!(bouncer.snos_output_shadow.alias_counter_was_zero, None);
-        assert!(bouncer.snos_output_shadow.storage_updates.is_empty());
-        assert!(bouncer.snos_output_shadow.modified_contracts.is_empty());
-        assert!(bouncer.snos_output_shadow.compiled_class_hashes.is_empty());
-        assert!(bouncer.snos_output_shadow.migrated_class_hashes.is_empty());
+        assert_eq!(bouncer.output_builtin.alias_counter_was_zero, None);
+        assert!(bouncer.output_builtin.storage_updates.is_empty());
+        assert!(bouncer.output_builtin.modified_contracts.is_empty());
+        assert!(bouncer.output_builtin.compiled_class_hashes.is_empty());
+        assert!(bouncer.output_builtin.migrated_class_hashes.is_empty());
     }
 }
 

@@ -32,10 +32,7 @@ pub trait StateReader {
 
     /// Returns several storage values in input order. Readers with a shared
     /// cache or backing snapshot can override this to amortize lookup setup.
-    fn get_storage_many(
-        &self,
-        keys: &[(ContractAddress, StorageKey)],
-    ) -> StateResult<Vec<Felt>> {
+    fn get_storage_many(&self, keys: &[(ContractAddress, StorageKey)]) -> StateResult<Vec<Felt>> {
         keys.iter()
             .map(|(contract_address, key)| self.get_storage_at(*contract_address, *key))
             .collect()
@@ -99,10 +96,7 @@ impl<T: StateReader + ?Sized> StateReader for Box<T> {
         self.as_ref().get_storage_at(contract_address, key)
     }
 
-    fn get_storage_many(
-        &self,
-        keys: &[(ContractAddress, StorageKey)],
-    ) -> StateResult<Vec<Felt>> {
+    fn get_storage_many(&self, keys: &[(ContractAddress, StorageKey)]) -> StateResult<Vec<Felt>> {
         self.as_ref().get_storage_many(keys)
     }
 

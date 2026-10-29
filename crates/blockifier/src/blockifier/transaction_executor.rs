@@ -115,7 +115,7 @@ impl<S: StateReader> TransactionExecutor<S> {
         )?;
         let preprocessed_state_changes_keys = block_state.to_state_diff()?.state_maps.keys();
         let executor = Self::new_with_pool(block_state, block_context, config, worker_pool);
-        lock_bouncer(&executor.bouncer).seed_snos_output_shadow(preprocessed_state_changes_keys);
+        lock_bouncer(&executor.bouncer).seed_output_builtin(preprocessed_state_changes_keys);
         Ok(executor)
     }
 
@@ -147,7 +147,7 @@ impl<S: StateReader> TransactionExecutor<S> {
     }
 
     /// Seeds the SNOS output predictor with state changes applied before transaction execution.
-    pub fn seed_snos_output_shadow_from_block_state(&mut self) -> StateResult<()> {
+    pub fn seed_output_builtin_from_block_state(&mut self) -> StateResult<()> {
         let state_changes_keys = self
             .block_state
             .as_mut()
@@ -155,7 +155,7 @@ impl<S: StateReader> TransactionExecutor<S> {
             .to_state_diff()?
             .state_maps
             .keys();
-        lock_bouncer(&self.bouncer).seed_snos_output_shadow(state_changes_keys);
+        lock_bouncer(&self.bouncer).seed_output_builtin(state_changes_keys);
         Ok(())
     }
 
@@ -299,7 +299,7 @@ pub(crate) fn finalize_block<S: StateReader>(
 
     let state_diff = block_state.to_state_diff()?.state_maps;
 
-    bouncer.log_snos_output_shadow_final(
+    bouncer.log_output_builtin_final(
         block_context.block_info.block_number,
         &state_diff,
         &block_context.versioned_constants,

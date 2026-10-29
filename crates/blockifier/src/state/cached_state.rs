@@ -140,10 +140,7 @@ impl<S: StateReader> StateReader for CachedState<S> {
         Ok(*value)
     }
 
-    fn get_storage_many(
-        &self,
-        keys: &[(ContractAddress, StorageKey)],
-    ) -> StateResult<Vec<Felt>> {
+    fn get_storage_many(&self, keys: &[(ContractAddress, StorageKey)]) -> StateResult<Vec<Felt>> {
         let mut values = vec![None; keys.len()];
         let mut misses = Vec::new();
         {
@@ -163,7 +160,11 @@ impl<S: StateReader> StateReader for CachedState<S> {
                 .map(|(_, contract_address, key)| (*contract_address, *key))
                 .collect::<Vec<_>>();
             let missing_values = self.state.get_storage_many(&missing_keys)?;
-            assert_eq!(missing_values.len(), misses.len(), "StateReader bulk result length mismatch");
+            assert_eq!(
+                missing_values.len(),
+                misses.len(),
+                "StateReader bulk result length mismatch"
+            );
 
             let mut cache = self.cache.borrow_mut();
             for ((index, contract_address, key), value) in misses.into_iter().zip(missing_values) {
@@ -650,10 +651,7 @@ impl<S: StateReader + ?Sized> StateReader for MutRefState<'_, S> {
         self.0.get_storage_at(contract_address, key)
     }
 
-    fn get_storage_many(
-        &self,
-        keys: &[(ContractAddress, StorageKey)],
-    ) -> StateResult<Vec<Felt>> {
+    fn get_storage_many(&self, keys: &[(ContractAddress, StorageKey)]) -> StateResult<Vec<Felt>> {
         self.0.get_storage_many(keys)
     }
 
