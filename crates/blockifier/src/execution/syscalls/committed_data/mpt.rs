@@ -9,7 +9,8 @@ use super::CommittedDataError;
 /// A canonical felt has at most 252 bits. This bounds paths, not the dataset's key space.
 pub const COMMITTED_DATA_TREE_HEIGHT: usize = 252;
 /// Per-import allocation bound, independent of key width and total retained DB size.
-pub const MAX_COMMITTED_DATA_VALUES: usize = 524_288;
+// Isolated capacity experiment only; commitment domains and hashing are unchanged.
+pub const MAX_COMMITTED_DATA_VALUES: usize = 1_048_576;
 const LEAF_DOMAIN: Felt = Felt::from_hex_unchecked("0x43445f4d50545f4c4541465f5631");
 const BRANCH_DOMAIN: Felt = Felt::from_hex_unchecked("0x43445f4d50545f4252414e43485f5631");
 
