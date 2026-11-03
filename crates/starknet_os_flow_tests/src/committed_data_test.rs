@@ -38,7 +38,7 @@ fn witness_for_key(value: Felt, key: Felt, height: usize) -> CommittedDataWitnes
             branch(step.bit, root, step.hash)
         };
     }
-    CommittedDataWitness { root, key, value, siblings }
+    CommittedDataWitness { root, key, value, siblings, terminal_key: None }
 }
 
 async fn prepare() -> TestRunner<DictStateReader> {
@@ -631,4 +631,186 @@ async fn committed_data_shared_reads_follow_reverts_and_block_boundaries(
     output.perform_default_validations();
     output.runner_output.cairo_pie.run_validity_checks().unwrap();
     assert_eq!(output.runner_output.committed_data_finalizations.len(), 2);
+}
+
+/// Uncaught absence consumes the nonce as an ordinary revert. Caught absence executes in
+/// Cairo (including two blocks and repeated shared prefixes), so an unproved host result cannot
+/// pass.
+#[tokio::test]
+async fn committed_data_absence_reverts_and_caught_failures_prove_across_blocks() {
+    use blockifier::execution::syscalls::committed_data::{
+        COMMITTED_DATA_ADDRESS,
+        CommittedDataSet,
+    };
+    let contract = FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
+    let (mut builder, [reader]) =
+        TestBuilder::create_standard([(contract, calldata![Felt::ZERO, Felt::ZERO])]).await;
+    let tree =
+        CommittedDataSet::new(vec![(Felt::ZERO, Felt::ZERO), (Felt::MAX, Felt::ONE)]).unwrap();
+    let proofs = vec![
+        tree.lookup_witness(Felt::ZERO),
+        tree.lookup_witness(Felt::ONE),
+        tree.lookup_witness(Felt::MAX),
+    ];
+    builder.initial_state.block_context.use_committed_data = true;
+    builder.os_hints_config.use_committed_data = true;
+    builder.initial_state.block_context.committed_data_witnesses =
+        Arc::new(CommittedDataWitnesses::new(proofs.clone()).unwrap());
+    builder.os_hints_config.committed_data_witnesses = proofs;
+    for block in 0..2 {
+        if block != 0 {
+            builder.move_to_next_block();
+        }
+        let calldata = create_calldata(
+            COMMITTED_DATA_ADDRESS.try_into().unwrap(),
+            "get_value",
+            &[tree.root(), Felt::ONE],
+        );
+        let tx = builder.create_funded_account_invoke(invoke_tx_args! { calldata });
+        builder.add_invoke_tx(tx, Some("CD_KEY_NOT_FOUND".into()), None);
+        let calldata =
+            create_calldata(reader, "test_committed_data_catch_single", &[tree.root(), Felt::ONE]);
+        builder.add_funded_account_invoke(invoke_tx_args! { calldata });
+        for keys in [
+            vec![Felt::ONE, Felt::TWO], /* Suffix has no supplied witness and must not be
+                                         * evaluated. */
+            vec![Felt::ONE; 1024],
+            [vec![Felt::ZERO; 1023], vec![Felt::ONE]].concat(),
+            vec![Felt::ONE],
+            vec![Felt::ZERO, Felt::ONE, Felt::MAX],
+            vec![Felt::ZERO, Felt::MAX, Felt::ONE],
+            vec![Felt::ZERO, Felt::ZERO, Felt::ONE],
+        ] {
+            let mut args = vec![tree.root(), Felt::from(keys.len())];
+            args.extend(keys);
+            args.extend([Felt::ONE, Felt::THREE]); // Catch the missing-key error three times.
+            let calldata = create_calldata(reader, "test_committed_data_catch", &args);
+            builder.add_funded_account_invoke(invoke_tx_args! { calldata });
+        }
+    }
+    let runner = builder.build().await;
+    let receipts: Vec<_> = runner.os_hints.os_input.os_block_inputs.iter().flat_map(|block| {
+        block.tx_execution_infos.iter().map(|tx| serde_json::json!({
+            "gas": tx.total_gas, "reverted": tx.revert_error.is_some(), "resources": tx.actual_resources,
+        }))
+    }).collect();
+    eprintln!("ABSENCE_RECEIPTS {}", serde_json::to_string(&receipts).unwrap());
+    let charged_l2: u64 = runner
+        .os_hints
+        .os_input
+        .os_block_inputs
+        .iter()
+        .flat_map(|block| &block.tx_execution_infos)
+        .map(|tx| tx.total_gas.l2_gas.0)
+        .sum();
+    let output = runner.run();
+    output.perform_default_validations();
+    output.runner_output.cairo_pie.run_validity_checks().unwrap();
+    let constants =
+        blockifier::blockifier_versioned_constants::VersionedConstants::create_for_testing();
+    let gas = &constants.os_constants.gas_costs;
+    // Output cells are DA, not Cairo-1 execution builtins; receipts price DA separately.
+    // Keep every execution step, memory hole and supported builtin in this L2 comparison.
+    let mut execution = output.runner_output.cairo_pie.execution_resources.clone();
+    execution.builtin_instance_counter.remove(&cairo_vm::types::builtin_name::BuiltinName::output);
+    let actual_l2 =
+        blockifier::utils::get_gas_cost_from_vm_resources(&execution, &gas.base, &gas.builtins);
+    eprintln!("ABSENCE_WHOLE_PIE actual_l2={actual_l2} charged_l2={charged_l2}");
+    assert!(
+        actual_l2 <= charged_l2,
+        "OS execution including all memory holes must fit charged L2 gas"
+    );
+    eprintln!(
+        "Non-membership full OS resources: {:?}",
+        output.runner_output.cairo_pie.execution_resources
+    );
+    if let Ok(directory) = std::env::var("COMMITTED_DATA_ABSENCE_REPORT_DIR") {
+        let directory = std::path::Path::new(&directory);
+        std::fs::create_dir_all(directory).unwrap();
+        output
+            .runner_output
+            .cairo_pie
+            .write_zip_file(&directory.join("absence-cairo-pie.zip"), true)
+            .unwrap();
+        std::fs::write(directory.join("absence-resources.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "receipts": receipts, "execution_l2_equivalent": actual_l2, "charged_l2": charged_l2,
+            "resources": output.runner_output.cairo_pie.execution_resources,
+        })).unwrap()).unwrap();
+    }
+}
+
+/// L1 handlers use the same authenticated, paid failure when their contract catches absence.
+#[tokio::test]
+async fn committed_data_absence_caught_by_l1_handler_proves() {
+    use blockifier::execution::syscalls::committed_data::CommittedDataSet;
+    let contract = FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
+    let (mut builder, [reader]) =
+        TestBuilder::create_standard([(contract, calldata![Felt::ZERO, Felt::ZERO])]).await;
+    let tree = CommittedDataSet::new(vec![(Felt::ZERO, Felt::ZERO)]).unwrap();
+    let proofs = vec![tree.lookup_witness(Felt::ZERO), tree.lookup_witness(Felt::ONE)];
+    builder.initial_state.block_context.use_committed_data = true;
+    builder.os_hints_config.use_committed_data = true;
+    builder.initial_state.block_context.committed_data_witnesses =
+        Arc::new(CommittedDataWitnesses::new(proofs.clone()).unwrap());
+    builder.os_hints_config.committed_data_witnesses = proofs;
+    builder.add_l1_handler(
+        reader,
+        "l1_committed_data_catch",
+        calldata![Felt::ONE, tree.root(), Felt::TWO, Felt::ZERO, Felt::ONE],
+        None,
+    );
+    let output = builder.build().await.run();
+    output.perform_default_validations();
+    output.runner_output.cairo_pie.run_validity_checks().unwrap();
+}
+
+/// The largest failed batch may contain 1023 distinct members, not merely duplicate keys.
+/// Repeating it must pay for each failure while sharing only its authenticated membership union.
+#[tokio::test]
+async fn committed_data_absence_after_maximum_distinct_prefix_proves() {
+    use blockifier::execution::syscalls::committed_data::CommittedDataSet;
+    let contract = FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
+    let (mut builder, [reader]) =
+        TestBuilder::create_standard([(contract, calldata![Felt::ZERO, Felt::ZERO])]).await;
+    let tree = CommittedDataSet::new(
+        (0..1024).map(|index| (Felt::from(index * 2), Felt::from(index))).collect(),
+    )
+    .unwrap();
+    let mut keys: Vec<_> = tree.entries().iter().take(1023).map(|entry| entry.0).collect();
+    keys.push(Felt::ONE);
+    let proofs: Vec<_> = keys.iter().map(|key| tree.lookup_witness(*key)).collect();
+    builder.initial_state.block_context.use_committed_data = true;
+    builder.os_hints_config.use_committed_data = true;
+    builder.initial_state.block_context.committed_data_witnesses =
+        Arc::new(CommittedDataWitnesses::new(proofs.clone()).unwrap());
+    builder.os_hints_config.committed_data_witnesses = proofs;
+    let mut args = vec![tree.root(), Felt::from(keys.len())];
+    args.extend(keys);
+    args.extend([Felt::ONE, Felt::THREE]);
+    builder.add_funded_account_invoke(invoke_tx_args! {
+        calldata: create_calldata(reader, "test_committed_data_catch", &args)
+    });
+    let runner = builder.build().await;
+    let charged = runner.os_hints.os_input.os_block_inputs[0].tx_execution_infos[0].total_gas;
+    let output = runner.run();
+    output.perform_default_validations();
+    output.runner_output.cairo_pie.run_validity_checks().unwrap();
+    let mut resources = output.runner_output.cairo_pie.execution_resources.clone();
+    resources.builtin_instance_counter.remove(&cairo_vm::types::builtin_name::BuiltinName::output);
+    let constants =
+        blockifier::blockifier_versioned_constants::VersionedConstants::create_for_testing();
+    let gas = &constants.os_constants.gas_costs;
+    let actual_l2 =
+        blockifier::utils::get_gas_cost_from_vm_resources(&resources, &gas.base, &gas.builtins);
+    assert!(actual_l2 <= charged.l2_gas.0, "{resources:?}, charged {charged:?}");
+    let report = serde_json::json!({"charged": charged, "execution_l2_equivalent": actual_l2,
+        "resources": output.runner_output.cairo_pie.execution_resources});
+    eprintln!("ABSENCE_DISTINCT_PREFIX {report}");
+    if let Ok(directory) = std::env::var("COMMITTED_DATA_ABSENCE_REPORT_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join("absence-distinct-prefix.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
 }

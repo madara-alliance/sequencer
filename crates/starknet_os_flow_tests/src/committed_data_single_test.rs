@@ -1,14 +1,17 @@
 //! Exercise the Cairo entrypoint directly: Rust validation must not hide unconstrained hints.
 use std::collections::HashMap;
 
-use apollo_starknet_os_program::test_programs::COMMITTED_DATA_TEST_BYTES;
 use apollo_starknet_os_program::OS_PROGRAM_BYTES;
+use apollo_starknet_os_program::test_programs::COMMITTED_DATA_TEST_BYTES;
 use blockifier::execution::syscalls::committed_data::{
-    batch_gas,
-    read_gas,
     CommittedDataSet,
     CommittedDataSibling,
     CommittedDataWitness,
+    MISSING_KEY_FELT,
+    absence_os_resources,
+    batch_gas,
+    read_gas,
+    resources_gas,
 };
 use blockifier::test_utils::dict_state_reader::DictStateReader;
 use cairo_vm::types::builtin_name::BuiltinName;
@@ -18,10 +21,10 @@ use cairo_vm::vm::runners::cairo_runner::CairoArg;
 use starknet_os::hint_processor::snos_hint_processor::SnosHintProcessor;
 use starknet_os::io::os_input::OsHintsConfig;
 use starknet_os::test_utils::cairo_runner::{
-    initialize_cairo_runner,
+    EMPTY_BLOCK_INPUT,
     EntryPointRunnerConfig,
     ImplicitArg,
-    EMPTY_BLOCK_INPUT,
+    initialize_cairo_runner,
 };
 use starknet_types_core::felt::Felt;
 
@@ -30,6 +33,17 @@ fn read_authenticated(
     gas: u64,
     batch: bool,
 ) -> Result<Vec<MaybeRelocatable>, Box<dyn std::error::Error>> {
+    read_measured(witness, gas, batch).map(|(values, _)| values)
+}
+
+fn read_measured(
+    witness: CommittedDataWitness,
+    gas: u64,
+    batch: bool,
+) -> Result<
+    (Vec<MaybeRelocatable>, cairo_vm::vm::runners::cairo_runner::ExecutionResources),
+    Box<dyn std::error::Error>,
+> {
     let entrypoint = if batch {
         "starkware.starknet.core.os.execution.committed_data.committed_data_read_batch"
     } else {
@@ -103,7 +117,7 @@ fn read_authenticated(
         None,
         &mut hints,
     )?;
-    Ok(runner.vm.get_return_values(if batch { 2 } else { 3 })?)
+    Ok((runner.vm.get_return_values(if batch { 2 } else { 3 })?, runner.get_execution_resources()?))
 }
 
 #[test]
@@ -141,4 +155,63 @@ fn batch_read_cannot_prove_unpaid_verification() {
         read_authenticated(witness, charge, true).unwrap(),
         [Felt::ZERO, Felt::ZERO].map(MaybeRelocatable::from)
     );
+}
+
+/// A comb-shaped tree reaches every supported bit boundary without exponential fixtures.
+/// Bit zero is omitted, so query 1 reaches leaf 0 and is provably absent even at depth 251.
+#[rstest::rstest]
+#[case(0)]
+#[case(1)]
+#[case(17)]
+#[case(20)]
+#[case(63)]
+#[case(127)]
+#[case(128)]
+#[case(251)]
+fn absence_cairo_is_paid_and_rejects_forged_routes(
+    #[case] height: usize,
+    #[values(false, true)] high_bits: bool,
+) {
+    let mut entries = vec![(Felt::ZERO, Felt::ZERO)];
+    for bit in 1..=height {
+        entries.push((
+            Felt::TWO.pow(if high_bits { (252 - bit) as u32 } else { bit as u32 }),
+            Felt::from(bit),
+        ));
+    }
+    let tree = CommittedDataSet::new(entries).unwrap();
+    let witness = tree.lookup_witness(Felt::ONE);
+    assert_eq!(witness.siblings.len(), height);
+    assert!(witness.verify());
+    let budget = absence_os_resources(height);
+    let charge = resources_gas(&budget);
+    let (response, actual) = read_measured(witness.clone(), charge, false).unwrap();
+    assert_eq!(response, [Felt::ZERO, Felt::ZERO, MISSING_KEY_FELT].map(MaybeRelocatable::from));
+    // CallContract's ordinary allowance is deducted from the committed-data surcharge.
+    let total_steps = budget.n_steps + 903;
+    assert!(
+        actual.n_steps + actual.n_memory_holes <= total_steps,
+        "{actual:?}, bound {total_steps}"
+    );
+    for (builtin, used) in &actual.builtin_instance_counter {
+        let allowance = if *builtin == BuiltinName::range_check { 18 } else { 0 };
+        assert!(
+            *used <= budget.builtin_instance_counter.get(builtin).copied().unwrap_or(0) + allowance,
+            "{builtin:?}: {used}"
+        );
+    }
+    eprintln!(
+        "ABSENCE_GAS height={height} high_bits={high_bits} surcharge={charge} actual={actual:?}"
+    );
+    assert!(read_authenticated(witness.clone(), charge - 1, false).is_err());
+    let mut wrong_value = witness.clone();
+    wrong_value.value = Felt::ONE;
+    assert!(read_authenticated(wrong_value, charge, false).is_err());
+    if height > 0 {
+        // This key is present on a different route; its absence must never authenticate.
+        let mut wrong_route = witness;
+        wrong_route.key = if high_bits { Felt::TWO.pow(251_u32) } else { Felt::TWO };
+        assert!(!wrong_route.verify());
+        assert!(read_authenticated(wrong_route, charge, false).is_err());
+    }
 }

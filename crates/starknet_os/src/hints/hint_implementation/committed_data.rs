@@ -34,6 +34,7 @@ pub(crate) fn load_committed_data_witness<S: StateReader>(
     ctx.vm.load_data(path, &values)?;
     ctx.insert_value(Ids::CommittedDataSiblings, path)?;
     ctx.insert_value(Ids::CommittedDataValue, witness.value)?;
+    ctx.insert_value(Ids::CommittedDataTerminalKey, witness.terminal_key.unwrap_or(witness.key))?;
     ctx.insert_value(Ids::CommittedDataHeight, witness.siblings.len())?;
     Ok(())
 }
@@ -215,5 +216,36 @@ pub(crate) fn end_committed_data_finalization<S: StateReader>(
             (BuiltinName::poseidon, (ctx.get_ptr(Ids::CommittedPoseidonPtr)? - poseidon)? / 6),
         ]),
     });
+    Ok(())
+}
+
+/// This is a hint, not authority: Cairo authenticates the successful prefix and terminal absence.
+pub(crate) fn load_committed_data_missing_index<S: StateReader>(
+    hp: &mut SnosHintProcessor<'_, S>,
+    mut ctx: HintContext<'_>,
+) -> OsHintResult {
+    use cairo_vm::hint_processor::hint_processor_utils::felt_to_usize;
+    let root = ctx.get_integer(Ids::CommittedDataRoot)?;
+    let count = felt_to_usize(&ctx.get_integer(Ids::CommittedDataCount)?)?;
+    if count == 0
+        || count > blockifier::execution::syscalls::committed_data::MAX_COMMITTED_DATA_READ_KEYS
+    {
+        return Err(OsHintError::AssertionFailed {
+            message: "Invalid committed-data count".into(),
+        });
+    }
+    let keys = ctx.get_ptr(Ids::CommittedDataKeys)?;
+    let mut missing = count;
+    for index in 0..count {
+        let key = *ctx.vm.get_integer((keys + index)?)?;
+        let witness = hp.committed_data_witness(root, key).ok_or_else(|| {
+            OsHintError::AssertionFailed { message: "CommittedData witness unavailable".into() }
+        })?;
+        if witness.terminal_key.is_some() {
+            missing = index;
+            break;
+        }
+    }
+    ctx.insert_value(Ids::CommittedDataMissingIndex, missing)?;
     Ok(())
 }

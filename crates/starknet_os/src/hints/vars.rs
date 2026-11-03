@@ -130,6 +130,8 @@ define_string_enum! {
         (CommittedDataValue),
         (CommittedDataSiblings),
         (CommittedDataHeight),
+        (CommittedDataTerminalKey),
+        (CommittedDataMissingIndex),
         (CommittedDataKeys),
         (CommittedDataCount),
         (CommittedDataProof),

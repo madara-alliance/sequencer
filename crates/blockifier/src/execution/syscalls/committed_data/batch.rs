@@ -65,8 +65,8 @@ impl CommittedDataBatchProof {
             if unique.contains_key(&key) {
                 continue;
             }
-            let witness = witness(key)?.ok_or(CommittedDataError::Unavailable)?;
-            if witness.root != root || witness.key != key {
+            let witness = witness(key)?.ok_or(CommittedDataError::Unavailable { root, key })?;
+            if witness.root != root || witness.key != key || witness.terminal_key.is_some() {
                 return Err(CommittedDataError::InvalidWitness);
             }
             let mut hash = leaf(key, witness.value);
@@ -127,10 +127,10 @@ impl CommittedDataBatchProof {
             let index = if let Some(index) = unique.get(key) {
                 *index
             } else {
-                let entry = tree
-                    .entries()
-                    .binary_search_by_key(key, |entry| entry.0)
-                    .map_err(|_| CommittedDataError::Unavailable)?;
+                let entry =
+                    tree.entries().binary_search_by_key(key, |entry| entry.0).map_err(|_| {
+                        CommittedDataError::Unavailable { root: tree.root(), key: *key }
+                    })?;
                 let index = result.unique_leaves();
                 result.leaves.extend([*key, tree.entries()[entry].1]);
                 unique.insert(*key, index);
@@ -235,7 +235,13 @@ mod tests {
             siblings.push(CommittedDataSibling { bit: bit as u8, hash: root });
             root = branch(bit as u8, root, root);
         }
-        let witness = CommittedDataWitness { root, key: Felt::ZERO, value: Felt::ONE, siblings };
+        let witness = CommittedDataWitness {
+            root,
+            key: Felt::ZERO,
+            value: Felt::ONE,
+            siblings,
+            terminal_key: None,
+        };
         assert!(witness.verify());
         let proof =
             CommittedDataBatchProof::new(root, &[Felt::ZERO], |_| Ok(Some(witness.clone())))
@@ -257,6 +263,7 @@ mod tests {
                 root,
                 key,
                 value: Felt::from(value),
+                terminal_key: None,
                 siblings: vec![CommittedDataSibling { bit: 0, hash }],
             };
             assert!(witness.verify());

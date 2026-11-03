@@ -508,7 +508,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .map_err(|e| self.handle_error(remaining_gas, e))?;
 
         if address == crate::execution::syscalls::committed_data::COMMITTED_DATA_ADDRESS {
-            let result = crate::execution::syscalls::committed_data::read_values_shared(
+            let result = crate::execution::syscalls::committed_data::read_outcome(
                 self.base.context.tx_context.block_context.use_committed_data,
                 &self.base.context.tx_context.block_context.committed_data_witnesses,
                 &self.base.context.tx_context.block_context.committed_data_read_set,
@@ -528,6 +528,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             );
             self.base.account_committed_data_read(&resources, result.is_err());
             let (values, _) = result.map_err(|e| self.handle_error(remaining_gas, e.into()))?;
+            let values = values.map_err(|error| vec![error])?;
             log::debug!(
                 target: "committed_data_native",
                 "Native committed_data system call completed: caller={}",

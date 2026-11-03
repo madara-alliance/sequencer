@@ -503,6 +503,7 @@ mod committed_witness_tests {
                 root: Felt::ONE,
                 key: Felt::from(key),
                 value: Felt::from(number),
+                terminal_key: None,
                 siblings: Vec::new(),
             })
             .collect();
