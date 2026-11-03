@@ -1,7 +1,9 @@
 //! Authenticated reads from immutable, application-owned datasets.
 //!
 //! The application supplies a root read from its own authenticated storage. Values and paths
-//! are private execution input; the Cairo OS independently proves membership and the response.
+//! are private execution input; the Cairo OS independently proves lookup outcomes and responses.
+//! An authenticated absent key returns a paid `CD_KEY_NOT_FOUND` syscall error. Uncaught errors
+//! revert normally; unavailable datasets or invalid witnesses still abort admission.
 //! Any contract may read a dataset by root and key. Roots and witnesses are independent of
 //! the caller; applications enforce root authorization and freshness in their own contracts.
 //! `use_committed_data` is execution permission, not a consensus activation policy. When false,
@@ -24,7 +26,9 @@ use super::vm_syscall_utils::SyscallExecutorBaseError;
 /// `starknet_keccak("committed_data_v1")`. Permanently reserved by this OS version.
 pub const COMMITTED_DATA_ADDRESS: Felt =
     Felt::from_hex_unchecked("0x6c5f4559c7041984537bc078c71443fdc58b2e1bab302b341ec12b3d2cec44");
+mod absence;
 mod sharing;
+pub use absence::{MISSING_KEY_FELT, absence_os_resources, read_outcome};
 pub use sharing::{
     CommittedDataReadSet,
     read_values_shared,
@@ -241,8 +245,8 @@ pub enum CommittedDataError {
     DuplicateWitness,
     #[error("At most {MAX_COMMITTED_DATA_WITNESSES} witnesses are accepted per replay")]
     TooManyWitnesses,
-    #[error("Committed-data witness unavailable for exact root and key")]
-    Unavailable,
+    #[error("Committed-data witness unavailable for root {root:#x} and key {key:#x}")]
+    Unavailable { root: Felt, key: Felt },
     #[error("Committed-data provider failed: {0}")]
     Provider(String),
 }
@@ -257,6 +261,14 @@ pub struct CommittedDataWitnesses {
 /// Providers authenticate immutable datasets against the exact root before returning values.
 /// The OS never trusts this trait: it separately constrains the witness and syscall response.
 pub trait CommittedDataProvider: std::fmt::Debug + Send + Sync {
+    /// Authenticated absence evidence. Providers without this capability fail closed.
+    fn absence(
+        &self,
+        _root: Felt,
+        _key: Felt,
+    ) -> Result<Option<CommittedDataWitness>, CommittedDataError> {
+        Ok(None)
+    }
     /// Authenticate the exact requested path union, reusing cached trie nodes when available.
     fn batch(
         &self,
@@ -295,7 +307,10 @@ impl CommittedDataWitnesses {
         index: Felt,
     ) -> Result<Option<(Felt, usize)>, CommittedDataError> {
         if let Some(witness) = self.get(root, index) {
-            return Ok(Some((witness.value, witness.siblings.len())));
+            return Ok(witness
+                .terminal_key
+                .is_none()
+                .then_some((witness.value, witness.siblings.len())));
         }
         let value = match &self.provider {
             Some(provider) => provider.value(root, index),
@@ -323,6 +338,30 @@ impl CommittedDataWitnesses {
     pub fn get(&self, root: Felt, index: Felt) -> Option<&CommittedDataWitness> {
         self.witnesses.get(&(root, index))
     }
+
+    /// A missing local witness is not evidence of absence. Always authenticate the terminal path.
+    pub fn absence(
+        &self,
+        root: Felt,
+        key: Felt,
+    ) -> Result<CommittedDataWitness, CommittedDataError> {
+        let witness = match self.get(root, key) {
+            Some(witness) => Some(witness.clone()),
+            None => match &self.provider {
+                Some(provider) => provider.absence(root, key)?,
+                None => None,
+            },
+        }
+        .ok_or(CommittedDataError::Unavailable { root, key })?;
+        if witness.root != root
+            || witness.key != key
+            || witness.terminal_key.is_none()
+            || !witness.verify()
+        {
+            return Err(CommittedDataError::InvalidWitness);
+        }
+        Ok(witness)
+    }
 }
 
 /// Shared VM/Native fast path. Missing data aborts execution instead of inventing a value.
@@ -348,7 +387,9 @@ pub fn read_value(
     let (value, height) = match witnesses.value(calldata[0], calldata[1]) {
         Ok(Some(value)) => value,
         result => {
-            let error = result.err().unwrap_or(CommittedDataError::Unavailable);
+            let error = result
+                .err()
+                .unwrap_or(CommittedDataError::Unavailable { root: calldata[0], key: calldata[1] });
             let syscall_error = invalid(&error.to_string());
             // This marker survives nested-call error handling. The transaction boundary must
             // reject unavailable data rather than commit an unprovable reverted receipt.
@@ -455,7 +496,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(matches!(failure, Some(CommittedDataError::Unavailable)));
+        assert!(matches!(failure, Some(CommittedDataError::Unavailable { .. })));
         for args in [
             vec![],
             vec![tree.root(), Felt::ZERO],
@@ -584,7 +625,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(gas, read_gas(0));
-        assert!(matches!(failure, Some(CommittedDataError::Unavailable)));
+        assert!(matches!(failure, Some(CommittedDataError::Unavailable { .. })));
         assert_eq!(
             read_value(true, &cache, selector, &[tree.root(), Felt::ZERO], &mut gas, &mut failure)
                 .unwrap(),

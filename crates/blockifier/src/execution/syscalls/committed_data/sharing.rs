@@ -23,6 +23,24 @@ struct ReadSet {
 pub struct CommittedDataReadSet(Arc<Mutex<ReadSet>>);
 
 impl CommittedDataReadSet {
+    pub(super) fn check_witness_capacity(
+        &self,
+        root: Felt,
+        key: Felt,
+    ) -> Result<(), CommittedDataError> {
+        let seen = self.0.lock().expect("Committed-data read set poisoned");
+        if seen.witnesses.len() >= MAX_COMMITTED_DATA_WITNESSES
+            && !seen.witnesses.contains(&(root, key))
+        {
+            return Err(CommittedDataError::TooManyWitnesses);
+        }
+        Ok(())
+    }
+
+    // Absence uses the single-proof schedule and must not warm the membership union.
+    pub(super) fn record_absence(&self, root: Felt, key: Felt) {
+        self.0.lock().expect("Committed-data read set poisoned").witnesses.insert((root, key));
+    }
     /// Witnesses required by admitted execution, including the independently charged single-key
     /// ABI.
     pub fn witness_keys(&self) -> Vec<(Felt, Felt)> {

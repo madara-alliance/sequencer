@@ -193,20 +193,24 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
             use blockifier::execution::syscalls::committed_data::{
                 CommittedDataWitnesses,
                 read_keys,
-                read_values_shared,
+                read_outcome,
             };
             let (keys, _) = read_keys(request.function_selector.0, &request.calldata.0)?;
             let root = request.calldata.0[0];
-            let unique: std::collections::BTreeSet<_> = keys.iter().copied().collect();
-            let witnesses = unique
-                .into_iter()
-                .map(|key| {
-                    syscall_handler
-                        .committed_data_witness(root, key)
-                        .cloned()
-                        .ok_or_else(|| invalid("Committed-data witness unavailable"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            // Failed batches require only the authenticated prefix and first absent key.
+            let mut required = std::collections::BTreeMap::new();
+            for key in keys {
+                let witness = syscall_handler
+                    .committed_data_witness(root, *key)
+                    .cloned()
+                    .ok_or_else(|| invalid("Committed-data witness unavailable"))?;
+                let absent = witness.terminal_key.is_some();
+                required.insert(*key, witness);
+                if absent {
+                    break;
+                }
+            }
+            let witnesses = required.into_values().collect();
             let witnesses = CommittedDataWitnesses::new(witnesses)
                 .map_err(|error| invalid(&error.to_string()))?;
             let block = syscall_handler
@@ -216,7 +220,7 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
                 .block_number
                 .0;
             let read_set = syscall_handler.committed_data_billing.entry(block).or_default();
-            let (values, _) = read_values_shared(
+            let (values, _) = read_outcome(
                 true,
                 &witnesses,
                 read_set,
@@ -225,6 +229,7 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
                 remaining_gas,
                 &mut None,
             )?;
+            let values = values.map_err(handle_failure)?;
             let values: Vec<MaybeRelocatable> = values.into_iter().map(Into::into).collect();
             // Cairo independently constrains every returned value, order and gas charge.
             let start_ptr = vm.add_memory_segment();

@@ -3,12 +3,12 @@ use std::collections::HashMap;
 
 use apollo_starknet_os_program::test_programs::COMMITTED_DATA_TEST_BYTES;
 use blockifier::execution::syscalls::committed_data::{
-    branch,
-    leaf,
     CommittedDataBatchProof,
     CommittedDataSet,
     CommittedDataSibling,
     CommittedDataWitness,
+    branch,
+    leaf,
 };
 use blockifier::test_utils::dict_state_reader::DictStateReader;
 use cairo_vm::types::builtin_name::BuiltinName;
@@ -16,10 +16,10 @@ use cairo_vm::types::layout_name::LayoutName;
 use cairo_vm::vm::runners::cairo_runner::CairoArg;
 use starknet_os::hint_processor::snos_hint_processor::SnosHintProcessor;
 use starknet_os::test_utils::cairo_runner::{
-    initialize_cairo_runner,
+    EMPTY_BLOCK_INPUT,
     EntryPointRunnerConfig,
     ImplicitArg,
-    EMPTY_BLOCK_INPUT,
+    initialize_cairo_runner,
 };
 use starknet_types_core::felt::Felt;
 
@@ -99,7 +99,13 @@ fn batch_verifier_accepts_repeated_hashes_as_opaque_siblings() {
         siblings.push(CommittedDataSibling { bit, hash: root });
         root = branch(bit, root, root);
     }
-    let witness = CommittedDataWitness { root, key: Felt::ZERO, value: Felt::ONE, siblings };
+    let witness = CommittedDataWitness {
+        root,
+        key: Felt::ZERO,
+        value: Felt::ONE,
+        siblings,
+        terminal_key: None,
+    };
     let keys = [Felt::ZERO];
     let proof = CommittedDataBatchProof::new(root, &keys, |_| Ok(Some(witness.clone()))).unwrap();
     assert_eq!(proof.branches, 252);

@@ -34,13 +34,20 @@ pub struct CommittedDataBranch {
     pub hash: Felt,
 }
 
-/// Membership evidence for a single (root, key), independent of the reading contract.
+/// Authenticated lookup evidence for a single (root, key), independent of the reading contract.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommittedDataWitness {
+    /// Exact immutable dataset commitment.
     pub root: Felt,
+    /// Requested key; unchanged for both lookup outcomes.
     pub key: Felt,
+    /// Authenticated terminal leaf value; not a returned value when `terminal_key` is present.
     pub value: Felt,
+    /// Terminal leaf key for an absent lookup. Omitted for membership, preserving its wire form.
+    /// Absence is authenticated only when this key differs and follows every requested branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_key: Option<Felt>,
     #[serde(deserialize_with = "deserialize_siblings")]
     pub siblings: Vec<CommittedDataSibling>,
 }
@@ -89,14 +96,22 @@ impl CommittedDataWitness {
     /// Authenticate key, value, branch order and hashes against the exact requested root.
     pub fn verify(&self) -> bool {
         let mut previous = None;
-        let mut node = leaf(self.key, self.value);
+        let terminal = self.terminal_key.unwrap_or(self.key);
+        if self.terminal_key == Some(self.key) {
+            return false;
+        }
+        let mut node = leaf(terminal, self.value);
         for step in &self.siblings {
             if usize::from(step.bit) >= COMMITTED_DATA_TREE_HEIGHT
                 || previous.is_some_and(|bit| step.bit <= bit)
             {
                 return false;
             }
-            node = if key_bit(self.key, step.bit) {
+            let direction = key_bit(self.key, step.bit);
+            if self.terminal_key.is_some() && direction != key_bit(terminal, step.bit) {
+                return false;
+            }
+            node = if direction {
                 branch(step.bit, step.hash, node)
             } else {
                 branch(step.bit, node, step.hash)
@@ -153,7 +168,13 @@ impl CommittedDataSet {
     }
     /// Fetch membership only; a missing key must never be converted into a zero value.
     pub fn witness(&self, key: Felt) -> Option<CommittedDataWitness> {
-        let index = self.entries.binary_search_by_key(&key, |entry| entry.0).ok()?;
+        let proof = self.lookup_witness(key);
+        proof.terminal_key.is_none().then_some(proof)
+    }
+
+    /// Follow the requested route even when its leaf is absent. The terminal leaf and siblings
+    /// authenticate either membership or non-membership without changing a stored commitment.
+    pub fn lookup_witness(&self, key: Felt) -> CommittedDataWitness {
         let count = self.entries.len();
         let mut id = (count + self.branches.len() - 1) as u32;
         let mut siblings = Vec::new();
@@ -173,9 +194,15 @@ impl CommittedDataSet {
             siblings.push(CommittedDataSibling { bit: node.bit, hash });
             id = child;
         }
-        debug_assert_eq!(id as usize, index);
         siblings.reverse();
-        Some(CommittedDataWitness { root: self.root, key, value: self.entries[index].1, siblings })
+        let (terminal, value) = self.entries[id as usize];
+        CommittedDataWitness {
+            root: self.root,
+            key,
+            value,
+            siblings,
+            terminal_key: (terminal != key).then_some(terminal),
+        }
     }
 }
 
@@ -212,6 +239,46 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Exhaust every query in a small keyspace, including zeros, sparse routes and singleton roots.
+    #[test]
+    fn absence_authenticates_the_terminal_route_without_changing_roots() {
+        for keys in [vec![0], vec![1, 7], vec![0, 1, 5, 31]] {
+            let tree = CommittedDataSet::new(
+                keys.iter().map(|key| (Felt::from(*key), Felt::ZERO)).collect(),
+            )
+            .unwrap();
+            for query in 0..64 {
+                let proof = tree.lookup_witness(Felt::from(query));
+                assert!(proof.verify());
+                assert_eq!(proof.terminal_key.is_none(), keys.contains(&query));
+                let mut corrupted = proof.clone();
+                corrupted.value += Felt::ONE;
+                assert!(!corrupted.verify());
+                corrupted = proof.clone();
+                corrupted.root += Felt::ONE;
+                assert!(!corrupted.verify());
+                if proof.terminal_key.is_some() {
+                    let mut membership = proof.clone();
+                    membership.key = proof.terminal_key.unwrap();
+                    membership.terminal_key = None;
+                    assert!(membership.verify());
+                    assert_eq!(tree.witness(membership.key), Some(membership));
+                }
+            }
+        }
+        let tree =
+            CommittedDataSet::new(vec![(Felt::ZERO, Felt::ONE), (Felt::MAX, Felt::ZERO)]).unwrap();
+        let mut wrong_route = tree.lookup_witness(Felt::ONE);
+        assert!(wrong_route.verify());
+        wrong_route.key = Felt::MAX;
+        assert!(!wrong_route.verify());
+        let mut redundant = tree.lookup_witness(Felt::ZERO);
+        redundant.terminal_key = Some(Felt::ZERO);
+        assert!(!redundant.verify());
+        let encoded = serde_json::to_value(tree.witness(Felt::ZERO).unwrap()).unwrap();
+        assert!(encoded.get("terminal_key").is_none());
+    }
+
     #[test]
     fn sparse_keys_can_reach_the_full_felt_width() {
         let mut entries = vec![(Felt::ZERO, Felt::ZERO)];

@@ -534,7 +534,7 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         syscall_handler.base.maybe_block_direct_execute_call(selector)?;
 
         if *storage_address.0.key() == super::committed_data::COMMITTED_DATA_ADDRESS {
-            let result = super::committed_data::read_values_shared(
+            let result = super::committed_data::read_outcome(
                 syscall_handler.base.context.tx_context.block_context.use_committed_data,
                 &syscall_handler.base.context.tx_context.block_context.committed_data_witnesses,
                 &syscall_handler.base.context.tx_context.block_context.committed_data_read_set,
@@ -549,6 +549,8 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
             );
             syscall_handler.base.account_committed_data_read(&resources, result.is_err());
             let (values, _) = result?;
+            let values = values
+                .map_err(|error| SyscallExecutorBaseError::Revert { error_data: vec![error] })?;
             let segment = create_retdata_segment(vm, syscall_handler, &values)?;
             return Ok(CallContractResponse { segment });
         }

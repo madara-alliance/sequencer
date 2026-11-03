@@ -102,6 +102,17 @@ mod TestContract {
         };
     }
 
+    #[external(v0)]
+    fn test_committed_data_catch_single(self: @ContractState, root: felt252, key: felt252) {
+        let result = syscalls::call_contract_syscall(
+            selector!("committed_data_v1").try_into().unwrap(), selector!("get_value"), array![root, key].span(),
+        );
+        match result {
+            Result::Ok(_) => panic!("expected missing key"),
+            Result::Err(reason) => assert(reason.span() == array!['CD_KEY_NOT_FOUND'].span(), 'wrong missing-key error'),
+        };
+    }
+
     // TODO(Dori): Delete this function, use `test` instead.
     #[external(v0)]
     fn test_increment(

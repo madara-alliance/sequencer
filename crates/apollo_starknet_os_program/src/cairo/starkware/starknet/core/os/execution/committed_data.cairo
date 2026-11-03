@@ -40,6 +40,12 @@ const COMMITTED_DATA_CALL_CONTRACT_STEPS = 903;
 const COMMITTED_DATA_RANGE_CHECK_BOUND_BASE = 40;
 const COMMITTED_DATA_RANGE_CHECK_BOUND_PER_LEVEL = 20;
 const COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS = 18;
+// Extra absence checks compare the requested route with the authenticated terminal route.
+// These bounds include high-bit extraction and memory holes, matching Blockifier.
+const COMMITTED_DATA_ABSENCE_STEPS_BASE = 200;
+const COMMITTED_DATA_ABSENCE_STEPS_PER_LEVEL = 300;
+const COMMITTED_DATA_ABSENCE_RANGE_CHECKS_BASE = 20;
+const COMMITTED_DATA_ABSENCE_RANGE_CHECKS_PER_LEVEL = 20;
 const STEP_SIERRA_GAS = 100;
 const RANGE_CHECK_SIERRA_GAS = 70;
 const POSEIDON_SIERRA_GAS = 491;
@@ -136,12 +142,13 @@ const MAX_COMMITTED_DATA_READ_KEYS = 1024;
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.memcpy import memcpy
 
-// One constrained membership read. Unpaid verification is never a provable syscall result.
+// One constrained membership or non-membership read. Unpaid verification is never a provable syscall result.
 func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
     committed_data_root: felt, committed_data_key: felt, remaining_gas: felt
 ) -> (value: felt, gas: felt, error: felt) {
     alloc_locals;
     local committed_data_value;
+    local committed_data_terminal_key;
     local committed_data_siblings: felt*;
     local committed_data_height;
     %{ LoadCommittedDataWitness %}
@@ -150,26 +157,78 @@ func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
     // Authenticate the hinted height before it can select an out-of-gas result.
     verify_committed_data_value(
         root=committed_data_root,
-        key=committed_data_key,
+        key=committed_data_terminal_key,
         value=committed_data_value,
         siblings=committed_data_siblings,
         height=committed_data_height,
     );
-    let (step_charge) = committed_data_step_charge(committed_data_height);
-    let range_check_charge = (
+    let (local step_charge) = committed_data_step_charge(committed_data_height);
+    local range_check_charge = (
         COMMITTED_DATA_RANGE_CHECK_BOUND_BASE +
         COMMITTED_DATA_RANGE_CHECK_BOUND_PER_LEVEL * committed_data_height -
         COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS
     ) * RANGE_CHECK_SIERRA_GAS;
-    let poseidon_charge = (2 * committed_data_height + 2) * POSEIDON_SIERRA_GAS;
-    local charge = step_charge + range_check_charge + poseidon_charge;
+    local poseidon_charge = (2 * committed_data_height + 2) * POSEIDON_SIERRA_GAS;
+    local absence_charge;
+    local error;
+    local saved_range_check_ptr;
+    local saved_poseidon_ptr: PoseidonBuiltin* = poseidon_ptr;
+    if (committed_data_terminal_key == committed_data_key) {
+        assert absence_charge = 0;
+        assert error = 0;
+        assert saved_range_check_ptr = range_check_ptr;
+    } else {
+        verify_committed_data_absence_route(
+            committed_data_key,
+            committed_data_terminal_key,
+            committed_data_siblings,
+            committed_data_height,
+        );
+        assert absence_charge = (
+            COMMITTED_DATA_ABSENCE_STEPS_BASE +
+            COMMITTED_DATA_ABSENCE_STEPS_PER_LEVEL * committed_data_height
+        ) * STEP_SIERRA_GAS + (
+            COMMITTED_DATA_ABSENCE_RANGE_CHECKS_BASE +
+            COMMITTED_DATA_ABSENCE_RANGE_CHECKS_PER_LEVEL * committed_data_height
+        ) * RANGE_CHECK_SIERRA_GAS;
+        assert error = 'CD_KEY_NOT_FOUND';
+        assert saved_range_check_ptr = range_check_ptr;
+    }
+    let range_check_ptr = saved_range_check_ptr;
+    let poseidon_ptr = saved_poseidon_ptr;
+    local charge = step_charge + range_check_charge + poseidon_charge + absence_charge;
     let gas_sufficient = is_le_felt(charge, remaining_gas);
     // Match the transaction-level Blockifier rejection, even if the caller catches errors.
     with_attr error_message("Insufficient gas for committed-data verification") {
         assert gas_sufficient = 1;
     }
     assert_nn(remaining_gas - charge);
-    return (value=committed_data_value, gas=remaining_gas - charge, error=0);
+    return (value=committed_data_value, gas=remaining_gas - charge, error=error);
+}
+
+// The leaf key is already authenticated. Prove the requested key follows every branch of
+// that same route; skipped bits may differ. No additional leaf or branch hashes are needed.
+func verify_committed_data_absence_route{range_check_ptr}(
+    key: felt, terminal: felt, siblings: felt*, height: felt
+) {
+    alloc_locals;
+    let (local high, local low) = split_felt(key);
+    let (terminal_high, terminal_low) = split_felt(terminal);
+    return committed_data_same_route(high, low, terminal_high, terminal_low, siblings, height);
+}
+func committed_data_same_route{range_check_ptr}(
+    high: felt, low: felt, terminal_high: felt, terminal_low: felt, siblings: felt*, height: felt
+) {
+    alloc_locals;
+    if (height == 0) {
+        return ();
+    }
+    let (local direction) = committed_data_key_bit(high, low, siblings[0]);
+    let (terminal_direction) = committed_data_key_bit(terminal_high, terminal_low, siblings[0]);
+    assert direction = terminal_direction;
+    return committed_data_same_route(
+        high, low, terminal_high, terminal_low, siblings + 2, height - 1
+    );
 }
 
 // A preorder multiproof expands only the union of requested membership paths. Counts are
@@ -717,8 +776,55 @@ func committed_data_dispatch{
 }(root: felt, keys: felt*, count: felt, values: felt*, gas: felt, batch: felt) -> (
     gas: felt, error: felt
 ) {
+    alloc_locals;
     if (batch != 0) {
-        return committed_data_shared_dispatch(root, keys, count, values, gas);
+        local committed_data_root = root;
+        local committed_data_keys: felt* = keys;
+        local committed_data_count = count;
+        local committed_data_missing_index;
+        %{ LoadCommittedDataMissingIndex %}
+        assert_nn(committed_data_missing_index);
+        assert_nn(count - committed_data_missing_index);
+        if (committed_data_missing_index == count) {
+            return committed_data_shared_dispatch(root, keys, count, values, gas);
+        }
+        local prefix_gas;
+        local saved_range_check_ptr;
+        local saved_poseidon_ptr: PoseidonBuiltin*;
+        local saved_bitwise_ptr: BitwiseBuiltin*;
+        local saved_cache: DictAccess*;
+        if (committed_data_missing_index == 0) {
+            assert prefix_gas = gas;
+            assert saved_range_check_ptr = range_check_ptr;
+            assert saved_poseidon_ptr = poseidon_ptr;
+            assert saved_bitwise_ptr = bitwise_ptr;
+            assert saved_cache = committed_data_cache;
+        } else {
+            let (next_gas, prefix_error) = committed_data_shared_dispatch(
+                root, keys, committed_data_missing_index, values, gas
+            );
+            assert prefix_error = 0;
+            let (adjusted_gas, _) = committed_data_charge(
+                COMMITTED_DATA_CALL_CONTRACT_STEPS * STEP_SIERRA_GAS +
+                COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS * RANGE_CHECK_SIERRA_GAS,
+                next_gas,
+            );
+            assert prefix_gas = adjusted_gas;
+            assert saved_range_check_ptr = range_check_ptr;
+            assert saved_poseidon_ptr = poseidon_ptr;
+            assert saved_bitwise_ptr = bitwise_ptr;
+            assert saved_cache = committed_data_cache;
+        }
+        let range_check_ptr = saved_range_check_ptr;
+        let poseidon_ptr = saved_poseidon_ptr;
+        let bitwise_ptr = saved_bitwise_ptr;
+        let committed_data_cache = saved_cache;
+        let (_, final_gas, missing_error) = committed_data_read_one(
+            root, keys[committed_data_missing_index], prefix_gas
+        );
+        // Forces the hint to select the first absent key: all prior keys were authenticated above.
+        assert missing_error = 'CD_KEY_NOT_FOUND';
+        return (gas=final_gas, error=missing_error);
     }
     let (value, gas, error) = committed_data_read_one(root, keys[0], gas);
     assert values[0] = value;
