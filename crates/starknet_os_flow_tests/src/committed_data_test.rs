@@ -667,7 +667,7 @@ async fn committed_data_absence_reverts_and_caught_failures_prove_across_blocks(
             &[tree.root(), Felt::ONE],
         );
         let tx = builder.create_funded_account_invoke(invoke_tx_args! { calldata });
-        builder.add_invoke_tx(tx, Some(String::new()), None);
+        builder.add_invoke_tx(tx, Some("CD_KEY_NOT_FOUND".into()), None);
         let calldata =
             create_calldata(reader, "test_committed_data_catch_single", &[tree.root(), Felt::ONE]);
         builder.add_funded_account_invoke(invoke_tx_args! { calldata });
