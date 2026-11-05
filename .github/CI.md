@@ -13,6 +13,8 @@ copy its Namespace runner access. Jobs that stay queued without a runner require
 checking the app's repository access and organization runner policy.
 
 `bootstrap` installs Rust before restoring dependencies with `Swatinem/rust-cache`.
+Cargo tools, including the pinned cargo-insta version, use the shared
+version-checked installer so a populated cache avoids repeated installations.
 Python downloads and cross-job image/digest handoffs use `actions/cache@v5`, which
 Blacksmith routes to its cache backend. Hybrid tests build local Docker archives
 and import them into k3d; they do not require the upstream Namespace registry.
