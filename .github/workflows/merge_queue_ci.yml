@@ -11,7 +11,7 @@ env:
 
 jobs:
   code_style:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       # Environment setup.
       - uses: actions/checkout@v6

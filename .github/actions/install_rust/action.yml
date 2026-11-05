@@ -17,6 +17,9 @@ runs:
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
 
+    - name: Setup CI caches
+      uses: ./.github/actions/setup_cache
+
     - name: Install cargo tools
       shell: bash
       run: ./scripts/install_cargo_tools.sh
