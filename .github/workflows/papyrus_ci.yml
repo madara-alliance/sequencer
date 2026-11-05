@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   integration-test:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap
@@ -43,7 +43,7 @@ jobs:
           -- --include-ignored --skip test_gw_integration_testnet
 
   random-table-test:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       # run this job only if the path 'crates/apollo_storage/src/db/**' is changed, because it takes around 2 minutes.
