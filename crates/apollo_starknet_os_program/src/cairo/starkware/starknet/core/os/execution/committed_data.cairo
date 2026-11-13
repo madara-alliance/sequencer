@@ -170,12 +170,12 @@ func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
     ) * RANGE_CHECK_SIERRA_GAS;
     local poseidon_charge = (2 * committed_data_height + 2) * POSEIDON_SIERRA_GAS;
     local absence_charge;
-    local error;
+    local result_value;
     local saved_range_check_ptr;
     local saved_poseidon_ptr: PoseidonBuiltin* = poseidon_ptr;
     if (committed_data_terminal_key == committed_data_key) {
         assert absence_charge = 0;
-        assert error = 0;
+        assert result_value = committed_data_value;
         assert saved_range_check_ptr = range_check_ptr;
     } else {
         verify_committed_data_absence_route(
@@ -191,7 +191,7 @@ func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
             COMMITTED_DATA_ABSENCE_RANGE_CHECKS_BASE +
             COMMITTED_DATA_ABSENCE_RANGE_CHECKS_PER_LEVEL * committed_data_height
         ) * RANGE_CHECK_SIERRA_GAS;
-        assert error = 'CD_KEY_NOT_FOUND';
+        assert result_value = 0;
         assert saved_range_check_ptr = range_check_ptr;
     }
     let range_check_ptr = saved_range_check_ptr;
@@ -203,7 +203,7 @@ func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
         assert gas_sufficient = 1;
     }
     assert_nn(remaining_gas - charge);
-    return (value=committed_data_value, gas=remaining_gas - charge, error=error);
+    return (value=result_value, gas=remaining_gas - charge, error=0);
 }
 
 // The leaf key is already authenticated. Prove the requested key follows every branch of
@@ -819,12 +819,24 @@ func committed_data_dispatch{
         let poseidon_ptr = saved_poseidon_ptr;
         let bitwise_ptr = saved_bitwise_ptr;
         let committed_data_cache = saved_cache;
-        let (_, final_gas, missing_error) = committed_data_read_one(
+        let (value, next_gas, error) = committed_data_read_one(
             root, keys[committed_data_missing_index], prefix_gas
         );
-        // Forces the hint to select the first absent key: all prior keys were authenticated above.
-        assert missing_error = 'CD_KEY_NOT_FOUND';
-        return (gas=final_gas, error=missing_error);
+        assert error = 0;
+        assert values[committed_data_missing_index] = value;
+        let consumed = committed_data_missing_index + 1;
+        if (consumed == count) {
+            return (gas=next_gas, error=0);
+        }
+        // The suffix is another sub-read, not another outer CallContract allowance.
+        let (suffix_gas, _) = committed_data_charge(
+            COMMITTED_DATA_CALL_CONTRACT_STEPS * STEP_SIERRA_GAS +
+            COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS * RANGE_CHECK_SIERRA_GAS,
+            next_gas,
+        );
+        return committed_data_dispatch(
+            root, keys + consumed, count - consumed, values + consumed, suffix_gas, batch
+        );
     }
     let (value, gas, error) = committed_data_read_one(root, keys[0], gas);
     assert values[0] = value;

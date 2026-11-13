@@ -1,10 +1,8 @@
-//! Paid non-membership failures. A failed batch authenticates its successful prefix and then
-//! the first absent key; unavailable evidence still aborts admission instead of inventing a revert.
+//! Zero-default reads backed by authenticated non-membership proofs.
+//! Unavailable evidence remains an availability failure; it never supplies a default value.
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 
 use super::*;
-
-pub const MISSING_KEY_FELT: Felt = Felt::from_hex_unchecked("0x43445f4b45595f4e4f545f464f554e44"); // CD_KEY_NOT_FOUND
 
 // A second traversal compares both keys at every committed branch. High-bit extraction
 // is the worst case; the direct Cairo matrix includes memory holes in the step bound.
@@ -24,8 +22,9 @@ pub fn absence_os_resources(height: usize) -> ExecutionResources {
     resources
 }
 
-/// Successful admission can contain a paid syscall failure. Keep its resources separate from
-/// node availability errors so both VM and Native account caught failures without rejecting them.
+/// Return zero only after authenticating absence. Present runs retain the shared membership
+/// schedule; absence paths are paid independently, including duplicates and repeated calls.
+/// Stage accounting so an unavailable suffix or insufficient gas cannot warm a partial read.
 pub fn read_outcome(
     enabled: bool,
     witnesses: &CommittedDataWitnesses,
@@ -34,94 +33,108 @@ pub fn read_outcome(
     calldata: &[Felt],
     remaining_gas: &mut u64,
     failure: &mut Option<CommittedDataError>,
-) -> Result<(Result<Vec<Felt>, Felt>, ExecutionResources), SyscallExecutorBaseError> {
-    // Keep the successful fast path unchanged. A failed authenticated lookup has not charged
-    // gas or warmed the read set; only then do we look for evidence of the first absent key.
-    let mut lookup_failure = None;
-    let result = read_values_shared(
-        enabled,
-        witnesses,
-        read_set,
-        selector,
-        calldata,
-        remaining_gas,
-        &mut lookup_failure,
-    );
-    if let Ok((values, resources)) = result {
-        return Ok((Ok(values), resources));
-    }
-    let keys = read_keys(selector, calldata).ok().filter(|_| {
-        enabled
-            && !matches!(
-                lookup_failure,
-                Some(
-                    CommittedDataError::InsufficientGas { .. }
-                        | CommittedDataError::TooManyWitnesses
-                )
-            )
-    });
-    let Some((keys, batch)) = keys else {
-        if failure.is_none() {
-            *failure = lookup_failure;
-        }
-        return result.map(|(values, resources)| (Ok(values), resources));
-    };
-    let root = calldata[0];
-    let mut missing = None;
-    for (index, key) in keys.iter().copied().enumerate() {
-        match witnesses.value(root, key) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                missing = Some((index, key));
-                break;
-            }
-            Err(error) => return Err(availability(selector, error, failure)),
-        }
-    }
-    let Some((index, key)) = missing else {
-        if failure.is_none() {
-            *failure = lookup_failure;
-        }
-        return result.map(|(values, resources)| (Ok(values), resources));
-    };
-    let witness =
-        witnesses.absence(root, key).map_err(|error| availability(selector, error, failure))?;
-    let mut resources = ExecutionResources::default();
-    if index > 0 {
-        debug_assert!(batch);
-        let mut prefix = vec![root, Felt::from(index)];
-        prefix.extend_from_slice(&keys[..index]);
-        let (_, prefix_resources) = read_values_shared(
-            true,
+) -> Result<(Vec<Felt>, ExecutionResources), SyscallExecutorBaseError> {
+    let Ok((keys, batch)) = read_keys(selector, calldata) else {
+        return read_values_shared(
+            enabled,
             witnesses,
             read_set,
             selector,
-            &prefix,
+            calldata,
             remaining_gas,
             failure,
-        )?;
-        resources += &prefix_resources;
-        // Prefix and terminal verification share one outer call_contract allowance, not two.
-        let overhead = ExecutionResources {
-            n_steps: CALL_CONTRACT_STEPS,
-            builtin_instance_counter: [(
-                cairo_vm::types::builtin_name::BuiltinName::range_check,
-                CALL_CONTRACT_RANGE_CHECKS,
-            )]
-            .into(),
-            n_memory_holes: 0,
-        };
-        charge_authenticated_read(selector, resources_gas(&overhead), remaining_gas, failure)?;
-        resources += &overhead;
+        );
+    };
+    if !enabled {
+        return read_values_shared(
+            enabled,
+            witnesses,
+            read_set,
+            selector,
+            calldata,
+            remaining_gas,
+            failure,
+        );
     }
-    let absent_resources = absence_os_resources(witness.siblings.len());
-    read_set
-        .check_witness_capacity(root, key)
-        .map_err(|error| availability(selector, error, failure))?;
-    charge_authenticated_read(selector, resources_gas(&absent_resources), remaining_gas, failure)?;
-    read_set.record_absence(root, key);
-    resources += &absent_resources;
-    Ok((Err(MISSING_KEY_FELT), resources))
+    let root = calldata[0];
+    // Provider errors are not absence. Authenticate every absent route before accounting work.
+    let mut absent = Vec::with_capacity(keys.len());
+    for key in keys {
+        let proof = match witnesses
+            .value(root, *key)
+            .map_err(|error| availability(selector, error, failure))?
+        {
+            Some(_) => None,
+            None => Some(
+                witnesses
+                    .absence(root, *key)
+                    .map_err(|error| availability(selector, error, failure))?
+                    .siblings
+                    .len(),
+            ),
+        };
+        absent.push(proof);
+    }
+    if absent.iter().all(Option::is_none) {
+        return read_values_shared(
+            enabled,
+            witnesses,
+            read_set,
+            selector,
+            calldata,
+            remaining_gas,
+            failure,
+        );
+    }
+    let staged = read_set.fork();
+    let mut gas = *remaining_gas;
+    let mut resources = ExecutionResources::default();
+    let mut values = Vec::with_capacity(keys.len() + usize::from(batch));
+    if batch {
+        values.push(Felt::from(keys.len()));
+    }
+    let mut index = 0;
+    while index < keys.len() {
+        if index > 0 {
+            // Each sub-read deducts CallContract's allowance; the outer call supplies it once.
+            let overhead = ExecutionResources {
+                n_steps: CALL_CONTRACT_STEPS,
+                builtin_instance_counter: [(
+                    cairo_vm::types::builtin_name::BuiltinName::range_check,
+                    CALL_CONTRACT_RANGE_CHECKS,
+                )]
+                .into(),
+                n_memory_holes: 0,
+            };
+            charge_authenticated_read(selector, resources_gas(&overhead), &mut gas, failure)?;
+            resources += &overhead;
+        }
+        if let Some(height) = absent[index] {
+            staged
+                .check_witness_capacity(root, keys[index])
+                .map_err(|error| availability(selector, error, failure))?;
+            let cost = absence_os_resources(height);
+            charge_authenticated_read(selector, resources_gas(&cost), &mut gas, failure)?;
+            staged.record_absence(root, keys[index]);
+            resources += &cost;
+            values.push(Felt::ZERO);
+            index += 1;
+        } else {
+            let end = (index..keys.len())
+                .find(|position| absent[*position].is_some())
+                .unwrap_or(keys.len());
+            let mut run = vec![root, Felt::from(end - index)];
+            run.extend_from_slice(&keys[index..end]);
+            let (members, cost) =
+                read_values_shared(true, witnesses, &staged, selector, &run, &mut gas, failure)?;
+            values.extend_from_slice(&members[1..]);
+            resources += &cost;
+            index = end;
+        }
+    }
+    read_set.replace_with(&staged);
+    *remaining_gas = gas;
+    Ok((values, resources))
 }
 
 fn availability(
@@ -144,7 +157,7 @@ mod tests {
     #[case::first(true, 0)]
     #[case::middle(true, 2)]
     #[case::last(true, 3)]
-    fn paid_absence_reverts_and_only_authenticates_the_prefix(
+    fn paid_absence_returns_zero_and_authenticates_the_whole_batch(
         #[case] batch: bool,
         #[case] position: usize,
     ) {
@@ -165,19 +178,22 @@ mod tests {
         if batch {
             calldata.push(Felt::from(keys.len()));
         }
-        calldata.extend(keys);
+        calldata.extend_from_slice(&keys);
         let read_set = CommittedDataReadSet::default();
         let mut gas = 100_000_000;
         let mut failure = None;
         let (outcome, resources) =
             read_outcome(true, &witnesses, &read_set, selector, &calldata, &mut gas, &mut failure)
                 .unwrap();
-        assert_eq!(outcome, Err(MISSING_KEY_FELT));
+        let mut expected = if batch { vec![Felt::from(keys.len())] } else { vec![] };
+        expected
+            .extend(keys.iter().map(|key| if *key == Felt::TWO { Felt::ZERO } else { Felt::MAX }));
+        assert_eq!(outcome, expected);
         assert!(failure.is_none());
         assert_eq!(100_000_000 - gas, resources_gas(&resources));
         let used = read_set.witness_keys();
         assert!(used.contains(&(tree.root(), Felt::TWO)));
-        assert_eq!(used.contains(&(tree.root(), Felt::ONE)), position > 0);
+        assert_eq!(used.contains(&(tree.root(), Felt::ONE)), batch);
         let mut underfunded_failure = None;
         assert!(
             read_outcome(
@@ -194,9 +210,84 @@ mod tests {
         assert!(matches!(underfunded_failure, Some(CommittedDataError::InsufficientGas { .. })));
     }
 
+    /// An explicit zero and absence have equal return values but different authenticated paths.
+    #[rstest::rstest]
+    #[case::all_absent(vec![Felt::TWO, Felt::THREE, Felt::TWO])]
+    #[case::alternating(vec![Felt::TWO, Felt::ONE, Felt::THREE, Felt::ZERO, Felt::TWO])]
+    #[case::maximum_duplicates(vec![Felt::TWO; MAX_COMMITTED_DATA_READ_KEYS])]
+    fn mixed_reads_preserve_order_and_charge_repeated_absence(#[case] keys: Vec<Felt>) {
+        let tree =
+            CommittedDataSet::new(vec![(Felt::ZERO, Felt::ZERO), (Felt::ONE, Felt::MAX)]).unwrap();
+        let witnesses = CommittedDataWitnesses::new(
+            [Felt::ZERO, Felt::ONE, Felt::TWO, Felt::THREE]
+                .map(|key| tree.lookup_witness(key))
+                .to_vec(),
+        )
+        .unwrap();
+        let mut calldata = vec![tree.root(), Felt::from(keys.len())];
+        calldata.extend_from_slice(&keys);
+        let read_set = CommittedDataReadSet::default();
+        for _ in 0..2 {
+            let mut gas = u64::MAX;
+            let (values, resources) = read_outcome(
+                true,
+                &witnesses,
+                &read_set,
+                selector_from_name("get_values").0,
+                &calldata,
+                &mut gas,
+                &mut None,
+            )
+            .unwrap();
+            let expected: Vec<_> = std::iter::once(Felt::from(keys.len()))
+                .chain(
+                    keys.iter().map(|key| if *key == Felt::ONE { Felt::MAX } else { Felt::ZERO }),
+                )
+                .collect();
+            assert_eq!(values, expected);
+            assert_eq!(u64::MAX - gas, resources_gas(&resources));
+            let absent_count = keys.iter().filter(|key| **key > Felt::ONE).count() as u64;
+            assert!(
+                resources_gas(&resources) >= absent_count * resources_gas(&absence_os_resources(1))
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::unavailable_suffix(false)]
+    #[case::insufficient_gas(true)]
+    fn incomplete_mixed_read_does_not_publish_partial_accounting(#[case] supplied_suffix: bool) {
+        let tree = CommittedDataSet::new(vec![(Felt::ZERO, Felt::ONE)]).unwrap();
+        let mut proofs = vec![tree.lookup_witness(Felt::ZERO), tree.lookup_witness(Felt::ONE)];
+        if supplied_suffix {
+            proofs.push(tree.lookup_witness(Felt::TWO));
+        }
+        let witnesses = CommittedDataWitnesses::new(proofs).unwrap();
+        let reads = CommittedDataReadSet::default();
+        let mut gas = if supplied_suffix { 0 } else { u64::MAX };
+        let before = gas;
+        let mut failure = None;
+        assert!(
+            read_outcome(
+                true,
+                &witnesses,
+                &reads,
+                selector_from_name("get_values").0,
+                &[tree.root(), Felt::THREE, Felt::ZERO, Felt::ONE, Felt::TWO],
+                &mut gas,
+                &mut failure
+            )
+            .is_err()
+        );
+        assert!(reads.is_empty());
+        assert_eq!(gas, before);
+        assert!(failure.is_some());
+    }
+
     #[test]
     fn absent_evidence_is_not_an_availability_fallback() {
         let mut failure = None;
+        let mut gas = u64::MAX;
         assert!(
             read_outcome(
                 true,
@@ -204,7 +295,7 @@ mod tests {
                 &CommittedDataReadSet::default(),
                 selector_from_name("get_value").0,
                 &[Felt::ONE, Felt::TWO],
-                &mut u64::MAX,
+                &mut gas,
                 &mut failure
             )
             .is_err()

@@ -549,8 +549,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
             );
             syscall_handler.base.account_committed_data_read(&resources, result.is_err());
             let (values, _) = result?;
-            let values = values
-                .map_err(|error| SyscallExecutorBaseError::Revert { error_data: vec![error] })?;
             let segment = create_retdata_segment(vm, syscall_handler, &values)?;
             return Ok(CallContractResponse { segment });
         }

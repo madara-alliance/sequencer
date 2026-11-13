@@ -197,18 +197,14 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
             };
             let (keys, _) = read_keys(request.function_selector.0, &request.calldata.0)?;
             let root = request.calldata.0[0];
-            // Failed batches require only the authenticated prefix and first absent key.
+            // Zero-default batches authenticate every requested key, including absent keys.
             let mut required = std::collections::BTreeMap::new();
             for key in keys {
                 let witness = syscall_handler
                     .committed_data_witness(root, *key)
                     .cloned()
                     .ok_or_else(|| invalid("Committed-data witness unavailable"))?;
-                let absent = witness.terminal_key.is_some();
                 required.insert(*key, witness);
-                if absent {
-                    break;
-                }
             }
             let witnesses = required.into_values().collect();
             let witnesses = CommittedDataWitnesses::new(witnesses)
@@ -229,7 +225,6 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
                 remaining_gas,
                 &mut None,
             )?;
-            let values = values.map_err(handle_failure)?;
             let values: Vec<MaybeRelocatable> = values.into_iter().map(Into::into).collect();
             // Cairo independently constrains every returned value, order and gas charge.
             let start_ptr = vm.add_memory_segment();

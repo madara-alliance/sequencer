@@ -107,10 +107,7 @@ mod TestContract {
         let result = syscalls::call_contract_syscall(
             selector!("committed_data_v1").try_into().unwrap(), selector!("get_value"), array![root, key].span(),
         );
-        match result {
-            Result::Ok(_) => panic!("expected missing key"),
-            Result::Err(reason) => assert(reason.span() == array!['CD_KEY_NOT_FOUND'].span(), 'wrong missing-key error'),
-        };
+        assert(result.unwrap_syscall() == array![0].span(), 'expected default zero');
     }
 
     // TODO(Dori): Delete this function, use `test` instead.
@@ -565,7 +562,7 @@ mod TestContract {
     // Exercise the same catching helper through the L1 transaction boundary.
     #[l1_handler]
     fn l1_committed_data_catch(self: @ContractState, from_address: felt252, root: felt252, keys: Span<felt252>) {
-        test_committed_data_catch(self, root, keys, true, 3);
+        test_committed_data_catch(self, root, keys, false, 3);
     }
 
     #[l1_handler]

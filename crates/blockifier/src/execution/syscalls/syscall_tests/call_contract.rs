@@ -967,11 +967,11 @@ fn committed_data_l1_failures_reject_without_state_changes(
     assert_eq!(state.to_state_diff().unwrap(), before);
 }
 
-/// An authenticated missing key is a paid, catchable syscall failure in both engines.
+/// An authenticated missing key returns zero successfully in both execution engines.
 #[rstest]
 #[case::vm(RunnableCairo1::Casm)]
 #[cfg_attr(feature = "cairo_native", case::native(RunnableCairo1::Native))]
-fn committed_data_absence_is_paid_and_catchable(
+fn committed_data_absence_returns_paid_zero(
     #[case] runnable: RunnableCairo1,
     #[values(false, true)] caught: bool,
 ) {
@@ -981,7 +981,6 @@ fn committed_data_absence_is_paid_and_catchable(
         COMMITTED_DATA_ADDRESS,
         CommittedDataSet,
         CommittedDataWitnesses,
-        MISSING_KEY_FELT,
         absence_os_resources,
         resources_gas,
     };
@@ -1016,10 +1015,10 @@ fn committed_data_absence_is_paid_and_catchable(
     };
     let info = call.execute_directly_given_block_context(&mut state, context).unwrap();
     info.check_native_execution(runnable.is_cairo_native());
-    assert_eq!(info.execution.failed, !caught);
+    assert!(!info.execution.failed);
     assert!(info.execution.gas_consumed >= minimum_gas);
     assert_eq!(info.unpaid_committed_data_resources, Default::default());
     if !caught {
-        assert!(info.execution.retdata.0.contains(&MISSING_KEY_FELT));
+        assert_eq!(info.execution.retdata.0, vec![Felt::ZERO]);
     }
 }

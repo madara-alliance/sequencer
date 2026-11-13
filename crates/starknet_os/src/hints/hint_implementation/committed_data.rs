@@ -219,7 +219,8 @@ pub(crate) fn end_committed_data_finalization<S: StateReader>(
     Ok(())
 }
 
-/// This is a hint, not authority: Cairo authenticates the successful prefix and terminal absence.
+/// Select the next run boundary. Cairo authenticates the prefix, terminal path and remaining
+/// suffix.
 pub(crate) fn load_committed_data_missing_index<S: StateReader>(
     hp: &mut SnosHintProcessor<'_, S>,
     mut ctx: HintContext<'_>,

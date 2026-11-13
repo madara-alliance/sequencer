@@ -633,11 +633,9 @@ async fn committed_data_shared_reads_follow_reverts_and_block_boundaries(
     assert_eq!(output.runner_output.committed_data_finalizations.len(), 2);
 }
 
-/// Uncaught absence consumes the nonce as an ordinary revert. Caught absence executes in
-/// Cairo (including two blocks and repeated shared prefixes), so an unproved host result cannot
-/// pass.
+/// Zero-default reads execute in Cairo across blocks, including repeated mixed batches.
 #[tokio::test]
-async fn committed_data_absence_reverts_and_caught_failures_prove_across_blocks() {
+async fn committed_data_absence_returns_zero_across_blocks() {
     use blockifier::execution::syscalls::committed_data::{
         COMMITTED_DATA_ADDRESS,
         CommittedDataSet,
@@ -650,6 +648,7 @@ async fn committed_data_absence_reverts_and_caught_failures_prove_across_blocks(
     let proofs = vec![
         tree.lookup_witness(Felt::ZERO),
         tree.lookup_witness(Felt::ONE),
+        tree.lookup_witness(Felt::TWO),
         tree.lookup_witness(Felt::MAX),
     ];
     builder.initial_state.block_context.use_committed_data = true;
@@ -667,13 +666,12 @@ async fn committed_data_absence_reverts_and_caught_failures_prove_across_blocks(
             &[tree.root(), Felt::ONE],
         );
         let tx = builder.create_funded_account_invoke(invoke_tx_args! { calldata });
-        builder.add_invoke_tx(tx, Some("CD_KEY_NOT_FOUND".into()), None);
+        builder.add_invoke_tx(tx, None, None);
         let calldata =
             create_calldata(reader, "test_committed_data_catch_single", &[tree.root(), Felt::ONE]);
         builder.add_funded_account_invoke(invoke_tx_args! { calldata });
         for keys in [
-            vec![Felt::ONE, Felt::TWO], /* Suffix has no supplied witness and must not be
-                                         * evaluated. */
+            vec![Felt::ONE, Felt::TWO], // Both absent keys require authenticated evidence.
             vec![Felt::ONE; 1024],
             [vec![Felt::ZERO; 1023], vec![Felt::ONE]].concat(),
             vec![Felt::ONE],
@@ -683,7 +681,7 @@ async fn committed_data_absence_reverts_and_caught_failures_prove_across_blocks(
         ] {
             let mut args = vec![tree.root(), Felt::from(keys.len())];
             args.extend(keys);
-            args.extend([Felt::ONE, Felt::THREE]); // Catch the missing-key error three times.
+            args.extend([Felt::ZERO, Felt::THREE]); // Repeat successful zero-default reads.
             let calldata = create_calldata(reader, "test_committed_data_catch", &args);
             builder.add_funded_account_invoke(invoke_tx_args! { calldata });
         }
@@ -739,9 +737,9 @@ async fn committed_data_absence_reverts_and_caught_failures_prove_across_blocks(
     }
 }
 
-/// L1 handlers use the same authenticated, paid failure when their contract catches absence.
+/// L1 handlers use the same authenticated zero-default semantics.
 #[tokio::test]
-async fn committed_data_absence_caught_by_l1_handler_proves() {
+async fn committed_data_absence_in_l1_handler_proves() {
     use blockifier::execution::syscalls::committed_data::CommittedDataSet;
     let contract = FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
     let (mut builder, [reader]) =
@@ -764,8 +762,7 @@ async fn committed_data_absence_caught_by_l1_handler_proves() {
     output.runner_output.cairo_pie.run_validity_checks().unwrap();
 }
 
-/// The largest failed batch may contain 1023 distinct members, not merely duplicate keys.
-/// Repeating it must pay for each failure while sharing only its authenticated membership union.
+/// A maximum-size mixed batch retains membership sharing and pays for each absence path.
 #[tokio::test]
 async fn committed_data_absence_after_maximum_distinct_prefix_proves() {
     use blockifier::execution::syscalls::committed_data::CommittedDataSet;
@@ -786,7 +783,7 @@ async fn committed_data_absence_after_maximum_distinct_prefix_proves() {
     builder.os_hints_config.committed_data_witnesses = proofs;
     let mut args = vec![tree.root(), Felt::from(keys.len())];
     args.extend(keys);
-    args.extend([Felt::ONE, Felt::THREE]);
+    args.extend([Felt::ZERO, Felt::THREE]);
     builder.add_funded_account_invoke(invoke_tx_args! {
         calldata: create_calldata(reader, "test_committed_data_catch", &args)
     });

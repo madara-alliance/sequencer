@@ -528,7 +528,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             );
             self.base.account_committed_data_read(&resources, result.is_err());
             let (values, _) = result.map_err(|e| self.handle_error(remaining_gas, e.into()))?;
-            let values = values.map_err(|error| vec![error])?;
             log::debug!(
                 target: "committed_data_native",
                 "Native committed_data system call completed: caller={}",

@@ -2,8 +2,8 @@
 //!
 //! The application supplies a root read from its own authenticated storage. Values and paths
 //! are private execution input; the Cairo OS independently proves lookup outcomes and responses.
-//! An authenticated absent key returns a paid `CD_KEY_NOT_FOUND` syscall error. Uncaught errors
-//! revert normally; unavailable datasets or invalid witnesses still abort admission.
+//! An authenticated absent key returns zero. Unavailable datasets or invalid witnesses still
+//! abort admission; a provider failure is never evidence that a key is absent.
 //! Any contract may read a dataset by root and key. Roots and witnesses are independent of
 //! the caller; applications enforce root authorization and freshness in their own contracts.
 //! `use_committed_data` is execution permission, not a consensus activation policy. When false,
@@ -28,7 +28,7 @@ pub const COMMITTED_DATA_ADDRESS: Felt =
     Felt::from_hex_unchecked("0x6c5f4559c7041984537bc078c71443fdc58b2e1bab302b341ec12b3d2cec44");
 mod absence;
 mod sharing;
-pub use absence::{MISSING_KEY_FELT, absence_os_resources, read_outcome};
+pub use absence::{absence_os_resources, read_outcome};
 pub use sharing::{
     CommittedDataReadSet,
     read_values_shared,

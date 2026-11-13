@@ -7,7 +7,6 @@ use blockifier::execution::syscalls::committed_data::{
     CommittedDataSet,
     CommittedDataSibling,
     CommittedDataWitness,
-    MISSING_KEY_FELT,
     absence_os_resources,
     batch_gas,
     read_gas,
@@ -186,7 +185,7 @@ fn absence_cairo_is_paid_and_rejects_forged_routes(
     let budget = absence_os_resources(height);
     let charge = resources_gas(&budget);
     let (response, actual) = read_measured(witness.clone(), charge, false).unwrap();
-    assert_eq!(response, [Felt::ZERO, Felt::ZERO, MISSING_KEY_FELT].map(MaybeRelocatable::from));
+    assert_eq!(response, [Felt::ZERO, Felt::ZERO, Felt::ZERO].map(MaybeRelocatable::from));
     // CallContract's ordinary allowance is deducted from the committed-data surcharge.
     let total_steps = budget.n_steps + 903;
     assert!(
