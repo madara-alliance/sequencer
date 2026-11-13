@@ -3,12 +3,19 @@ use std::sync::{Arc, LazyLock};
 
 use assert_matches::assert_matches;
 use blockifier::abi::constants::STORED_BLOCK_HASH_BUFFER;
+use blockifier::blockifier::transaction_executor::TransactionExecutorError;
 use blockifier::blockifier_versioned_constants::VersionedConstants;
+use blockifier::bouncer::accumulate_snos_full_output_cells;
 use blockifier::execution::call_info::OpcodeName;
+use blockifier::fee::fee_utils::get_sequencer_balance_keys;
+use blockifier::state::cached_state::StateMaps;
+use blockifier::state::state_api::StateReader;
 use blockifier::test_utils::contracts::FeatureContractTrait;
 use blockifier::test_utils::dict_state_reader::DictStateReader;
 use blockifier::test_utils::{get_valid_virtual_os_program_hash, ALIAS_CONTRACT_ADDRESS};
+use blockifier::transaction::errors::TransactionExecutionError;
 use blockifier::transaction::test_utils::ExpectedExecutionInfo;
+use blockifier::transaction::transaction_execution::Transaction as BlockifierTransaction;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::calldata::{cairo0_proven_revert_scenario_calldata, create_calldata};
 use blockifier_test_utils::contracts::FeatureContract;
@@ -84,11 +91,17 @@ use starknet_committer::block_committer::input::{
     StarknetStorageValue,
     StateDiff,
 };
+use starknet_committer::db::facts_db::FactsDb;
+use starknet_committer::db::forest_trait::StorageInitializer;
 use starknet_committer::patricia_merkle_tree::types::CompiledClassHash;
 use starknet_core::crypto::ecdsa_sign;
 use starknet_crypto::{get_public_key, Signature};
 use starknet_os::hints::hint_implementation::deprecated_compiled_class::class_hash::compute_deprecated_class_hash;
 use starknet_os::hints::vars::Const;
+use starknet_transaction_prover::running::committer_utils::{
+    commit_state_diff,
+    state_maps_to_committer_state_diff,
+};
 use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::{Pedersen, StarkHash};
 
@@ -116,6 +129,7 @@ use crate::test_manager::{
 };
 use crate::utils::{
     divide_vec_into_n_parts,
+    execute_transactions_concurrently,
     get_class_hash_of_feature_contract,
     get_class_info_of_cairo0_contract,
     get_class_info_of_feature_contract,
@@ -225,6 +239,27 @@ async fn declare_deploy_scenario(
     test_builder.divide_transactions_into_n_blocks(n_blocks);
     let test_output = test_builder.build_and_run().await;
 
+    if full_output {
+        let actual_output_cells = test_output.runner_output.raw_os_output.len();
+        let predicted_output_cells = test_output
+            .predicted_snos_full_output_cells_per_block
+            .iter()
+            .copied()
+            .reduce(|accumulated, block| {
+                accumulate_snos_full_output_cells(accumulated, block)
+                    .expect("SNOS output prediction must not overflow")
+            })
+            .expect("OS flow must contain at least one block");
+        assert!(
+            predicted_output_cells >= actual_output_cells,
+            "Blockifier prediction must cover the actual serialized SNOS output: \
+             predicted={predicted_output_cells}, actual={actual_output_cells}"
+        );
+        if n_blocks == 1 {
+            assert_eq!(predicted_output_cells, actual_output_cells);
+        }
+    }
+
     let partial_state_diff = StateDiff {
         // Deployed contract.
         address_to_class_hash: HashMap::from([(expected_contract_address, class_hash)]),
@@ -250,6 +285,164 @@ async fn declare_deploy_scenario(
         "declare_deploy_scenario_n_blocks_{}_use_kzg_da_{}_full_output_{}",
         n_blocks, use_kzg_da, full_output
     ));
+}
+
+async fn set_sequencer_balance_to_force_high_word_carry(
+    test_builder: &mut TestBuilder<DictStateReader>,
+) -> starknet_api::state::StorageKey {
+    let (low_key, high_key) = get_sequencer_balance_keys(&test_builder.initial_state.block_context);
+    let state_maps = StateMaps {
+        storage: HashMap::from([((*STRK_FEE_TOKEN_ADDRESS, low_key), Felt::from(u128::MAX))]),
+        ..Default::default()
+    };
+    test_builder.initial_state.updatable_state.storage_view.extend(state_maps.storage.clone());
+
+    let mut db = FactsDb::new(std::mem::take(&mut test_builder.initial_state.commitment_storage));
+    let roots = commit_state_diff(
+        &mut db,
+        test_builder.initial_state.contracts_trie_root_hash,
+        test_builder.initial_state.classes_trie_root_hash,
+        state_maps_to_committer_state_diff(state_maps),
+    )
+    .await
+    .unwrap();
+    test_builder.initial_state.commitment_storage = db.consume_storage();
+    test_builder.initial_state.contracts_trie_root_hash = roots.contracts_trie_root_hash;
+    test_builder.initial_state.classes_trie_root_hash = roots.classes_trie_root_hash;
+    high_key
+}
+
+async fn concurrent_output_limit_builder(
+    max_snos_full_output_cells: Option<usize>,
+) -> (TestBuilder<DictStateReader>, ContractAddress, starknet_api::state::StorageKey) {
+    let (mut test_builder, [test_contract_address]) = TestBuilder::create_standard_with_config(
+        [(FeatureContract::TestContract(CairoVersion::Cairo0), calldata![Felt::ZERO, Felt::ZERO])],
+        TestBuilderConfig { full_output: true, max_snos_full_output_cells, ..Default::default() },
+    )
+    .await;
+    let sequencer_balance_high =
+        set_sequencer_balance_to_force_high_word_carry(&mut test_builder).await;
+    (test_builder, test_contract_address, sequencer_balance_high)
+}
+
+fn create_output_target_transaction(
+    test_builder: &mut TestBuilder<DictStateReader>,
+    test_contract_address: ContractAddress,
+) -> InvokeTransaction {
+    let calldata = create_calldata(
+        test_contract_address,
+        "test_storage_read_write",
+        &[Felt::from(0x123_u16), Felt::ONE],
+    );
+    test_builder.create_funded_account_invoke(invoke_tx_args! { calldata })
+}
+
+fn as_blockifier_invoke(tx: InvokeTransaction) -> BlockifierTransaction {
+    BlockifierTransaction::new_for_sequencing(Transaction::Account(AccountTransaction::Invoke(tx)))
+}
+
+fn concurrent_block_context(
+    test_builder: &TestBuilder<DictStateReader>,
+    max_snos_full_output_cells: usize,
+) -> blockifier::context::BlockContext {
+    let mut block_context = blockifier::context::BlockContext::from_base_context(
+        &test_builder.initial_state.block_context,
+        0,
+        false,
+    );
+    block_context.bouncer_config.max_snos_full_output_cells = max_snos_full_output_cells;
+    block_context
+}
+
+#[tokio::test]
+async fn concurrent_snos_admission_matches_real_output_and_rolls_back_rejection() {
+    let (mut discovery, test_contract_address, _) = concurrent_output_limit_builder(None).await;
+    let target_tx = create_output_target_transaction(&mut discovery, test_contract_address);
+    let (_, _, exact_limit) = execute_transactions_concurrently(
+        discovery.initial_state.updatable_state.clone(),
+        &[as_blockifier_invoke(target_tx)],
+        concurrent_block_context(&discovery, usize::MAX),
+    );
+
+    let (mut boundary, test_contract_address, sequencer_balance_high) =
+        concurrent_output_limit_builder(Some(exact_limit)).await;
+    let boundary_tx = create_output_target_transaction(&mut boundary, test_contract_address);
+    let (boundary_results, boundary_state, boundary_prediction) = execute_transactions_concurrently(
+        boundary.initial_state.updatable_state.clone(),
+        &[as_blockifier_invoke(boundary_tx.clone())],
+        concurrent_block_context(&boundary, exact_limit),
+    );
+    assert!(boundary_results[0].is_ok());
+    assert_eq!(boundary_prediction, exact_limit);
+    assert_eq!(
+        boundary_state.get_storage_at(*STRK_FEE_TOKEN_ADDRESS, sequencer_balance_high).unwrap(),
+        Felt::ONE
+    );
+    boundary.add_invoke_tx(boundary_tx, None, None);
+    let boundary_output = boundary.build_and_run().await;
+    assert_eq!(boundary_output.predicted_snos_full_output_cells_per_block, [exact_limit]);
+    assert_eq!(boundary_output.runner_output.raw_os_output.len(), exact_limit);
+    assert_eq!(
+        boundary_output
+            .final_state
+            .get_storage_at(*STRK_FEE_TOKEN_ADDRESS, sequencer_balance_high)
+            .unwrap(),
+        Felt::ONE
+    );
+
+    let (mut rollback, test_contract_address, sequencer_balance_high) =
+        concurrent_output_limit_builder(Some(exact_limit - 1)).await;
+    let rejected_tx = create_output_target_transaction(&mut rollback, test_contract_address);
+    rollback.nonce_manager.rollback(*FUNDED_ACCOUNT_ADDRESS);
+    let smaller_tx = rollback.create_funded_account_invoke(invoke_tx_args! {
+        calldata: create_calldata(
+            test_contract_address,
+            "get_value",
+            &[Felt::from(0x123_u16)],
+        )
+    });
+    let (rollback_results, rollback_state, rollback_prediction) = execute_transactions_concurrently(
+        rollback.initial_state.updatable_state.clone(),
+        &[as_blockifier_invoke(rejected_tx), as_blockifier_invoke(smaller_tx.clone())],
+        concurrent_block_context(&rollback, exact_limit - 1),
+    );
+    assert!(matches!(
+        rollback_results[0],
+        Err(TransactionExecutorError::TransactionExecutionError(
+            TransactionExecutionError::TransactionTooLargeForProof { .. }
+        ))
+    ));
+    assert!(rollback_results[1].is_ok());
+    assert!(rollback_prediction <= exact_limit - 1);
+    assert_eq!(
+        rollback_state
+            .get_storage_at(test_contract_address, Felt::from(0x123_u16).try_into().unwrap())
+            .unwrap(),
+        Felt::ZERO
+    );
+    assert_eq!(
+        rollback_state.get_storage_at(*STRK_FEE_TOKEN_ADDRESS, sequencer_balance_high).unwrap(),
+        Felt::ONE
+    );
+
+    rollback.add_invoke_tx(smaller_tx, None, None);
+    let rollback_output = rollback.build_and_run().await;
+    assert_eq!(rollback_output.predicted_snos_full_output_cells_per_block, [rollback_prediction]);
+    assert_eq!(rollback_output.runner_output.raw_os_output.len(), rollback_prediction);
+    assert_eq!(
+        rollback_output
+            .final_state
+            .get_storage_at(test_contract_address, Felt::from(0x123_u16).try_into().unwrap(),)
+            .unwrap(),
+        Felt::ZERO
+    );
+    assert_eq!(
+        rollback_output
+            .final_state
+            .get_storage_at(*STRK_FEE_TOKEN_ADDRESS, sequencer_balance_high)
+            .unwrap(),
+        Felt::ONE
+    );
 }
 
 /// Test state diffs in separate blocks that become trivial in a multiblock.
@@ -364,7 +557,12 @@ async fn test_encrypted_state_diff(
             FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm)),
             calldata![Felt::ONE, Felt::TWO],
         )],
-        TestBuilderConfig { use_kzg_da, full_output, private_keys: private_keys.clone() },
+        TestBuilderConfig {
+            use_kzg_da,
+            full_output,
+            private_keys: private_keys.clone(),
+            ..Default::default()
+        },
     )
     .await;
 

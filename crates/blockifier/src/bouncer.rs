@@ -5,8 +5,11 @@ use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use serde::{Deserialize, Serialize};
-use starknet_api::core::ClassHash;
+use starknet_api::block::BlockNumber;
+use starknet_api::core::{ClassHash, ContractAddress};
 use starknet_api::execution_resources::GasAmount;
+use starknet_api::state::StorageKey;
+use starknet_types_core::felt::Felt;
 
 use crate::blockifier::transaction_executor::{
     CompiledClassHashV2ToV1,
@@ -25,6 +28,11 @@ use crate::fee::gas_usage::get_onchain_data_segment_length;
 use crate::fee::resources::TransactionResources;
 use crate::state::cached_state::{StateChangesKeys, StorageEntry};
 use crate::state::state_api::StateReader;
+use crate::state::stateful_compression::{
+    ALIAS_COUNTER_STORAGE_KEY,
+    MAX_NON_COMPRESSED_CONTRACT_ADDRESS,
+    MIN_VALUE_FOR_ALIAS_ALLOC,
+};
 use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::{ExecutionResourcesTraits, TransactionExecutionResult};
 use crate::utils::{add_maps, should_migrate, u64_from_usize, usize_from_u64};
@@ -68,10 +76,54 @@ macro_rules! impl_field_wise_ops {
     };
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub const DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS: usize = 49_000;
+pub const SNOS_OUTPUT_FIXED_CELLS: usize = 14;
+
+/// Returns the serialized full SNOS output size for the supplied output-shape counts.
+pub fn snos_full_output_cells_from_counts(
+    message_segment_length: usize,
+    modified_contracts: usize,
+    storage_updates: usize,
+    declared_class_updates: usize,
+) -> Option<usize> {
+    SNOS_OUTPUT_FIXED_CELLS
+        .checked_add(message_segment_length)?
+        .checked_add(modified_contracts.checked_mul(6)?)?
+        .checked_add(storage_updates.checked_mul(3)?)?
+        .checked_add(declared_class_updates.checked_mul(3)?)
+}
+
+/// Combines two independently predicted full-output blocks into one SNOS output budget, counting
+/// the batch-level header only once.
+pub fn accumulate_snos_full_output_cells(
+    current_cells: usize,
+    next_block_cells: usize,
+) -> Option<usize> {
+    next_block_cells
+        .checked_sub(SNOS_OUTPUT_FIXED_CELLS)
+        .and_then(|additional| current_cells.checked_add(additional))
+}
+
+fn default_max_snos_full_output_cells() -> usize {
+    DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BouncerConfig {
     pub block_max_capacity: BouncerWeights,
     pub builtin_weights: BuiltinWeights,
+    #[serde(default = "default_max_snos_full_output_cells")]
+    pub max_snos_full_output_cells: usize,
+}
+
+impl Default for BouncerConfig {
+    fn default() -> Self {
+        Self {
+            block_max_capacity: BouncerWeights::default(),
+            builtin_weights: BuiltinWeights::default(),
+            max_snos_full_output_cells: DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+        }
+    }
 }
 
 impl BouncerConfig {
@@ -79,6 +131,7 @@ impl BouncerConfig {
         Self {
             block_max_capacity: BouncerWeights::empty(),
             builtin_weights: BuiltinWeights::empty(),
+            max_snos_full_output_cells: 0,
         }
     }
 
@@ -86,6 +139,7 @@ impl BouncerConfig {
         Self {
             block_max_capacity: BouncerWeights::max(),
             builtin_weights: BuiltinWeights::default(),
+            max_snos_full_output_cells: usize::MAX,
         }
     }
 
@@ -117,6 +171,12 @@ impl SerializeConfig for BouncerConfig {
         let mut dump =
             prepend_sub_config_name(self.block_max_capacity.dump(), "block_max_capacity");
         dump.append(&mut prepend_sub_config_name(self.builtin_weights.dump(), "builtin_weights"));
+        dump.append(&mut BTreeMap::from([ser_param(
+            "max_snos_full_output_cells",
+            &self.max_snos_full_output_cells,
+            "An upper bound on the predicted full SNOS output cells in a block.",
+            ParamPrivacyInput::Public,
+        )]));
         dump
     }
 }
@@ -526,6 +586,61 @@ pub struct Bouncer {
     pub state_changes_keys: StateChangesKeys,
     pub bouncer_config: BouncerConfig,
     accumulated_weights: TxWeights,
+    output_builtin: OutputBuiltinTracker,
+}
+
+/// Tracks the block-wide state required to enforce the full SNOS output-cell limit.
+/// This remains separate from additive bouncer weights because aliases and state keys are
+/// deduplicated across the complete block.
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
+struct OutputBuiltinTracker {
+    storage_updates: HashSet<StorageEntry>,
+    modified_contracts: HashSet<ContractAddress>,
+    compiled_class_hashes: HashSet<ClassHash>,
+    migrated_class_hashes: HashSet<ClassHash>,
+    checked_alias_candidates: HashSet<StorageKey>,
+    new_alias_keys: HashSet<StorageKey>,
+    alias_counter_was_zero: Option<bool>,
+}
+
+#[derive(Debug)]
+struct OutputBuiltinPrediction {
+    cells: usize,
+    message_segment_length: usize,
+    modified_contracts: usize,
+    storage_updates: usize,
+    declared_class_updates: usize,
+    new_aliases: usize,
+}
+
+#[derive(Debug, Default)]
+struct OutputBuiltinUpdate {
+    previous_alias_counter_was_zero: Option<bool>,
+    newly_checked_aliases: Vec<(StorageKey, bool)>,
+    inserted_storage_updates: Vec<StorageEntry>,
+    inserted_modified_contracts: Vec<ContractAddress>,
+    inserted_compiled_class_hashes: Vec<ClassHash>,
+    inserted_migrated_class_hashes: Vec<ClassHash>,
+}
+
+fn ensure_snos_output_within_limit(
+    predicted_output_cells: usize,
+    current_n_txs: usize,
+    max_output_cells: usize,
+) -> TransactionExecutorResult<()> {
+    if predicted_output_cells <= max_output_cells {
+        return Ok(());
+    }
+    if current_n_txs == 0 {
+        Err(TransactionExecutionError::TransactionTooLargeForProof {
+            max_output_cells,
+            predicted_output_cells,
+        }
+        .into())
+    } else {
+        Err(TransactionExecutorError::BlockFull)
+    }
 }
 
 impl Bouncer {
@@ -539,11 +654,22 @@ impl Bouncer {
             state_changes_keys: StateChangesKeys::default(),
             bouncer_config: BouncerConfig::empty(),
             accumulated_weights: TxWeights::empty(),
+            output_builtin: OutputBuiltinTracker::default(),
         }
     }
 
     pub fn get_bouncer_weights(&self) -> &BouncerWeights {
         &self.accumulated_weights.bouncer_weights
+    }
+
+    pub(crate) fn seed_output_builtin(
+        &mut self,
+        preprocessed_state_changes_keys: StateChangesKeys,
+    ) {
+        self.output_builtin.storage_updates = preprocessed_state_changes_keys.storage_keys;
+        self.output_builtin.modified_contracts = preprocessed_state_changes_keys.modified_contracts;
+        self.output_builtin.compiled_class_hashes =
+            preprocessed_state_changes_keys.compiled_class_hash_keys;
     }
 
     pub fn get_mut_casm_hash_computation_data_sierra_gas(
@@ -578,6 +704,7 @@ impl Bouncer {
     #[allow(clippy::too_many_arguments)]
     pub fn try_update<S: StateReader>(
         &mut self,
+        block_number: BlockNumber,
         state_reader: &S,
         tx_state_changes_keys: &StateChangesKeys,
         tx_execution_summary: &ExecutionSummary,
@@ -632,9 +759,319 @@ impl Bouncer {
             Err(TransactionExecutorError::BlockFull)?
         }
 
+        let mut output_update = self.update_output_builtin(
+            state_reader,
+            &marginal_state_changes_keys,
+            versioned_constants,
+        )?;
+        self.apply_output_builtin_accounting(
+            versioned_constants,
+            &marginal_state_changes_keys,
+            &tx_weights,
+            &mut output_update,
+        );
+        let prediction =
+            self.output_builtin_prediction_with_pending(versioned_constants, &tx_weights);
+        if let Err(error) = ensure_snos_output_within_limit(
+            prediction.cells,
+            self.get_bouncer_weights().n_txs,
+            self.bouncer_config.max_snos_full_output_cells,
+        ) {
+            self.rollback_output_builtin(output_update);
+            let tx_ordinal = next_accumulated_weights.n_txs;
+            let empty_block = self.get_bouncer_weights().n_txs == 0;
+            log::info!(
+                target: "output_builtin",
+                "event=tx_prediction_rejected block_number={} tx_ordinal={} \
+                 predicted_full_output_cells={} max_full_output_cells={} reason={}",
+                block_number,
+                tx_ordinal,
+                prediction.cells,
+                self.bouncer_config.max_snos_full_output_cells,
+                if empty_block { "transaction_too_large_for_proof" } else { "block_full" },
+            );
+            return Err(error);
+        }
+
         self.update(tx_weights, tx_execution_summary, &marginal_state_changes_keys);
 
+        log::debug!(
+            target: "output_builtin",
+            "event=tx_prediction block_number={} tx_ordinal={} predicted_full_output_cells={} \
+             message_segment_length={} modified_contracts={} storage_updates={} \
+             declared_class_updates={} new_aliases={} exceeds_49000={} \
+             exceeds_configured_limit={} max_full_output_cells={}",
+            block_number,
+            self.get_bouncer_weights().n_txs,
+            prediction.cells,
+            prediction.message_segment_length,
+            prediction.modified_contracts,
+            prediction.storage_updates,
+            prediction.declared_class_updates,
+            prediction.new_aliases,
+            prediction.cells > DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+            prediction.cells > self.bouncer_config.max_snos_full_output_cells,
+            self.bouncer_config.max_snos_full_output_cells,
+        );
+
         Ok(())
+    }
+
+    fn update_output_builtin<S: StateReader>(
+        &mut self,
+        state_reader: &S,
+        marginal_state_changes_keys: &StateChangesKeys,
+        versioned_constants: &VersionedConstants,
+    ) -> TransactionExecutorResult<OutputBuiltinUpdate> {
+        if !versioned_constants.enable_stateful_compression {
+            return Ok(OutputBuiltinUpdate::default());
+        }
+
+        let alias_contract_address =
+            versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+        let mut candidates = HashSet::with_capacity(
+            marginal_state_changes_keys.modified_contracts.len()
+                + marginal_state_changes_keys.storage_keys.len(),
+        );
+
+        for contract_address in &marginal_state_changes_keys.modified_contracts {
+            let candidate = StorageKey(contract_address.0);
+            if candidate.0 >= MIN_VALUE_FOR_ALIAS_ALLOC {
+                candidates.insert(candidate);
+            }
+        }
+        for (contract_address, storage_key) in &marginal_state_changes_keys.storage_keys {
+            if contract_address > &MAX_NON_COMPRESSED_CONTRACT_ADDRESS
+                && storage_key.0 >= MIN_VALUE_FOR_ALIAS_ALLOC
+            {
+                candidates.insert(*storage_key);
+            }
+        }
+
+        // Complete all fallible reads before mutating the tracker. Keep the
+        // counter in the same batch so a cold transaction pays lookup setup once.
+        let read_counter = self.output_builtin.alias_counter_was_zero.is_none();
+        let unchecked_candidates = candidates
+            .into_iter()
+            .filter(|candidate| !self.output_builtin.checked_alias_candidates.contains(candidate))
+            .collect::<Vec<_>>();
+        let mut storage_reads =
+            Vec::with_capacity(unchecked_candidates.len() + usize::from(read_counter));
+        if read_counter {
+            storage_reads.push((alias_contract_address, ALIAS_COUNTER_STORAGE_KEY));
+        }
+        storage_reads.extend(
+            unchecked_candidates.iter().map(|candidate| (alias_contract_address, *candidate)),
+        );
+        let storage_values = state_reader.get_storage_many(&storage_reads)?;
+        assert_eq!(
+            storage_values.len(),
+            storage_reads.len(),
+            "StateReader bulk result length mismatch"
+        );
+
+        let (counter_was_zero, candidate_values) = if read_counter {
+            (storage_values[0] == Felt::ZERO, &storage_values[1..])
+        } else {
+            (
+                self.output_builtin
+                    .alias_counter_was_zero
+                    .expect("Alias counter presence was checked above"),
+                storage_values.as_slice(),
+            )
+        };
+        let newly_checked = unchecked_candidates
+            .into_iter()
+            .zip(candidate_values)
+            .map(|(candidate, value)| (candidate, *value == Felt::ZERO))
+            .collect();
+
+        let update = OutputBuiltinUpdate {
+            previous_alias_counter_was_zero: self.output_builtin.alias_counter_was_zero,
+            newly_checked_aliases: newly_checked,
+            ..OutputBuiltinUpdate::default()
+        };
+        self.output_builtin.alias_counter_was_zero = Some(counter_was_zero);
+        for (candidate, needs_alias) in &update.newly_checked_aliases {
+            self.output_builtin.checked_alias_candidates.insert(*candidate);
+            if *needs_alias {
+                self.output_builtin.new_alias_keys.insert(*candidate);
+            }
+        }
+        Ok(update)
+    }
+
+    fn rollback_output_builtin(&mut self, update: OutputBuiltinUpdate) {
+        self.output_builtin.alias_counter_was_zero = update.previous_alias_counter_was_zero;
+        for (candidate, needs_alias) in update.newly_checked_aliases {
+            self.output_builtin.checked_alias_candidates.remove(&candidate);
+            if needs_alias {
+                self.output_builtin.new_alias_keys.remove(&candidate);
+            }
+        }
+        for entry in update.inserted_storage_updates {
+            self.output_builtin.storage_updates.remove(&entry);
+        }
+        for contract_address in update.inserted_modified_contracts {
+            self.output_builtin.modified_contracts.remove(&contract_address);
+        }
+        for class_hash in update.inserted_compiled_class_hashes {
+            self.output_builtin.compiled_class_hashes.remove(&class_hash);
+        }
+        for class_hash in update.inserted_migrated_class_hashes {
+            self.output_builtin.migrated_class_hashes.remove(&class_hash);
+        }
+    }
+
+    fn apply_output_builtin_accounting(
+        &mut self,
+        versioned_constants: &VersionedConstants,
+        marginal_state_changes_keys: &StateChangesKeys,
+        tx_weights: &TxWeights,
+        update: &mut OutputBuiltinUpdate,
+    ) {
+        for entry in &marginal_state_changes_keys.storage_keys {
+            if self.output_builtin.storage_updates.insert(*entry) {
+                update.inserted_storage_updates.push(*entry);
+            }
+        }
+        for contract_address in &marginal_state_changes_keys.modified_contracts {
+            if self.output_builtin.modified_contracts.insert(*contract_address) {
+                update.inserted_modified_contracts.push(*contract_address);
+            }
+        }
+        for class_hash in &marginal_state_changes_keys.compiled_class_hash_keys {
+            if self.output_builtin.compiled_class_hashes.insert(*class_hash) {
+                update.inserted_compiled_class_hashes.push(*class_hash);
+            }
+        }
+        for class_hash in tx_weights.class_hashes_to_migrate.keys() {
+            if self.output_builtin.migrated_class_hashes.insert(*class_hash) {
+                update.inserted_migrated_class_hashes.push(*class_hash);
+            }
+        }
+
+        if !versioned_constants.enable_stateful_compression {
+            return;
+        }
+
+        let alias_contract_address =
+            versioned_constants.os_constants.os_contract_addresses.alias_contract_address();
+        for (alias_key, needs_alias) in &update.newly_checked_aliases {
+            if *needs_alias {
+                let entry = (alias_contract_address, *alias_key);
+                if self.output_builtin.storage_updates.insert(entry) {
+                    update.inserted_storage_updates.push(entry);
+                }
+            }
+        }
+        let counter_changes = self.output_builtin.alias_counter_was_zero == Some(true)
+            || !self.output_builtin.new_alias_keys.is_empty();
+        if counter_changes {
+            let entry = (alias_contract_address, ALIAS_COUNTER_STORAGE_KEY);
+            if self.output_builtin.storage_updates.insert(entry) {
+                update.inserted_storage_updates.push(entry);
+            }
+            if self.output_builtin.modified_contracts.insert(alias_contract_address) {
+                update.inserted_modified_contracts.push(alias_contract_address);
+            }
+        }
+    }
+
+    fn output_builtin_prediction(
+        &self,
+        _versioned_constants: &VersionedConstants,
+    ) -> OutputBuiltinPrediction {
+        self.output_builtin_prediction_inner(None)
+    }
+
+    /// Returns the block-wide full SNOS output-cell prediction after all accepted work so far.
+    ///
+    /// This is exposed for end-to-end comparison with the real Starknet OS output vector; block
+    /// admission uses the same retained tracker through `try_update`.
+    pub fn predicted_snos_full_output_cells(&self) -> usize {
+        self.output_builtin_prediction_inner(None).cells
+    }
+
+    fn output_builtin_prediction_with_pending(
+        &self,
+        _versioned_constants: &VersionedConstants,
+        pending_tx_weights: &TxWeights,
+    ) -> OutputBuiltinPrediction {
+        self.output_builtin_prediction_inner(Some(pending_tx_weights))
+    }
+
+    fn output_builtin_prediction_inner(
+        &self,
+        pending_tx_weights: Option<&TxWeights>,
+    ) -> OutputBuiltinPrediction {
+        let message_segment_length = pending_tx_weights
+            .map(|pending| {
+                self.get_bouncer_weights()
+                    .checked_add(pending.bouncer_weights)
+                    .expect("Bouncer weights were already checked for overflow")
+                    .message_segment_length
+            })
+            .unwrap_or(self.get_bouncer_weights().message_segment_length);
+        let declared_class_updates = self.output_builtin.compiled_class_hashes.len()
+            + self.output_builtin.migrated_class_hashes.len();
+        let cells = snos_full_output_cells_from_counts(
+            message_segment_length,
+            self.output_builtin.modified_contracts.len(),
+            self.output_builtin.storage_updates.len(),
+            declared_class_updates,
+        )
+        .unwrap_or(usize::MAX);
+
+        OutputBuiltinPrediction {
+            cells,
+            message_segment_length,
+            modified_contracts: self.output_builtin.modified_contracts.len(),
+            storage_updates: self.output_builtin.storage_updates.len(),
+            declared_class_updates,
+            new_aliases: self.output_builtin.new_alias_keys.len(),
+        }
+    }
+
+    pub(crate) fn log_output_builtin_final(
+        &self,
+        block_number: BlockNumber,
+        state_diff: &crate::state::cached_state::StateMaps,
+        versioned_constants: &VersionedConstants,
+    ) {
+        if !log::log_enabled!(target: "output_builtin", log::Level::Info) {
+            return;
+        }
+
+        let prediction = self.output_builtin_prediction(versioned_constants);
+        let actual_shape_cells = snos_full_output_cells_from_counts(
+            self.get_bouncer_weights().message_segment_length,
+            state_diff.get_contract_addresses().len(),
+            state_diff.storage.len(),
+            state_diff.compiled_class_hashes.len(),
+        )
+        .unwrap_or(usize::MAX);
+        log::info!(
+            target: "output_builtin",
+            "event=block_prediction block_number={} predicted_full_output_cells={} \
+             finalized_state_diff_cells={} prediction_minus_finalized={} undercount={} \
+             exceeds_49000={} exceeds_configured_limit={} max_full_output_cells={} \
+             message_segment_length={} modified_contracts={} storage_updates={} \
+             declared_class_updates={} new_aliases={}",
+            block_number,
+            prediction.cells,
+            actual_shape_cells,
+            prediction.cells as i128 - actual_shape_cells as i128,
+            prediction.cells < actual_shape_cells,
+            prediction.cells > DEFAULT_MAX_SNOS_FULL_OUTPUT_CELLS,
+            prediction.cells > self.bouncer_config.max_snos_full_output_cells,
+            self.bouncer_config.max_snos_full_output_cells,
+            prediction.message_segment_length,
+            prediction.modified_contracts,
+            prediction.storage_updates,
+            prediction.declared_class_updates,
+            prediction.new_aliases,
+        );
     }
 
     fn update(

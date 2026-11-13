@@ -124,6 +124,7 @@ pub(crate) struct TestBuilderConfig {
     pub(crate) use_kzg_da: bool,
     pub(crate) full_output: bool,
     pub(crate) private_keys: Option<Vec<Felt>>,
+    pub(crate) max_snos_full_output_cells: Option<usize>,
 }
 
 pub(crate) struct FlowTestTx {
@@ -217,6 +218,7 @@ impl OsTestExpectedValues {
 
 pub(crate) struct OsTestOutput<S: StateReader> {
     pub(crate) runner_output: StarknetOsRunnerOutput,
+    pub(crate) predicted_snos_full_output_cells_per_block: Vec<usize>,
     pub(crate) private_keys: Option<Vec<Felt>>,
     pub(crate) decompressed_state_diff: StateDiff,
     pub(crate) final_state: S,
@@ -391,6 +393,7 @@ pub(crate) struct TestRunner<S: FlowTestState> {
     pub(crate) messages_to_l1: Vec<MessageToL1>,
     pub(crate) messages_to_l2: Vec<MessageToL2>,
     pub(crate) private_keys: Option<Vec<Felt>>,
+    pub(crate) predicted_snos_full_output_cells_per_block: Vec<usize>,
 }
 
 impl<S: FlowTestState> TestRunner<S> {
@@ -425,6 +428,8 @@ impl<S: FlowTestState> TestRunner<S> {
 
         OsTestOutput {
             runner_output: os_output,
+            predicted_snos_full_output_cells_per_block: self
+                .predicted_snos_full_output_cells_per_block,
             private_keys: self.private_keys,
             decompressed_state_diff,
             final_state,
@@ -444,6 +449,7 @@ pub(crate) struct TestBuilder<S: FlowTestState> {
     pub(crate) virtual_os: bool,
     pub(crate) messages_to_l1: Vec<MessageToL1>,
     pub(crate) messages_to_l2: Vec<MessageToL2>,
+    pub(crate) max_snos_full_output_cells: Option<usize>,
 
     per_block_txs: Vec<Vec<FlowTestTx>>,
 }
@@ -478,6 +484,7 @@ impl<S: FlowTestState> TestBuilder<S> {
             virtual_os,
             messages_to_l1: Vec::new(),
             messages_to_l2: Vec::new(),
+            max_snos_full_output_cells: config.max_snos_full_output_cells,
             per_block_txs: vec![vec![]],
         }
     }
@@ -842,13 +849,18 @@ impl<S: FlowTestState> TestBuilder<S> {
 
         let use_kzg_da = self.os_hints_config.use_kzg_da;
         let mut current_block_hash = BlockHash::default();
+        let mut predicted_snos_full_output_cells_per_block =
+            Vec::with_capacity(self.per_block_txs.len());
         for (block_index, block_txs_with_reason) in self.per_block_txs.into_iter().enumerate() {
-            let block_context = if self.virtual_os {
+            let mut block_context = if self.virtual_os {
                 // In virtual OS mode, the block context is the same as the base block context.
                 base_block_context.clone()
             } else {
                 BlockContext::from_base_context(&base_block_context, block_index, use_kzg_da)
             };
+            if let Some(max_output_cells) = self.max_snos_full_output_cells {
+                block_context.bouncer_config.max_snos_full_output_cells = max_output_cells;
+            }
 
             let (block_txs, revert_reasons, event_expectations_per_tx): (Vec<_>, Vec<_>, Vec<_>) =
                 block_txs_with_reason
@@ -864,13 +876,17 @@ impl<S: FlowTestState> TestBuilder<S> {
             // Clone the block info for later use.
             let block_info = block_context.block_info().clone();
             // Execute the transactions.
-            let ExecutionOutput { execution_outputs, mut final_state } =
-                execute_transactions::<CachedState<S>>(
-                    state,
-                    &block_txs,
-                    block_context,
-                    self.virtual_os,
-                );
+            let ExecutionOutput {
+                execution_outputs,
+                mut final_state,
+                predicted_snos_full_output_cells,
+            } = execute_transactions::<CachedState<S>>(
+                state,
+                &block_txs,
+                block_context,
+                self.virtual_os,
+            );
+            predicted_snos_full_output_cells_per_block.push(predicted_snos_full_output_cells);
             Self::verify_execution_outputs(
                 block_index,
                 &revert_reasons,
@@ -963,6 +979,7 @@ impl<S: FlowTestState> TestBuilder<S> {
             messages_to_l1: self.messages_to_l1,
             messages_to_l2: self.messages_to_l2,
             private_keys: self.private_keys,
+            predicted_snos_full_output_cells_per_block,
         }
     }
 

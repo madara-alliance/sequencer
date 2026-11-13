@@ -144,6 +144,11 @@
     "privacy": "Public",
     "value": 179
   },
+  "batcher_config.static_config.block_builder_config.bouncer_config.max_snos_full_output_cells": {
+    "description": "An upper bound on the predicted full SNOS output cells in a block.",
+    "privacy": "Public",
+    "value": 49000
+  },
   "batcher_config.static_config.block_builder_config.chain_info.chain_id": {
     "description": "The chain ID of the StarkNet chain.",
     "pointer_target": "chain_id",

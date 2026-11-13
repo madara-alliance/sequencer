@@ -6,6 +6,7 @@ use blockifier::blockifier::config::TransactionExecutorConfig;
 use blockifier::blockifier::transaction_executor::{
     TransactionExecutionOutput,
     TransactionExecutor,
+    TransactionExecutorResult,
 };
 use blockifier::context::BlockContext;
 use blockifier::state::cached_state::{CachedState, StateMaps};
@@ -37,6 +38,7 @@ use crate::tests::NON_TRIVIAL_RESOURCE_BOUNDS;
 pub(crate) struct ExecutionOutput<S: StateReader + Send> {
     pub(crate) execution_outputs: Vec<TransactionExecutionOutput>,
     pub(crate) final_state: CachedState<S>,
+    pub(crate) predicted_snos_full_output_cells: usize,
 }
 
 /// Executes the given transactions on the given state and block context with default execution
@@ -86,8 +88,33 @@ pub(crate) fn execute_transactions<S: StateReader + Send>(
         executor.finalize().expect("Failed to finalize block.");
     }
 
+    let predicted_snos_full_output_cells =
+        executor.bouncer.lock().unwrap().predicted_snos_full_output_cells();
     let final_state = executor.block_state.unwrap();
-    ExecutionOutput { execution_outputs, final_state }
+    ExecutionOutput { execution_outputs, final_state, predicted_snos_full_output_cells }
+}
+
+/// Executes a transaction batch using Blockifier's concurrent admission path and retains errors so
+/// tests can verify that rejected work is rolled back while later work still executes.
+pub(crate) fn execute_transactions_concurrently<S: StateReader + Send + Sync + 'static>(
+    initial_state: S,
+    txs: &[Transaction],
+    block_context: BlockContext,
+) -> (Vec<TransactionExecutorResult<TransactionExecutionOutput>>, CachedState<S>, usize) {
+    let block_number_hash_pair =
+        maybe_dummy_block_hash_and_number(block_context.block_info().block_number);
+    let mut executor = TransactionExecutor::pre_process_and_create(
+        initial_state,
+        block_context,
+        block_number_hash_pair.map(|(number, hash)| BlockHashAndNumber { hash, number }),
+        TransactionExecutorConfig::create_for_testing(true),
+    )
+    .expect("Failed to create concurrent transaction executor.");
+    let execution_results = executor.execute_txs(txs, None);
+    executor.finalize().expect("Failed to finalize concurrent block.");
+    let predicted_snos_full_output_cells =
+        executor.bouncer.lock().unwrap().predicted_snos_full_output_cells();
+    (execution_results, executor.block_state.unwrap(), predicted_snos_full_output_cells)
 }
 
 pub(crate) fn create_cairo1_bootstrap_declare_tx(
