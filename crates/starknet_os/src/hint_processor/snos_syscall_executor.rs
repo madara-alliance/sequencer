@@ -198,15 +198,16 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
             let (keys, _) = read_keys(request.function_selector.0, &request.calldata.0)?;
             let root = request.calldata.0[0];
             // Zero-default batches authenticate every requested key, including absent keys.
-            let mut required = std::collections::BTreeMap::new();
-            for key in keys {
-                let witness = syscall_handler
-                    .committed_data_witness(root, *key)
-                    .cloned()
-                    .ok_or_else(|| invalid("Committed-data witness unavailable"))?;
-                required.insert(*key, witness);
-            }
-            let witnesses = required.into_values().collect();
+            let unique: std::collections::BTreeSet<_> = keys.iter().copied().collect();
+            let witnesses = unique
+                .into_iter()
+                .map(|key| {
+                    syscall_handler
+                        .committed_data_witness(root, key)
+                        .cloned()
+                        .ok_or_else(|| invalid("Committed-data witness unavailable"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let witnesses = CommittedDataWitnesses::new(witnesses)
                 .map_err(|error| invalid(&error.to_string()))?;
             let block = syscall_handler
