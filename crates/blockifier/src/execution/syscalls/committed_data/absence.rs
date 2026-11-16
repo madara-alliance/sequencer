@@ -57,6 +57,9 @@ pub fn read_outcome(
         );
     }
     let root = calldata[0];
+    if let Some(provider) = &witnesses.provider {
+        provider.prefetch(root, keys).map_err(|error| availability(selector, error, failure))?;
+    }
     // Provider errors are not absence. Authenticate every absent route before accounting work.
     let mut absent = Vec::with_capacity(keys.len());
     for key in keys {

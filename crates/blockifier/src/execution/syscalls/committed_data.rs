@@ -261,6 +261,11 @@ pub struct CommittedDataWitnesses {
 /// Providers authenticate immutable datasets against the exact root before returning values.
 /// The OS never trusts this trait: it separately constrains the witness and syscall response.
 pub trait CommittedDataProvider: std::fmt::Debug + Send + Sync {
+    /// Allow remote providers to fetch a complete read before per-key absence classification.
+    /// This is only an I/O hint: value and proof authentication remain mandatory below.
+    fn prefetch(&self, _root: Felt, _keys: &[Felt]) -> Result<(), CommittedDataError> {
+        Ok(())
+    }
     /// Authenticated absence evidence. Providers without this capability fail closed.
     fn absence(
         &self,
