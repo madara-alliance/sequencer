@@ -74,6 +74,42 @@ mod TestContract {
         storage_write_syscall(domain_address, storage_address, value).unwrap_syscall();
     }
 
+    // POC adapter: the root comes from normal authenticated storage, not caller calldata.
+    // This is a test fixture. Production root publication needs its existing committed_data authorization.
+    #[external(v0)]
+    fn test_committed_data_read(self: @ContractState, asset: felt252, expected_price: felt252) {
+        let root = syscalls::storage_read_syscall(0, 45.try_into().unwrap()).unwrap_syscall();
+        let price = syscalls::call_contract_syscall(
+            selector!("committed_data_v1").try_into().unwrap(),
+            selector!("get_value"), array![root, asset].span(),
+        ).unwrap_syscall();
+        assert(price.len() == 1, 'committed_data response length');
+        assert(*price.at(0) == expected_price, 'committed_data price mismatch');
+        syscalls::storage_write_syscall(0, 46.try_into().unwrap(), *price.at(0)).unwrap_syscall();
+    }
+
+    #[external(v0)]
+    fn test_committed_data_catch(self: @ContractState, root: felt252, keys: Span<felt252>, expect_error: bool, rounds: u32) {
+        let mut args = array![root, keys.len().into()];
+        for key in keys { args.append(*key); }
+        let mut round = 0;
+        while round < rounds {
+        let result = syscalls::call_contract_syscall(
+            selector!("committed_data_v1").try_into().unwrap(), selector!("get_values"), args.span(),
+        );
+        assert(result.is_err() == expect_error, 'expected call outcome');
+        round += 1;
+        };
+    }
+
+    #[external(v0)]
+    fn test_committed_data_catch_single(self: @ContractState, root: felt252, key: felt252) {
+        let result = syscalls::call_contract_syscall(
+            selector!("committed_data_v1").try_into().unwrap(), selector!("get_value"), array![root, key].span(),
+        );
+        assert(result.unwrap_syscall() == array![0].span(), 'expected default zero');
+    }
+
     // TODO(Dori): Delete this function, use `test` instead.
     #[external(v0)]
     fn test_increment(
@@ -521,6 +557,12 @@ mod TestContract {
     fn segment_arena_builtin(self: @ContractState) {
         let x = felt252_dict_new::<felt252>();
         x.squash();
+    }
+
+    // Exercise the same catching helper through the L1 transaction boundary.
+    #[l1_handler]
+    fn l1_committed_data_catch(self: @ContractState, from_address: felt252, root: felt252, keys: Span<felt252>) {
+        test_committed_data_catch(self, root, keys, false, 3);
     }
 
     #[l1_handler]
