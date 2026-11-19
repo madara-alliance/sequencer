@@ -543,13 +543,14 @@ async fn committed_data_batches_match_os_and_bound_resources() {
         actual += &profile;
         let mut calldata = vec![root, Felt::from(keys.len())];
         calldata.extend_from_slice(&keys);
+        let mut gas = u64::MAX;
         let (_, extra) = read_values_shared(
             true,
             &pricing_witnesses,
             &cache,
             selector_from_name("get_values").0,
             &calldata,
-            &mut u64::MAX,
+            &mut gas,
             &mut None,
         )
         .unwrap();

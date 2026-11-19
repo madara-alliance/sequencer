@@ -39,7 +39,6 @@ use crate::hints::hint_implementation::cairo1_revert::implementation::{
 };
 use crate::hints::hint_implementation::committed_data::{
     end_committed_data_finalization,
-    load_committed_data_batch,
     load_committed_data_deferred,
     load_committed_data_missing_index,
     load_committed_data_root_union,
