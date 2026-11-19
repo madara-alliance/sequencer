@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use apollo_starknet_os_program::test_programs::COMMITTED_DATA_TEST_BYTES;
 use blockifier::execution::syscalls::committed_data::{
+    batch_os_resources,
     branch,
     leaf,
     CommittedDataBatchProof,
@@ -10,10 +11,12 @@ use blockifier::execution::syscalls::committed_data::{
     CommittedDataSibling,
     CommittedDataWitness,
 };
+use blockifier::execution::syscalls::vm_syscall_utils::SyscallSelector;
 use blockifier::test_utils::dict_state_reader::DictStateReader;
+use blockifier::test_utils::get_const_syscall_resources;
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::types::layout_name::LayoutName;
-use cairo_vm::vm::runners::cairo_runner::CairoArg;
+use cairo_vm::vm::runners::cairo_runner::{CairoArg, ExecutionResources};
 use starknet_os::hint_processor::snos_hint_processor::SnosHintProcessor;
 use starknet_os::test_utils::cairo_runner::{
     initialize_cairo_runner,
@@ -23,7 +26,10 @@ use starknet_os::test_utils::cairo_runner::{
 };
 use starknet_types_core::felt::Felt;
 
-fn verify(root: Felt, proof: &CommittedDataBatchProof) -> Result<(), Box<dyn std::error::Error>> {
+fn verify(
+    root: Felt,
+    proof: &CommittedDataBatchProof,
+) -> Result<ExecutionResources, Box<dyn std::error::Error>> {
     let entrypoint = "__main__.verify_union";
     let (mut runner, program, _) = initialize_cairo_runner(
         &EntryPointRunnerConfig {
@@ -95,28 +101,40 @@ fn verify(root: Felt, proof: &CommittedDataBatchProof) -> Result<(), Box<dyn std
         None,
         &mut hints,
     )?;
-    Ok(())
+    Ok(runner.get_execution_resources()?)
 }
 
-#[test]
-fn union_verifier_accepts_repeated_hashes_as_opaque_siblings() {
-    let mut root = leaf(Felt::ZERO, Felt::ONE);
+/// Narrow paths exercise both opaque-child positions and cannot hide costs in a larger batch.
+#[rstest::rstest]
+fn union_verifier_accepts_repeated_hashes_as_opaque_siblings(
+    #[values(0, 1, 2, 19, 64, 128, 252)] height: u8,
+    #[values(Felt::ZERO, Felt::MAX)] key: Felt,
+) {
+    let mut root = leaf(key, Felt::ONE);
     let mut siblings = Vec::new();
-    for bit in 0..252_u8 {
+    for bit in 0..height {
         siblings.push(CommittedDataSibling { bit, hash: root });
         root = branch(bit, root, root);
     }
-    let witness = CommittedDataWitness {
-        root,
-        key: Felt::ZERO,
-        value: Felt::ONE,
-        siblings,
-        terminal_key: None,
-    };
-    let keys = [Felt::ZERO];
+    let witness =
+        CommittedDataWitness { root, key, value: Felt::ONE, siblings, terminal_key: None };
+    let keys = [key];
     let proof = CommittedDataBatchProof::new(root, &keys, |_| Ok(Some(witness.clone()))).unwrap();
-    assert_eq!(proof.branches, 252);
-    verify(root, &proof).unwrap();
+    assert_eq!(proof.branches, usize::from(height));
+    let actual = verify(root, &proof).unwrap();
+    // Restore the ordinary CallContract allowance credited by the surcharge schedule.
+    let bound = &get_const_syscall_resources(SyscallSelector::CallContract)
+        + &batch_os_resources(1, 1, usize::from(height));
+    let constants =
+        blockifier::blockifier_versioned_constants::VersionedConstants::create_for_testing();
+    let gas = &constants.os_constants.gas_costs;
+    let proving = blockifier::bouncer::BuiltinWeights::default().gas_costs;
+    for costs in [&gas.builtins, &proving] {
+        let actual_gas =
+            blockifier::utils::get_gas_cost_from_vm_resources(&actual, &gas.base, costs);
+        let bound_gas = blockifier::utils::get_gas_cost_from_vm_resources(&bound, &gas.base, costs);
+        assert!(actual_gas <= bound_gas, "actual={actual:?}, bound={bound:?}");
+    }
 }
 
 #[test]

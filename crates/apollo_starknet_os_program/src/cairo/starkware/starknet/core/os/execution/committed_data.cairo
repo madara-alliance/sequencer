@@ -197,13 +197,8 @@ func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
     let range_check_ptr = saved_range_check_ptr;
     let poseidon_ptr = saved_poseidon_ptr;
     local charge = step_charge + range_check_charge + poseidon_charge + absence_charge;
-    let gas_sufficient = is_le_felt(charge, remaining_gas);
-    // Match the transaction-level Blockifier rejection, even if the caller catches errors.
-    with_attr error_message("Insufficient gas for committed-data verification") {
-        assert gas_sufficient = 1;
-    }
-    assert_nn(remaining_gas - charge);
-    return (value=result_value, gas=remaining_gas - charge);
+    let (gas) = committed_data_charge(charge, remaining_gas);
+    return (value=result_value, gas=gas);
 }
 
 // The leaf key is already authenticated. Prove the requested key follows every branch of
@@ -570,6 +565,25 @@ func committed_data_claim_sum{range_check_ptr}(claims: CommittedDataClaim*, call
     return (count=count + rest);
 }
 
+// A present prefix consumes the outer CallContract allowance before the absent read.
+func committed_data_prefix{
+    range_check_ptr,
+    poseidon_ptr: PoseidonBuiltin*,
+    bitwise_ptr: BitwiseBuiltin*,
+    committed_data_cache: DictAccess*,
+}(root: felt, keys: felt*, count: felt, values: felt*, gas: felt) -> (gas: felt) {
+    if (count == 0) {
+        return (gas=gas);
+    }
+    let (gas) = committed_data_shared_dispatch(root, keys, count, values, gas);
+    let (gas) = committed_data_charge(
+        COMMITTED_DATA_CALL_CONTRACT_STEPS * STEP_SIERRA_GAS +
+        COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS * RANGE_CHECK_SIERRA_GAS,
+        gas,
+    );
+    return (gas=gas);
+}
+
 // Both branches return the same builtin pointers and remaining gas.
 func committed_data_dispatch{
     range_check_ptr,
@@ -589,36 +603,9 @@ func committed_data_dispatch{
         if (committed_data_missing_index == count) {
             return committed_data_shared_dispatch(root, keys, count, values, gas);
         }
-        local prefix_gas;
-        local saved_range_check_ptr;
-        local saved_poseidon_ptr: PoseidonBuiltin*;
-        local saved_bitwise_ptr: BitwiseBuiltin*;
-        local saved_cache: DictAccess*;
-        if (committed_data_missing_index == 0) {
-            assert prefix_gas = gas;
-            assert saved_range_check_ptr = range_check_ptr;
-            assert saved_poseidon_ptr = poseidon_ptr;
-            assert saved_bitwise_ptr = bitwise_ptr;
-            assert saved_cache = committed_data_cache;
-        } else {
-            let (next_gas) = committed_data_shared_dispatch(
-                root, keys, committed_data_missing_index, values, gas
-            );
-            let (adjusted_gas) = committed_data_charge(
-                COMMITTED_DATA_CALL_CONTRACT_STEPS * STEP_SIERRA_GAS +
-                COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS * RANGE_CHECK_SIERRA_GAS,
-                next_gas,
-            );
-            assert prefix_gas = adjusted_gas;
-            assert saved_range_check_ptr = range_check_ptr;
-            assert saved_poseidon_ptr = poseidon_ptr;
-            assert saved_bitwise_ptr = bitwise_ptr;
-            assert saved_cache = committed_data_cache;
-        }
-        let range_check_ptr = saved_range_check_ptr;
-        let poseidon_ptr = saved_poseidon_ptr;
-        let bitwise_ptr = saved_bitwise_ptr;
-        let committed_data_cache = saved_cache;
+        let (prefix_gas) = committed_data_prefix(
+            root, keys, committed_data_missing_index, values, gas
+        );
         let (value, next_gas) = committed_data_read_one(
             root, keys[committed_data_missing_index], prefix_gas
         );
