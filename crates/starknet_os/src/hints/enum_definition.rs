@@ -234,7 +234,7 @@ use crate::hints::hint_implementation::syscalls::{
     storage_read,
     storage_write,
 };
-use crate::hints::pythonic_hint_strings::builtin_selection::{SELECT_BUILTIN, SELECTED_BUILTINS};
+use crate::hints::pythonic_hint_strings::builtin_selection::{SELECTED_BUILTINS, SELECT_BUILTIN};
 use crate::hints::pythonic_hint_strings::deprecated_syscalls::{
     CALL_CONTRACT,
     DELEGATE_CALL,
