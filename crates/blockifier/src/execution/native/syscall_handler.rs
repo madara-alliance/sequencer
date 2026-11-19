@@ -863,6 +863,25 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
 
         Ok(())
     }
+
+    fn sha512_process_block(
+        &mut self,
+        _prev_state: &mut [u64; 8],
+        _current_block: &[u64; 16],
+        remaining_gas: &mut u64,
+    ) -> SyscallResult<()> {
+        // RC.9 exposes this callback, but this protocol version's VM and OS do not support it.
+        // Preserve the VM's invalid-selector failure instead of enabling a native-only syscall.
+        if self.unrecoverable_error.is_some() {
+            return Err(vec![]);
+        }
+        Err(self.handle_error(
+            remaining_gas,
+            SyscallExecutionError::InvalidSyscallSelector(Felt::from_bytes_be_slice(
+                b"Sha512ProcessBlock",
+            )),
+        ))
+    }
 }
 
 /// A wrapper around an elliptic curve point in affine coordinates (x,y) on a
@@ -998,6 +1017,56 @@ mod test {
     use cairo_native::starknet::U256;
 
     use crate::execution::native::syscall_handler::Secp256Point;
+
+    #[test]
+    fn sha512_remains_unsupported_in_native_and_vm() {
+        use super::*;
+        use crate::context::{BlockContext, TransactionContext};
+        use crate::execution::entry_point::{EntryPointRevertInfo, SierraGasRevertTracker};
+        use crate::state::cached_state::CachedState;
+        use crate::test_utils::dict_state_reader::DictStateReader;
+        use crate::transaction::objects::CurrentTransactionInfo;
+
+        let selector = Felt::from_bytes_be_slice(b"Sha512ProcessBlock");
+        assert!(SyscallSelector::try_from(selector).is_err());
+        let tx_context = TransactionContext {
+            block_context: Arc::new(BlockContext::create_for_testing()),
+            tx_info: TransactionInfo::Current(CurrentTransactionInfo::create_for_testing()),
+        };
+        let mut context = EntryPointExecutionContext::new(
+            Arc::new(tx_context),
+            ExecutionMode::Execute,
+            false,
+            SierraGasRevertTracker::new(GasAmount(1_000_000)),
+        );
+        context.revert_infos.0.push(EntryPointRevertInfo::new(
+            ContractAddress::default(),
+            ClassHash::default(),
+            0,
+            0,
+        ));
+        let mut state = CachedState::<DictStateReader>::default();
+        let mut handler = NativeSyscallHandler::new(
+            ExecutableCallEntryPoint::default(),
+            &mut state,
+            &mut context,
+        );
+        let mut remaining_gas = 1_000_000;
+        let mut hash_state = [7; 8];
+        for _ in 0..2 {
+            assert!(
+                (&mut handler)
+                    .sha512_process_block(&mut hash_state, &[0; 16], &mut remaining_gas,)
+                    .is_err()
+            );
+            assert_eq!(remaining_gas, 0);
+            assert_eq!(hash_state, [7; 8]);
+            assert!(matches!(
+                handler.unrecoverable_error,
+                Some(SyscallExecutionError::InvalidSyscallSelector(value)) if value == selector
+            ));
+        }
+    }
 
     #[test]
     fn infinity_test() {

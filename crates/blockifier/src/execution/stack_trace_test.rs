@@ -43,7 +43,10 @@ use crate::execution::stack_trace::{
     extract_trailing_cairo1_revert_trace,
     Cairo1RevertHeader,
     Cairo1RevertSummary,
+    ErrorStack,
+    ErrorStackSegment,
     MIN_CAIRO1_FRAME_LENGTH,
+    TRACE_EXTRA_CHARS_SLACK,
     TRACE_LENGTH_CAP,
 };
 use crate::execution::syscalls::hint_processor::ENTRYPOINT_FAILED_ERROR_FELT;
@@ -1078,5 +1081,39 @@ fn test_cairo1_stack_extraction_not_failure_fallback() {
         extract_trailing_cairo1_revert_trace(&successful_call, Cairo1RevertHeader::Execution),
         Cairo1RevertSummary { stack, last_retdata, .. }
         if stack.is_empty() && last_retdata == expected_retdata
+    );
+}
+
+/// `ErrorStack::Display` trims over-long traces by keeping a head slice (`[..TRACE_LENGTH_CAP /
+/// 2]`) and a tail slice (`[len - TRACE_LENGTH_CAP / 2..]`). Trace content includes
+/// contract/VM-controlled strings, so a multi-byte UTF-8 character straddling either cut point must
+/// not panic the formatter. Each case puts a 2-byte 'é' straddling exactly one of the two cut
+/// points.
+#[rstest]
+// Head cut is at byte `TRACE_LENGTH_CAP / 2`.
+#[case::head_boundary(TRACE_LENGTH_CAP / 2)]
+// Tail cut is at byte `total_len - TRACE_LENGTH_CAP / 2`.
+#[case::tail_boundary(3 * TRACE_LENGTH_CAP - TRACE_LENGTH_CAP / 2)]
+fn error_stack_display_handles_utf8_boundary(#[case] cut_point: usize) {
+    // Single frame of `total_len` bytes (well past the trim threshold) with a 2-byte 'é' starting
+    // one byte before `cut_point`, so the byte at `cut_point` is mid-character. On the buggy raw
+    // byte-slice implementation, slicing at `cut_point` panics.
+    let total_len = 3 * TRACE_LENGTH_CAP;
+    assert!(total_len > TRACE_LENGTH_CAP + TRACE_EXTRA_CHARS_SLACK);
+    let mut content = "a".repeat(cut_point - 1);
+    content.push('é');
+    content.push_str(&"b".repeat(total_len - cut_point - 1));
+    assert_eq!(content.len(), total_len);
+
+    let mut stack = ErrorStack::default();
+    stack.push(ErrorStackSegment::StringFrame(content));
+
+    // Must not panic, and must actually be trimmed (head + separator + tail).
+    let rendered = format!("{stack}");
+    assert!(rendered.contains("\n\n...\n\n"), "expected the trimmed trace to contain a separator");
+    assert!(
+        rendered.len() < TRACE_LENGTH_CAP + TRACE_EXTRA_CHARS_SLACK + 100,
+        "trimmed trace is unexpectedly long: {} bytes",
+        rendered.len()
     );
 }

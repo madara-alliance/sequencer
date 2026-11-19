@@ -96,12 +96,11 @@ use crate::utils::{
 };
 
 /// The STRK fee token address that was deployed when initializing the default initial state.
-/// The resulting address depends on the nonce of the deploying account - if extra init transactions
-/// are added to the initial state construction before the STRK fee token is deployed, the address
-/// must be updated.
+/// The resulting address depends on the deploying account's class hash and nonce. Recompiling that
+/// account with a new Cairo compiler or adding earlier init transactions changes this fixture.
 pub(crate) const EXPECTED_STRK_FEE_TOKEN_ADDRESS: Expect = expect![
     r#"
-    0x4ff17bf76a1c6cebb82601a43bcab4f9650aea543c44f28e8863f8b624e4b58
+    0x18bfdb8f0fddfcc46ce7822c567f7b0de2db0bcb4516843857e102d2c4d8f29
 "#
 ];
 const SEQUENCER_ADDRESS_FELT: Felt = Felt::from_hex_unchecked(TEST_SEQUENCER_ADDRESS);
@@ -662,12 +661,23 @@ impl<S: FlowTestState> TestBuilder<S> {
     }
 
     pub(crate) fn add_deploy_account_tx(&mut self, tx: DeployAccountTransaction) {
+        self.add_deploy_account_tx_with_events(tx, Vec::new());
+    }
+
+    /// Like `add_deploy_account_tx`, but registers `event_expectations` (in emission order) for the
+    /// constructor's events; the fee-transfer expectation is appended automatically last.
+    pub(crate) fn add_deploy_account_tx_with_events(
+        &mut self,
+        tx: DeployAccountTransaction,
+        mut event_expectations: Vec<EventPredicateExpectation>,
+    ) {
+        event_expectations.push(expect_fee_token_transfer_to_sequencer_event());
         self.last_block_txs_mut().push(FlowTestTx {
             tx: BlockifierTransaction::new_for_sequencing(ExecutableTransaction::Account(
                 AccountTransaction::DeployAccount(tx),
             )),
             expected_revert_reason: None,
-            event_expectations: vec![expect_fee_token_transfer_to_sequencer_event()],
+            event_expectations,
         });
     }
 
