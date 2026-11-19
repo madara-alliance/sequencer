@@ -1,17 +1,15 @@
-//! Canonical binary Patricia trie over full felt keys. Unary paths are implicit:
-//! each branch commits its critical bit, and each leaf commits its full key.
+//! Standard Starknet Poseidon Patricia commitments: value leaves, binary hashes,
+//! and explicit compressed edges. Keys are restricted to 251 bits; zero means absence.
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::{Poseidon, StarkHash};
 
 use super::CommittedDataError;
 
-/// A canonical felt has at most 252 bits. This bounds paths, not the dataset's key space.
-pub const COMMITTED_DATA_TREE_HEIGHT: usize = 252;
+/// Same key domain as the OS Patricia implementation.
+pub const COMMITTED_DATA_TREE_HEIGHT: usize = 251;
 /// Per-import allocation bound, independent of key width and total retained DB size.
 pub const MAX_COMMITTED_DATA_VALUES: usize = 524_288;
-const LEAF_DOMAIN: Felt = Felt::from_hex_unchecked("0x43445f4d50545f4c4541465f5631");
-const BRANCH_DOMAIN: Felt = Felt::from_hex_unchecked("0x43445f4d50545f4252414e43485f5631");
 
 /// Application-defined key and value. Neither has pricing semantics in the node.
 pub type CommittedDataEntry = (Felt, Felt);
@@ -25,7 +23,8 @@ pub struct CommittedDataSibling {
 }
 
 /// A branch in the compact persistent representation. IDs below the entry count are leaves;
-/// other IDs address branches in postorder. The last branch is the root.
+/// other IDs address binary nodes in postorder. Hashes are at bit+1 height;
+/// the root or a parent may wrap them in a standard compressed edge.
 #[derive(Clone, Copy, Debug)]
 pub struct CommittedDataBranch {
     pub bit: u8,
@@ -59,7 +58,7 @@ fn deserialize_siblings<'de, D: serde::Deserializer<'de>>(
     impl<'de> serde::de::Visitor<'de> for Path {
         type Value = Vec<CommittedDataSibling>;
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("at most 252 Patricia branches")
+            f.write_str("at most 251 Patricia branches")
         }
         fn visit_seq<A: serde::de::SeqAccess<'de>>(
             self,
@@ -78,14 +77,31 @@ fn deserialize_siblings<'de, D: serde::Deserializer<'de>>(
     d.deserialize_seq(Path)
 }
 
-/// Leaf commitment distinguishes stored zero from absence and binds the entire key.
-pub fn leaf(key: Felt, value: Felt) -> Felt {
-    Poseidon::hash_array(&[LEAF_DOMAIN, key, value])
+/// Standard Patricia leaves contain the value directly.
+pub fn leaf(_key: Felt, value: Felt) -> Felt {
+    value
 }
-/// Branch tags occupy a disjoint domain from leaves and bind the compressed path's critical bit.
-pub fn branch(bit: u8, left: Felt, right: Felt) -> Felt {
-    Poseidon::hash_array(&[BRANCH_DOMAIN + Felt::from(bit), left, right])
+/// Standard binary node. The level is represented by the path, not a hash domain.
+pub fn branch(_bit: u8, left: Felt, right: Felt) -> Felt {
+    Poseidon::hash(&left, &right)
 }
+
+pub fn valid_key(key: Felt) -> bool {
+    key.to_bytes_be()[0] < 8
+}
+
+fn edge(hash: Felt, key: Felt, bottom: usize, top: usize) -> (Felt, Option<Vec<Felt>>) {
+    if bottom == top || hash == Felt::ZERO {
+        return (hash, None);
+    }
+    let length = top - bottom;
+    let mut path = Felt::ZERO;
+    for bit in (bottom..top).rev() {
+        path = path * Felt::TWO + Felt::from(key_bit(key, bit as u8) as u8);
+    }
+    (Poseidon::hash(&hash, &path) + Felt::from(length), Some(vec![Felt::from(length), path, hash]))
+}
+
 /// Tests a least-significant-bit-numbered position in a canonical felt.
 pub fn key_bit(key: Felt, bit: u8) -> bool {
     let bytes = key.to_bytes_be();
@@ -93,36 +109,62 @@ pub fn key_bit(key: Felt, bit: u8) -> bool {
 }
 
 impl CommittedDataWitness {
-    /// Authenticate key, value, branch order and hashes against the exact requested root.
-    pub fn verify(&self) -> bool {
-        let mut previous = None;
+    pub fn read_value(&self) -> Felt {
+        if self.terminal_key.is_some() { Felt::ZERO } else { self.value }
+    }
+
+    /// Expand the compact transport proof into the standard OS node preimages.
+    /// No leaf hash or custom node tag is introduced.
+    pub fn facts(&self) -> Option<std::collections::HashMap<Felt, Vec<Felt>>> {
         let terminal = self.terminal_key.unwrap_or(self.key);
-        if self.terminal_key == Some(self.key) {
-            return false;
+        if !valid_key(self.key) || !valid_key(terminal) || self.terminal_key == Some(self.key) {
+            return None;
         }
-        let mut node = leaf(terminal, self.value);
+        if self.value == Felt::ZERO {
+            return (self.root == Felt::ZERO
+                && self.siblings.is_empty()
+                && self.terminal_key.is_none())
+            .then(std::collections::HashMap::new);
+        }
+        let mut facts = std::collections::HashMap::new();
+        let mut node = self.value;
+        let mut height = 0;
         for step in &self.siblings {
-            if usize::from(step.bit) >= COMMITTED_DATA_TREE_HEIGHT
-                || previous.is_some_and(|bit| step.bit <= bit)
+            let bit = usize::from(step.bit);
+            if bit < height
+                || bit >= COMMITTED_DATA_TREE_HEIGHT
+                || step.hash == Felt::ZERO
+                || key_bit(self.key, step.bit) != key_bit(terminal, step.bit)
             {
-                return false;
+                return None;
             }
-            let direction = key_bit(self.key, step.bit);
-            if self.terminal_key.is_some() && direction != key_bit(terminal, step.bit) {
-                return false;
+            let (extended, preimage) = edge(node, terminal, height, bit);
+            if let Some(preimage) = preimage {
+                facts.insert(extended, preimage);
             }
-            node = if direction {
-                branch(step.bit, step.hash, node)
+            let (left, right) = if key_bit(terminal, step.bit) {
+                (step.hash, extended)
             } else {
-                branch(step.bit, node, step.hash)
+                (extended, step.hash)
             };
-            previous = Some(step.bit);
+            node = branch(step.bit, left, right);
+            facts.insert(node, vec![left, right]);
+            height = bit + 1;
         }
-        node == self.root
+        let (root, preimage) = edge(node, terminal, height, COMMITTED_DATA_TREE_HEIGHT);
+        if let Some(preimage) = preimage {
+            facts.insert(root, preimage);
+        }
+        (root == self.root).then_some(facts)
+    }
+
+    pub fn verify(&self) -> bool {
+        self.facts().is_some()
     }
 }
 
-/// Sorted immutable entries plus exactly N-1 compressed branches; no sparse empty nodes.
+/// Sorted nonzero entries and compact binary nodes. Edge commitments are derived
+/// from child heights and key prefixes, using the standard Starknet encoding.
 #[derive(Debug)]
 pub struct CommittedDataSet {
     entries: Vec<CommittedDataEntry>,
@@ -132,15 +174,25 @@ pub struct CommittedDataSet {
 impl CommittedDataSet {
     /// Sorts keys and rejects duplicates. Input order never changes the root.
     pub fn new(mut entries: Vec<CommittedDataEntry>) -> Result<Self, CommittedDataError> {
-        if entries.is_empty() || entries.len() > MAX_COMMITTED_DATA_VALUES {
+        if entries.len() > MAX_COMMITTED_DATA_VALUES {
             return Err(CommittedDataError::InvalidLength);
+        }
+        if entries.iter().any(|(key, _)| !valid_key(*key)) {
+            return Err(CommittedDataError::InvalidWitness);
         }
         entries.sort_unstable_by_key(|entry| entry.0);
         if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(CommittedDataError::DuplicateKey);
         }
-        let mut branches = Vec::with_capacity(entries.len() - 1);
-        let (_, root) = build(&entries, 0, entries.len() as u32, &mut branches)?;
+        entries.retain(|(_, value)| *value != Felt::ZERO);
+        let mut branches = Vec::with_capacity(entries.len().saturating_sub(1));
+        let root = if entries.is_empty() {
+            Felt::ZERO
+        } else {
+            let (_, hash) = build(&entries, 0, entries.len() as u32, &mut branches)?;
+            let height = branches.last().map_or(0, |node| usize::from(node.bit) + 1);
+            edge(hash, entries[0].0, height, COMMITTED_DATA_TREE_HEIGHT).0
+        };
         Ok(Self { entries, branches, root })
     }
     pub fn root(&self) -> Felt {
@@ -155,6 +207,12 @@ impl CommittedDataSet {
     /// Hot execution needs the value and charged path length, without allocating or hashing a
     /// proof.
     pub fn value_and_depth(&self, key: Felt) -> Option<(Felt, usize)> {
+        if !valid_key(key) {
+            return None;
+        }
+        if self.entries.is_empty() {
+            return Some((Felt::ZERO, 0));
+        }
         let count = self.entries.len();
         let mut id = count + self.branches.len() - 1;
         let mut depth = 0;
@@ -166,8 +224,12 @@ impl CommittedDataSet {
         let (stored_key, value) = self.entries[id];
         (stored_key == key).then_some((value, depth))
     }
-    /// Fetch membership only; a missing key must never be converted into a zero value.
+    /// Fetch nonzero membership, or a zero proof for an entirely empty tree.
+    /// Other missing keys use lookup_witness to authenticate their terminal route.
     pub fn witness(&self, key: Felt) -> Option<CommittedDataWitness> {
+        if !valid_key(key) {
+            return None;
+        }
         let proof = self.lookup_witness(key);
         proof.terminal_key.is_none().then_some(proof)
     }
@@ -175,6 +237,15 @@ impl CommittedDataSet {
     /// Follow the requested route even when its leaf is absent. The terminal leaf and siblings
     /// authenticate either membership or non-membership without changing a stored commitment.
     pub fn lookup_witness(&self, key: Felt) -> CommittedDataWitness {
+        if self.entries.is_empty() {
+            return CommittedDataWitness {
+                root: self.root,
+                key,
+                value: Felt::ZERO,
+                terminal_key: None,
+                siblings: vec![],
+            };
+        }
         let count = self.entries.len();
         let mut id = (count + self.branches.len() - 1) as u32;
         let mut siblings = Vec::new();
@@ -191,6 +262,18 @@ impl CommittedDataSet {
             } else {
                 self.branches[sibling as usize - count].hash
             };
+            let sibling_height = if (sibling as usize) < count {
+                0
+            } else {
+                usize::from(self.branches[sibling as usize - count].bit) + 1
+            };
+            // Recover one descendant key to encode the sibling's compressed edge.
+            let mut terminal_id = sibling as usize;
+            while terminal_id >= count {
+                terminal_id = self.branches[terminal_id - count].left as usize;
+            }
+            let hash =
+                edge(hash, self.entries[terminal_id].0, sibling_height, usize::from(node.bit)).0;
             siblings.push(CommittedDataSibling { bit: node.bit, hash });
             id = child;
         }
@@ -230,6 +313,10 @@ fn build(
     let split = entries.partition_point(|entry| !key_bit(entry.0, bit));
     let (left, left_hash) = build(&entries[..split], offset, count, branches)?;
     let (right, right_hash) = build(&entries[split..], offset + split as u32, count, branches)?;
+    let child_height =
+        |id: u32| if id < count { 0 } else { usize::from(branches[(id - count) as usize].bit) + 1 };
+    let left_hash = edge(left_hash, entries[0].0, child_height(left), usize::from(bit)).0;
+    let right_hash = edge(right_hash, entries[split].0, child_height(right), usize::from(bit)).0;
     let hash = branch(bit, left_hash, right_hash);
     let id = count + branches.len() as u32;
     branches.push(CommittedDataBranch { bit, left, right, hash });
@@ -239,105 +326,95 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Exhaust every query in a small keyspace, including zeros, sparse routes and singleton roots.
     #[test]
-    fn absence_authenticates_the_terminal_route_without_changing_roots() {
-        for keys in [vec![0], vec![1, 7], vec![0, 1, 5, 31]] {
-            let tree = CommittedDataSet::new(
-                keys.iter().map(|key| (Felt::from(*key), Felt::ZERO)).collect(),
-            )
-            .unwrap();
-            for query in 0..64 {
-                let proof = tree.lookup_witness(Felt::from(query));
-                assert!(proof.verify());
-                assert_eq!(proof.terminal_key.is_none(), keys.contains(&query));
-                let mut corrupted = proof.clone();
-                corrupted.value += Felt::ONE;
-                assert!(!corrupted.verify());
-                corrupted = proof.clone();
-                corrupted.root += Felt::ONE;
-                assert!(!corrupted.verify());
-                if proof.terminal_key.is_some() {
-                    let mut membership = proof.clone();
-                    membership.key = proof.terminal_key.unwrap();
-                    membership.terminal_key = None;
-                    assert!(membership.verify());
-                    assert_eq!(tree.witness(membership.key), Some(membership));
-                }
+    fn standard_patricia_matches_independent_cairo_vectors() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../../scripts/committed_data_patricia_vectors.json"
+        ))
+        .unwrap();
+        let mut exported = Vec::new();
+        for vector in vectors.as_array().unwrap() {
+            let felt =
+                |value: &serde_json::Value| Felt::from_dec_str(value.as_str().unwrap()).unwrap();
+            let entries = vector["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pair| (felt(&pair[0]), felt(&pair[1])))
+                .collect();
+            let tree = CommittedDataSet::new(entries).unwrap();
+            assert_eq!(tree.root(), felt(&vector["root"]));
+            let keys: Vec<_> = vector["keys"].as_array().unwrap().iter().map(felt).collect();
+            let proof = super::super::CommittedDataBatchProof::from_dataset(&tree, &keys).unwrap();
+            let facts: Vec<_> = proof
+                .facts
+                .into_iter()
+                .map(|(hash, preimage)| {
+                    (hash.to_string(), preimage.iter().map(ToString::to_string).collect::<Vec<_>>())
+                })
+                .collect();
+            exported
+                .push(serde_json::json!({"root":tree.root().to_string(), "keys":vector["keys"],
+                "entries":vector["entries"], "facts":facts}));
+            for key in vector["keys"].as_array().unwrap().iter().map(felt) {
+                let proof = tree.lookup_witness(key);
+                assert!(proof.verify(), "key {key}");
+                let mut bad = proof.clone();
+                bad.root += Felt::ONE;
+                assert!(!bad.verify());
+                let mut bad = proof.clone();
+                bad.value += Felt::ONE;
+                assert!(!bad.verify());
             }
         }
-        let tree =
-            CommittedDataSet::new(vec![(Felt::ZERO, Felt::ONE), (Felt::MAX, Felt::ZERO)]).unwrap();
-        let mut wrong_route = tree.lookup_witness(Felt::ONE);
-        assert!(wrong_route.verify());
-        wrong_route.key = Felt::MAX;
-        assert!(!wrong_route.verify());
-        let mut redundant = tree.lookup_witness(Felt::ZERO);
-        redundant.terminal_key = Some(Felt::ZERO);
-        assert!(!redundant.verify());
-        let encoded = serde_json::to_value(tree.witness(Felt::ZERO).unwrap()).unwrap();
-        assert!(encoded.get("terminal_key").is_none());
-    }
-
-    #[test]
-    fn sparse_keys_can_reach_the_full_felt_width() {
-        let mut entries = vec![(Felt::ZERO, Felt::ZERO)];
-        for bit in 0..COMMITTED_DATA_TREE_HEIGHT {
-            let mut bytes = [0_u8; 32];
-            bytes[31 - bit / 8] = 1 << (bit % 8);
-            entries.push((Felt::from_bytes_be(&bytes), Felt::from(bit)));
+        if let Some(path) = std::env::var_os("COMMITTED_DATA_PATRICIA_PROOFS") {
+            std::fs::write(path, serde_json::to_vec(&exported).unwrap()).unwrap();
         }
-        let tree = CommittedDataSet::new(entries).unwrap();
-        let proof = tree.witness(Felt::ZERO).unwrap();
-        assert_eq!(proof.siblings.len(), COMMITTED_DATA_TREE_HEIGHT);
-        assert!(proof.verify());
-        assert_eq!(
-            tree.value_and_depth(Felt::ZERO),
-            Some((Felt::ZERO, COMMITTED_DATA_TREE_HEIGHT))
-        );
-        let mut reordered = proof.clone();
-        reordered.siblings.swap(0, 1);
-        assert!(!reordered.verify());
-        let mut repeated = proof;
-        repeated.siblings[1].bit = repeated.siblings[0].bit;
-        assert!(!repeated.verify());
-        for &(key, value) in tree.entries() {
-            let proof = tree.witness(key).unwrap();
+    }
+    #[test]
+    fn zero_is_absence_and_invalid_keys_are_rejected() {
+        let tree = CommittedDataSet::new(vec![(Felt::TWO, Felt::from(100))]).unwrap();
+        let with_zero =
+            CommittedDataSet::new(vec![(Felt::TWO, Felt::from(100)), (Felt::ONE, Felt::ZERO)])
+                .unwrap();
+        assert_eq!(tree.root(), with_zero.root());
+        for query in 0..32 {
+            let proof = tree.lookup_witness(Felt::from(query));
             assert!(proof.verify());
-            assert_eq!(proof.value, value);
+            assert_eq!(proof.read_value(), if query == 2 { Felt::from(100) } else { Felt::ZERO });
         }
+        assert!(CommittedDataSet::new(vec![(Felt::TWO.pow(251_u32), Felt::ONE)]).is_err());
+        assert!(!tree.lookup_witness(Felt::MAX).verify());
+        assert!(CommittedDataSet::new(vec![(Felt::ONE, Felt::ONE); 2]).is_err());
+        let empty = CommittedDataSet::new(vec![]).unwrap();
+        assert_eq!(empty.root(), Felt::ZERO);
+        assert!(empty.lookup_witness(Felt::ONE).verify());
     }
     #[test]
-    fn full_key_membership_is_order_independent_and_tamper_evident() {
-        let entries: Vec<_> = [Felt::ZERO, Felt::ONE, Felt::from(65536_u32), Felt::MAX]
-            .into_iter()
-            .map(|key| (key, Felt::ZERO))
+    fn paths_are_order_independent_and_tamper_evident() {
+        let entries: Vec<_> = (0..251_u32)
+            .map(|bit| (Felt::TWO.pow(bit), Felt::from(bit + 1)))
+            .chain([(Felt::ZERO, Felt::ONE)])
             .collect();
         let tree = CommittedDataSet::new(entries.clone()).unwrap();
         assert_eq!(
             tree.root(),
             CommittedDataSet::new(entries.into_iter().rev().collect()).unwrap().root()
         );
-        for entry in tree.entries() {
-            let proof = tree.witness(entry.0).unwrap();
-            assert!(proof.verify());
-            assert_eq!(tree.value_and_depth(entry.0), Some((entry.1, proof.siblings.len())));
-            let mut bad = proof.clone();
-            bad.key += Felt::ONE;
-            assert!(!bad.verify());
-            let mut bad = proof.clone();
-            bad.value += Felt::ONE;
-            assert!(!bad.verify());
-            let mut bad = proof.clone();
-            bad.siblings[0].hash += Felt::ONE;
-            assert!(!bad.verify());
-            let mut bad = proof.clone();
-            bad.siblings[0].bit = 255;
-            assert!(!bad.verify());
-        }
-        assert!(tree.witness(Felt::TWO).is_none());
-        assert!(CommittedDataSet::new(vec![tree.entries()[0]; 2]).is_err());
-        let one = CommittedDataSet::new(vec![tree.entries()[0]]).unwrap();
-        assert!(one.witness(Felt::ZERO).unwrap().verify());
+        let proof = tree.witness(Felt::ZERO).unwrap();
+        assert_eq!(proof.siblings.len(), 251);
+        assert!(proof.verify());
+        let mut bad = proof.clone();
+        bad.siblings.swap(0, 1);
+        assert!(!bad.verify());
+        let mut bad = proof.clone();
+        bad.siblings[0].hash += Felt::ONE;
+        assert!(!bad.verify());
+        let mut bad = proof.clone();
+        bad.siblings[0].bit = 251;
+        assert!(!bad.verify());
+        let mut bad = proof;
+        bad.terminal_key = Some(Felt::ZERO);
+        assert!(!bad.verify());
     }
 }

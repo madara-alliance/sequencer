@@ -13,36 +13,15 @@ use super::*;
 #[derive(Clone, Debug, Default)]
 struct ReadSet {
     witnesses: HashSet<(Felt, Felt)>,
-    leaves: HashSet<(Felt, Felt)>,
-    branches: HashSet<(Felt, Felt)>,
 }
 
-/// One ordered block's charged leaves and expanded branch commitments.
+/// One ordered block's charged (root, key) reads, including authenticated absence.
 /// Clone shares state within a transaction; `fork` isolates speculative execution.
 #[derive(Clone, Debug, Default)]
 pub struct CommittedDataReadSet(Arc<Mutex<ReadSet>>);
 
 impl CommittedDataReadSet {
-    pub(super) fn check_witness_capacity(
-        &self,
-        root: Felt,
-        key: Felt,
-    ) -> Result<(), CommittedDataError> {
-        let seen = self.0.lock().expect("Committed-data read set poisoned");
-        if seen.witnesses.len() >= MAX_COMMITTED_DATA_WITNESSES
-            && !seen.witnesses.contains(&(root, key))
-        {
-            return Err(CommittedDataError::TooManyWitnesses);
-        }
-        Ok(())
-    }
-
-    // Absence uses the single-proof schedule and must not warm the membership union.
-    pub(super) fn record_absence(&self, root: Felt, key: Felt) {
-        self.0.lock().expect("Committed-data read set poisoned").witnesses.insert((root, key));
-    }
-    /// Witnesses required by admitted execution, including the independently charged single-key
-    /// ABI.
+    /// Witnesses required by admitted execution through either selector.
     pub fn witness_keys(&self) -> Vec<(Felt, Felt)> {
         let mut keys: Vec<_> = self
             .0
@@ -72,7 +51,7 @@ impl CommittedDataReadSet {
 }
 
 /// Per-call dictionary accesses, response copying and amortized dictionary finalization.
-/// Membership work is charged separately for newly observed leaves and branches.
+/// Standard Patricia work is charged separately for each newly observed key.
 pub fn shared_request_resources(count: usize) -> ExecutionResources {
     use cairo_vm::types::builtin_name::BuiltinName;
     ExecutionResources {
@@ -94,8 +73,26 @@ pub fn resources_gas(resources: &ExecutionResources) -> u64 {
         + count(BuiltinName::bitwise) * BITWISE_SIERRA_GAS
 }
 
-/// Authenticate first, price only new membership work, and warm only after payment succeeds.
-/// The legacy single-key selector retains its existing independently verified gas schedule.
+/// Prototype upper bound for a complete 251-bit path, including compressed edges.
+/// A tighter production tariff requires profiling the shared standard verifier.
+pub fn standard_path_resources(count: usize) -> ExecutionResources {
+    if count == 0 {
+        return ExecutionResources::default();
+    }
+    use cairo_vm::types::builtin_name::BuiltinName;
+    ExecutionResources {
+        n_steps: 252000 * count,
+        n_memory_holes: 0,
+        builtin_instance_counter: [
+            (BuiltinName::range_check, 25200 * count),
+            (BuiltinName::poseidon, 502 * count),
+        ]
+        .into(),
+    }
+}
+
+/// Both selectors and both lookup outcomes use the same block-local accounting.
+/// Cache entries become visible only after the complete request is available and paid.
 pub fn read_values_shared(
     enabled: bool,
     witnesses: &CommittedDataWitnesses,
@@ -105,105 +102,84 @@ pub fn read_values_shared(
     remaining_gas: &mut u64,
     failure: &mut Option<CommittedDataError>,
 ) -> Result<(Vec<Felt>, ExecutionResources), SyscallExecutorBaseError> {
-    let Ok((keys, batch)) = read_keys(selector, calldata) else {
-        return read_values(enabled, witnesses, selector, calldata, remaining_gas, failure);
-    };
-    // Preserve permission checks and authenticate every supplied value even on a warm hit.
-    let mut verification_gas = u64::MAX;
-    let (values, single_resources) =
-        read_values(enabled, witnesses, selector, calldata, &mut verification_gas, failure)?;
+    if !enabled {
+        return read_values(false, witnesses, selector, calldata, remaining_gas, failure);
+    }
+    let (keys, batch) = read_keys(selector, calldata)?;
     let root = calldata[0];
-    let mut seen = read_set.0.lock().expect("Committed-data read set poisoned");
-    let mut distinct = HashSet::new();
-    let cold: Vec<_> = keys
-        .iter()
-        .copied()
-        .filter(|key| !seen.leaves.contains(&(root, *key)) && distinct.insert(*key))
-        .collect();
-    // Count both ABIs without giving single reads the batch ABI's deferred-proof discount.
-    let requested: HashSet<_> = keys.iter().map(|key| (root, *key)).collect();
-    if seen.witnesses.len() + requested.difference(&seen.witnesses).count()
-        > MAX_COMMITTED_DATA_WITNESSES
-    {
-        let error = CommittedDataError::TooManyWitnesses;
-        let info = error.to_string();
+    let availability = |error: CommittedDataError, failure: &mut Option<CommittedDataError>| {
+        let result = SyscallExecutorBaseError::InvalidSyscallInput {
+            input: selector,
+            info: error.to_string(),
+        };
         failure.get_or_insert(error);
-        return Err(SyscallExecutorBaseError::InvalidSyscallInput { input: selector, info });
+        result
+    };
+    if let Some(provider) = &witnesses.provider {
+        provider.prefetch(root, keys).map_err(|e| availability(e, failure))?;
     }
-    if !batch {
-        charge_authenticated_read(
-            selector,
-            resources_gas(&single_resources),
-            remaining_gas,
-            failure,
-        )?;
-        seen.witnesses.extend(requested);
-        return Ok((values, single_resources));
+    let mut values = Vec::with_capacity(keys.len() + usize::from(batch));
+    if batch {
+        values.push(Felt::from(keys.len()));
     }
-    let mut resources = shared_request_resources(keys.len());
-    let mut new_branches = Vec::new();
-    if !cold.is_empty() {
-        let proof = witnesses.batch(root, &cold).map_err(|error| {
-            let result = SyscallExecutorBaseError::InvalidSyscallInput {
-                input: selector,
-                info: error.to_string(),
-            };
-            failure.get_or_insert(error);
-            result
-        })?;
-        new_branches.extend(
-            proof.branch_hashes.into_iter().filter(|hash| !seen.branches.contains(&(root, *hash))),
-        );
-        resources += &batch_os_resources(cold.len(), cold.len(), new_branches.len());
+    for &key in keys {
+        if !valid_key(key) {
+            return Err(availability(CommittedDataError::InvalidWitness, failure));
+        }
+        let value = match witnesses.value(root, key).map_err(|e| availability(e, failure))? {
+            Some((value, _)) => value,
+            None => {
+                witnesses.absence(root, key).map_err(|e| availability(e, failure))?.read_value()
+            }
+        };
+        values.push(value);
     }
+    let mut seen = read_set.0.lock().expect("Committed-data read set poisoned");
+    let requested: HashSet<_> = keys.iter().map(|key| (root, *key)).collect();
+    let cold = requested.difference(&seen.witnesses).count();
+    if seen.witnesses.len() + cold > MAX_COMMITTED_DATA_WITNESSES {
+        return Err(availability(CommittedDataError::TooManyWitnesses, failure));
+    }
+    let resources = &shared_request_resources(keys.len()) + &standard_path_resources(cold);
     charge_authenticated_read(selector, resources_gas(&resources), remaining_gas, failure)?;
     seen.witnesses.extend(requested);
-    seen.leaves.extend(cold.into_iter().map(|key| (root, key)));
-    seen.branches.extend(new_branches.into_iter().map(|hash| (root, hash)));
     Ok((values, resources))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Only paid, admitted work may warm a block; roots and block boundaries are independent.
     #[test]
-    fn shared_reads_charge_union_and_discard_rejected_forks() {
-        let tree = CommittedDataSet::new(
-            (0..16).map(|key| (Felt::from(key), Felt::from(key + 20))).collect(),
-        )
-        .unwrap();
-        let witnesses = CommittedDataWitnesses::new(
-            tree.entries().iter().map(|(key, _)| tree.witness(*key).unwrap()).collect(),
-        )
+    fn standard_reads_cache_both_outcomes_and_publish_only_paid_forks() {
+        let tree = CommittedDataSet::new(vec![(Felt::ONE, Felt::from(100))]).unwrap();
+        let witnesses = CommittedDataWitnesses::new(vec![
+            tree.lookup_witness(Felt::ZERO),
+            tree.lookup_witness(Felt::ONE),
+        ])
         .unwrap();
         let block = CommittedDataReadSet::default();
-        let selector = selector_from_name("get_values").0;
-        let call = |cache: &CommittedDataReadSet, keys: &[Felt], mut gas: u64| {
-            let mut calldata = vec![tree.root(), Felt::from(keys.len())];
-            calldata.extend_from_slice(keys);
-            read_values_shared(true, &witnesses, cache, selector, &calldata, &mut gas, &mut None)
+        let call = |read_set: &CommittedDataReadSet, mut gas| {
+            read_values_shared(
+                true,
+                &witnesses,
+                read_set,
+                selector_from_name("get_values").0,
+                &[tree.root(), Felt::THREE, Felt::ONE, Felt::ZERO, Felt::ONE],
+                &mut gas,
+                &mut None,
+            )
         };
-        let first_keys = [Felt::ZERO, Felt::ONE, Felt::ZERO];
-        let expected = &shared_request_resources(3) + &batch_os_resources(2, 2, 4);
-        let discarded = block.fork();
-        let (_, cold) = call(&discarded, &first_keys, u64::MAX).unwrap();
-        assert_eq!(cold, expected);
-        // A rejected admission doesn't publish its fork.
+        let rejected = block.fork();
+        assert!(call(&rejected, 0).is_err());
+        assert!(rejected.is_empty());
         let accepted = block.fork();
-        assert_eq!(call(&accepted, &first_keys, u64::MAX).unwrap().1, cold);
+        let (values, cold) = call(&accepted, u64::MAX).unwrap();
+        assert_eq!(values, vec![Felt::THREE, Felt::from(100), Felt::ZERO, Felt::from(100)]);
+        assert_eq!(cold, &shared_request_resources(3) + &standard_path_resources(2));
+        assert_eq!(call(&block, u64::MAX).unwrap().1, cold);
         block.replace_with(&accepted);
-        assert_eq!(call(&block, &first_keys, u64::MAX).unwrap().1, shared_request_resources(3));
-        // An underfunded cold read does not warm even the current transaction.
-        let next_keys = [Felt::TWO, Felt::THREE];
-        let before = block.fork();
-        assert!(call(&block, &next_keys, 0).is_err());
-        assert_eq!(
-            call(&block, &next_keys, u64::MAX).unwrap().1,
-            call(&before, &next_keys, u64::MAX).unwrap().1
-        );
-        assert_eq!(call(&CommittedDataReadSet::default(), &first_keys, u64::MAX).unwrap().1, cold);
+        assert_eq!(call(&block, u64::MAX).unwrap().1, shared_request_resources(3));
+        assert_eq!(block.witness_keys().len(), 2);
     }
 
     /// Both selectors consume the same block allowance; single reads keep their original gas.
@@ -287,43 +263,5 @@ mod tests {
             next.block_state.as_ref().unwrap().get_nonce_at(data.account_address).unwrap(),
             nonce
         );
-    }
-
-    #[test]
-    fn single_reads_share_witness_identity_without_warming_batch_proof_discounts() {
-        let tree = CommittedDataSet::new(vec![(Felt::ZERO, Felt::TWO)]).unwrap();
-        let witnesses =
-            CommittedDataWitnesses::new(vec![tree.witness(Felt::ZERO).unwrap()]).unwrap();
-        let seen = CommittedDataReadSet::default();
-        let single = selector_from_name("get_value").0;
-        for _ in 0..2 {
-            let mut gas = u64::MAX;
-            let (_, resources) = read_values_shared(
-                true,
-                &witnesses,
-                &seen,
-                single,
-                &[tree.root(), Felt::ZERO],
-                &mut gas,
-                &mut None,
-            )
-            .unwrap();
-            assert_eq!(u64::MAX - gas, read_gas(0));
-            assert_eq!(resources, read_os_resources(0));
-        }
-        assert_eq!(seen.witness_keys(), vec![(tree.root(), Felt::ZERO)]);
-        let mut gas = u64::MAX;
-        let (_, resources) = read_values_shared(
-            true,
-            &witnesses,
-            &seen,
-            selector_from_name("get_values").0,
-            &[tree.root(), Felt::TWO, Felt::ZERO, Felt::ZERO],
-            &mut gas,
-            &mut None,
-        )
-        .unwrap();
-        assert_eq!(resources, &shared_request_resources(2) + &batch_os_resources(1, 1, 0));
-        assert_eq!(seen.witness_keys().len(), 1);
     }
 }

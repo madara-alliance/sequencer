@@ -34,6 +34,7 @@ pub use sharing::{
     read_values_shared,
     resources_gas,
     shared_request_resources,
+    standard_path_resources,
 };
 mod batch;
 pub use batch::CommittedDataBatchProof;
@@ -41,13 +42,7 @@ mod mpt;
 pub use mpt::*;
 /// Bound on distinct witnesses required by one block, shared by both read ABIs.
 pub const MAX_COMMITTED_DATA_WITNESSES: usize = 65_536;
-// Conservative bounds include full-key bit extraction and two Poseidon permutations per node.
-// The OS flow test profiles short, long and high-bit paths against these same bounds.
-const READ_STEPS_BASE: usize = 600;
-const READ_STEPS_PER_LEVEL: usize = 300;
-const READ_RANGE_CHECKS_BASE: usize = 40;
-const READ_RANGE_CHECKS_PER_LEVEL: usize = 20;
-// The ordinary CallContract entry is already counted by the syscall accounting.
+// The ordinary call-contract resources are still supplied by syscall accounting.
 const CALL_CONTRACT_STEPS: usize = 903;
 const CALL_CONTRACT_RANGE_CHECKS: usize = 18;
 const STEP_SIERRA_GAS: u64 = 100;
@@ -55,35 +50,14 @@ const RANGE_CHECK_SIERRA_GAS: u64 = 70;
 const POSEIDON_SIERRA_GAS: u64 = 491;
 const BITWISE_SIERRA_GAS: u64 = 583;
 
-fn read_steps(height: usize) -> usize {
-    (READ_STEPS_BASE + READ_STEPS_PER_LEVEL * height).saturating_sub(CALL_CONTRACT_STEPS)
+/// Cold single read. The prototype tariff deliberately ignores path depth.
+pub fn read_os_resources(
+    _height: usize,
+) -> cairo_vm::vm::runners::cairo_runner::ExecutionResources {
+    &shared_request_resources(1) + &standard_path_resources(1)
 }
-
-fn read_range_checks(height: usize) -> usize {
-    READ_RANGE_CHECKS_BASE + READ_RANGE_CHECKS_PER_LEVEL * height - CALL_CONTRACT_RANGE_CHECKS
-}
-
-/// Extra OS resources beyond the already-counted CallContract entry.
-/// OS flow tests check short, high-bit and maximum-length paths against these bounds.
-pub fn read_os_resources(height: usize) -> cairo_vm::vm::runners::cairo_runner::ExecutionResources {
-    use cairo_vm::types::builtin_name::BuiltinName;
-    use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
-    assert!(height <= COMMITTED_DATA_TREE_HEIGHT);
-    ExecutionResources {
-        n_steps: read_steps(height),
-        n_memory_holes: 0,
-        builtin_instance_counter: std::collections::BTreeMap::from([
-            (BuiltinName::range_check, read_range_checks(height)),
-            (BuiltinName::poseidon, 2 * height + 2),
-        ]),
-    }
-}
-
 pub fn read_gas(height: usize) -> u64 {
-    assert!(height <= COMMITTED_DATA_TREE_HEIGHT);
-    read_steps(height) as u64 * STEP_SIERRA_GAS
-        + read_range_checks(height) as u64 * RANGE_CHECK_SIERRA_GAS
-        + (2 * height + 2) as u64 * POSEIDON_SIERRA_GAS
+    resources_gas(&read_os_resources(height))
 }
 
 /// Bounded batch ABI: [root, number_of_keys, key_0, ...], returning [count, value_0, ...].
@@ -106,42 +80,16 @@ pub fn read_keys(
     Err(SyscallExecutorBaseError::Revert { error_data: vec![INVALID_ARGUMENT_FELT] })
 }
 
-/// Extra resources for one minimal batch multiproof. `branches` counts the union of paths;
-/// `unique` counts authenticated leaves; `count` includes duplicate returned values. The ordinary
-/// CallContract allowance is credited once. Cairo independently constrains these work counts.
-/// The step allowance covers dispatch, every output (including duplicates), authenticated leaves
-/// and expanded branches separately. Full-OS tests include maximal paths and price every PIE
-/// memory hole against the remaining step allowance. Hash/bitwise counts are exact; range-check
-/// and step counts remain upper bounds, not an average-case discount.
+/// A cold batch reserves a complete standard path for each distinct key.
 pub fn batch_os_resources(
     count: usize,
     unique: usize,
-    branches: usize,
+    _branches: usize,
 ) -> cairo_vm::vm::runners::cairo_runner::ExecutionResources {
-    use cairo_vm::types::builtin_name::BuiltinName;
-    cairo_vm::vm::runners::cairo_runner::ExecutionResources {
-        n_steps: 1000 + 60 * count + 160 * unique + 160 * branches - CALL_CONTRACT_STEPS,
-        n_memory_holes: 0,
-        builtin_instance_counter: std::collections::BTreeMap::from([
-            (
-                BuiltinName::range_check,
-                30 + 4 * count + 12 * unique + 6 * branches - CALL_CONTRACT_RANGE_CHECKS,
-            ),
-            (BuiltinName::poseidon, 2 * (branches + unique)),
-            (BuiltinName::bitwise, 2 * unique),
-        ]),
-    }
+    &shared_request_resources(count) + &standard_path_resources(unique)
 }
-
-/// Sierra charge for the same bounded resources that admission reserves for the OS.
 pub fn batch_gas(count: usize, unique: usize, branches: usize) -> u64 {
-    use cairo_vm::types::builtin_name::BuiltinName;
-    let resources = batch_os_resources(count, unique, branches);
-    resources.n_steps as u64 * STEP_SIERRA_GAS
-        + resources.builtin_instance_counter[&BuiltinName::range_check] as u64
-            * RANGE_CHECK_SIERRA_GAS
-        + resources.builtin_instance_counter[&BuiltinName::poseidon] as u64 * POSEIDON_SIERRA_GAS
-        + resources.builtin_instance_counter[&BuiltinName::bitwise] as u64 * BITWISE_SIERRA_GAS
+    resources_gas(&batch_os_resources(count, unique, branches))
 }
 
 /// Shared VM/native dispatch. A batch fails as a whole; no partial values are returned.
@@ -168,26 +116,15 @@ pub fn read_values(
         )
         .map(|(value, height)| (vec![value], read_os_resources(height)));
     }
-    let (keys, batch) = read_keys(selector, calldata)?;
-    if !batch {
-        return read_value(true, witnesses, selector, calldata, remaining_gas, transaction_failure)
-            .map(|(value, height)| (vec![value], read_os_resources(height)));
-    }
-    let proof = witnesses.batch(calldata[0], keys).map_err(|error| {
-        let syscall_error = SyscallExecutorBaseError::InvalidSyscallInput {
-            input: selector,
-            info: error.to_string(),
-        };
-        transaction_failure.get_or_insert(error);
-        syscall_error
-    })?;
-    let unique = proof.unique_leaves();
-    let charge = batch_gas(keys.len(), unique, proof.branches);
-    charge_authenticated_read(selector, charge, remaining_gas, transaction_failure)?;
-    let mut values = Vec::with_capacity(keys.len() + 1);
-    values.push(Felt::from(keys.len()));
-    values.extend(proof.indices.iter().map(|index| proof.leaves[2 * index + 1]));
-    Ok((values, batch_os_resources(keys.len(), unique, proof.branches)))
+    read_values_shared(
+        true,
+        witnesses,
+        &CommittedDataReadSet::default(),
+        selector,
+        calldata,
+        remaining_gas,
+        transaction_failure,
+    )
 }
 
 /// Failed calls reserve the bounded worst case, including proof verification before out-of-gas.
@@ -311,6 +248,9 @@ impl CommittedDataWitnesses {
         root: Felt,
         index: Felt,
     ) -> Result<Option<(Felt, usize)>, CommittedDataError> {
+        if !valid_key(index) {
+            return Err(CommittedDataError::InvalidWitness);
+        }
         if let Some(witness) = self.get(root, index) {
             return Ok(witness
                 .terminal_key
@@ -459,20 +399,20 @@ mod tests {
     fn batch_reads_preserve_order_charge_resources_and_reject_partial_success() {
         use crate::utils::get_gas_cost_from_vm_resources;
         let tree =
-            CommittedDataSet::new(vec![(Felt::ZERO, Felt::MAX), (Felt::MAX, Felt::ZERO)]).unwrap();
+            CommittedDataSet::new(vec![(Felt::ZERO, Felt::MAX), (Felt::TWO, Felt::ONE)]).unwrap();
         let witnesses = CommittedDataWitnesses::new(vec![
             tree.witness(Felt::ZERO).unwrap(),
-            tree.witness(Felt::MAX).unwrap(),
+            tree.witness(Felt::TWO).unwrap(),
         ])
         .unwrap();
         let selector = selector_from_name("get_values").0;
-        let calldata = [tree.root(), Felt::from(3), Felt::MAX, Felt::ZERO, Felt::MAX];
+        let calldata = [tree.root(), Felt::from(3), Felt::TWO, Felt::ZERO, Felt::TWO];
         let charge = batch_gas(3, 2, 1);
         let mut gas = charge;
         let mut failure = None;
         let (values, resources) =
             read_values(true, &witnesses, selector, &calldata, &mut gas, &mut failure).unwrap();
-        assert_eq!(values, vec![Felt::from(3), Felt::ZERO, Felt::MAX, Felt::ZERO]);
+        assert_eq!(values, vec![Felt::from(3), Felt::ONE, Felt::MAX, Felt::ONE]);
         assert_eq!(gas, 0);
         let costs = &VersionedConstants::latest_constants().os_constants.gas_costs;
         assert_eq!(
@@ -554,9 +494,10 @@ mod tests {
     #[test]
     fn compact_tree_authenticates_every_occupied_key() {
         for count in [1_u32, 2, 3, 7, 8, 9, 31] {
-            let tree =
-                CommittedDataSet::new((0..count).map(|i| (Felt::from(i), Felt::from(i))).collect())
-                    .unwrap();
+            let tree = CommittedDataSet::new(
+                (0..count).map(|i| (Felt::from(i), Felt::from(i + 1))).collect(),
+            )
+            .unwrap();
             for index in 0..count {
                 assert!(tree.witness(Felt::from(index)).unwrap().verify());
             }
@@ -574,7 +515,7 @@ mod tests {
         assert_eq!(
             tree.root(),
             Felt::from_hex_unchecked(
-                "0x31fd3f11a98d38bff2d70429c78b0acca48029a9a3eade958f9950911b0b3e6"
+                "0x4adb9897b6d7f9ef766b9cf690ca2a891bf780062fed17c8df7194df0a2bed4"
             )
         );
         let mut bad = witness.clone();
@@ -641,7 +582,7 @@ mod tests {
             read_value(true, &cache, selector, &[tree.root(), Felt::ZERO], &mut gas, &mut failure)
                 .is_err()
         );
-        assert!(cache.value(tree.root(), Felt::MAX).unwrap().is_none());
+        assert!(cache.value(tree.root(), Felt::MAX).is_err());
         assert!(cache.value(tree.root(), Felt::from(MAX_COMMITTED_DATA_VALUES)).unwrap().is_none());
     }
 }
