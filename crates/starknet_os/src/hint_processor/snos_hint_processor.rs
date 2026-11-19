@@ -125,7 +125,7 @@ pub struct SnosHintProcessor<'a, S: StateReader> {
     committed_data_index: HashMap<(Option<u64>, Felt, Felt), usize>,
     pub(crate) committed_data_billing:
         HashMap<u64, blockifier::execution::syscalls::committed_data::CommittedDataReadSet>,
-    pub(crate) committed_root_branch_cache: HashSet<(Relocatable, Felt)>,
+    pub(crate) committed_data_commitment: Option<CommitmentInfo>,
     pub(crate) committed_finalization_start: Option<(usize, Relocatable, Relocatable, Relocatable)>,
     pub(crate) committed_finalizations:
         Vec<cairo_vm::vm::runners::cairo_runner::ExecutionResources>,
@@ -217,7 +217,7 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
             os_hints_config,
             committed_data_index,
             committed_data_billing: HashMap::new(),
-            committed_root_branch_cache: HashSet::new(),
+            committed_data_commitment: None,
             committed_finalization_start: None,
             committed_finalizations: Vec::new(),
             da_segment: None,
@@ -336,6 +336,10 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
     pub fn get_commitment_info(&self) -> Result<&CommitmentInfo, ExecutionHelperError> {
         let os_input = self.get_current_execution_helper()?.os_block_input;
         Ok(match self.commitment_type {
+            CommitmentType::CommittedData => self
+                .committed_data_commitment
+                .as_ref()
+                .expect("Committed-data preimages initialized before traversal"),
             CommitmentType::Class => &os_input.contract_class_commitment_info,
             CommitmentType::State => &os_input.contract_state_commitment_info,
             CommitmentType::Contract(contract_address) => self

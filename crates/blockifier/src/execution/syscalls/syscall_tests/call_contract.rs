@@ -582,8 +582,11 @@ fn committed_data_reads_require_permission_across_execution_engines(runnable: Ru
     use crate::state::state_api::State;
 
     let contract = FeatureContract::TestContract(CairoVersion::Cairo1(runnable));
-    let tree =
-        CommittedDataSet::new(vec![(Felt::ZERO, Felt::ZERO), (Felt::MAX, Felt::MAX)]).unwrap();
+    let tree = CommittedDataSet::new(vec![
+        (Felt::ZERO, Felt::ZERO),
+        (Felt::TWO.pow(251_u32) - Felt::ONE, Felt::MAX),
+    ])
+    .unwrap();
     for use_committed_data in [false, true] {
         for instance in 0..2 {
             let address = contract.get_instance_address(instance);
@@ -592,11 +595,14 @@ fn committed_data_reads_require_permission_across_execution_engines(runnable: Ru
             let mut context = BlockContext::create_for_testing();
             context.use_committed_data = use_committed_data;
             context.committed_data_witnesses = Arc::new(
-                CommittedDataWitnesses::new(vec![tree.witness(Felt::MAX).unwrap()]).unwrap(),
+                CommittedDataWitnesses::new(vec![
+                    tree.lookup_witness(Felt::TWO.pow(251_u32) - Felt::ONE),
+                ])
+                .unwrap(),
             );
             let call = CallEntryPoint {
                 entry_point_selector: selector_from_name("test_committed_data_read"),
-                calldata: calldata_macro![Felt::MAX, Felt::MAX],
+                calldata: calldata_macro![Felt::TWO.pow(251_u32) - Felt::ONE, Felt::MAX],
                 storage_address: address,
                 code_address: Some(address),
                 ..trivial_external_entry_point_new(contract)
@@ -757,15 +763,18 @@ fn committed_data_batch_dispatch_returns_values_in_order(runnable: RunnableCairo
         batch_os_resources,
     };
     let contract = FeatureContract::TestContract(CairoVersion::Cairo1(runnable));
-    let tree =
-        CommittedDataSet::new(vec![(Felt::ZERO, Felt::MAX), (Felt::MAX, Felt::ZERO)]).unwrap();
+    let tree = CommittedDataSet::new(vec![
+        (Felt::ZERO, Felt::MAX),
+        (Felt::TWO.pow(251_u32) - Felt::ONE, Felt::ZERO),
+    ])
+    .unwrap();
     let mut state = test_state(&ChainInfo::create_for_testing(), BALANCE, &[(contract, 1)]);
     let mut context = BlockContext::create_for_testing();
     context.use_committed_data = true;
     context.committed_data_witnesses = Arc::new(
         CommittedDataWitnesses::new(vec![
             tree.witness(Felt::ZERO).unwrap(),
-            tree.witness(Felt::MAX).unwrap(),
+            tree.lookup_witness(Felt::TWO.pow(251_u32) - Felt::ONE),
         ])
         .unwrap(),
     );
@@ -777,9 +786,9 @@ fn committed_data_batch_dispatch_returns_values_in_order(runnable: RunnableCairo
             Felt::from(5),
             tree.root(),
             Felt::from(3),
-            Felt::MAX,
+            Felt::TWO.pow(251_u32) - Felt::ONE,
             Felt::ZERO,
-            Felt::MAX
+            Felt::TWO.pow(251_u32) - Felt::ONE
         ],
         ..trivial_external_entry_point_new(contract)
     };
@@ -985,8 +994,11 @@ fn committed_data_absence_returns_paid_zero(
         resources_gas,
     };
     let contract = FeatureContract::TestContract(CairoVersion::Cairo1(runnable));
-    let tree =
-        CommittedDataSet::new(vec![(Felt::ZERO, Felt::ZERO), (Felt::MAX, Felt::ONE)]).unwrap();
+    let tree = CommittedDataSet::new(vec![
+        (Felt::ZERO, Felt::ZERO),
+        (Felt::TWO.pow(251_u32) - Felt::ONE, Felt::ONE),
+    ])
+    .unwrap();
     let witness = tree.lookup_witness(Felt::ONE);
     let minimum_gas = resources_gas(&absence_os_resources(witness.siblings.len()));
     let mut context = BlockContext::create_for_testing();

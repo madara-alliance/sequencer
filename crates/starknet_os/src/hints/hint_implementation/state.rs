@@ -12,6 +12,7 @@ use crate::hints::vars::{CairoStruct, Const, Ids};
 #[derive(Copy, Clone)]
 pub(crate) enum CommitmentType {
     Class,
+    CommittedData,
     State,
     Contract(ContractAddress),
 }
@@ -19,7 +20,7 @@ pub(crate) enum CommitmentType {
 impl CommitmentType {
     pub(crate) fn hash_builtin_struct(&self) -> CairoStruct {
         match self {
-            Self::Class => CairoStruct::SpongeHashBuiltin,
+            Self::Class | Self::CommittedData => CairoStruct::SpongeHashBuiltin,
             Self::State | Self::Contract(_) => CairoStruct::HashBuiltin,
         }
     }
