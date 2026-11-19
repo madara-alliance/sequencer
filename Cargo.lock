@@ -4707,8 +4707,7 @@ dependencies = [
 [[package]]
 name = "cairo-native"
 version = "0.9.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe61376fbdfb4c121e4d5ca997fa6eee18b4891d8fe22226f60fe27983467339"
+source = "git+https://github.com/madara-alliance/cairo_native?rev=57e745e1a7883ec07cd8e6d721cc02036a112a89#57e745e1a7883ec07cd8e6d721cc02036a112a89"
 dependencies = [
  "aquamarine",
  "ark-ec",
