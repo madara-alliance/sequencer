@@ -3,9 +3,9 @@
 Run inside the repository's Cairo 0 virtualenv. This keeps rejection tests independent of the
 Rust witness builder: malformed claims must fail in Cairo, even when a hint supplies them.
 """
-from pathlib import Path
-from collections import defaultdict
 import json
+from collections import defaultdict
+from pathlib import Path
 
 from starkware.cairo.common.poseidon_hash import poseidon_hash_many
 from starkware.cairo.lang.compiler.cairo_compile import compile_cairo
@@ -64,11 +64,13 @@ func main{output_ptr: felt*, range_check_ptr, bitwise_ptr: BitwiseBuiltin*, pose
     let committed_data_cache = start;
     local keys: felt*;
     %{ ids.keys = segments.gen_arg([0, 1, 0, 8]) %}
+    local initial_gas;
+    %{ ids.initial_gas = supplied_gas %}
     let (local values) = alloc();
     with committed_data_cache {
-        let (local gas1, _) = committed_data_shared_dispatch(ROOT, keys, 3, values, 10000000);
-        let (local gas2, _) = committed_data_shared_dispatch(ROOT, keys + 2, 2, values + 3, gas1);
-        let (local gas3, _) = committed_data_shared_dispatch(ROOT, keys, 3, values + 5, gas2);
+        let (local gas1) = committed_data_shared_dispatch(ROOT, keys, 3, values, initial_gas);
+        let (local gas2) = committed_data_shared_dispatch(ROOT, keys + 2, 2, values + 3, gas1);
+        let (local gas3) = committed_data_shared_dispatch(ROOT, keys, 3, values + 5, gas2);
     }
     committed_data_finalize(start, committed_data_cache);
     assert values[0] = 100;
@@ -77,6 +79,8 @@ func main{output_ptr: felt*, range_check_ptr, bitwise_ptr: BitwiseBuiltin*, pose
     assert values[3] = 100;
     assert values[4] = 108;
     assert values[5] = 100;
+    assert values[6] = 101;
+    assert values[7] = 100;
     assert [output_ptr] = gas3;
     let output_ptr = output_ptr + 1;
     return ();
@@ -99,6 +103,9 @@ func main{output_ptr: felt*, range_check_ptr, bitwise_ptr: BitwiseBuiltin*, pose
     results = []
     for attack in [
         None,
+        "exact_budget",
+        "zero_budget",
+        "short_budget",
         "value",
         "underclaim",
         "overclaim",
@@ -108,6 +115,11 @@ func main{output_ptr: felt*, range_check_ptr, bitwise_ptr: BitwiseBuiltin*, pose
         "opaque",
         "trailing",
     ]:
+        charged = 529138
+        supplied_gas = {"exact_budget": charged, "zero_budget": 0, "short_budget": charged - 1}.get(
+            attack, 10000000
+        )
+        valid = attack in (None, "exact_budget")
         seen = set()
         calls = 0
 
@@ -156,20 +168,24 @@ func main{output_ptr: felt*, range_check_ptr, bitwise_ptr: BitwiseBuiltin*, pose
         try:
             runner = get_main_runner(
                 program,
-                hint_locals={"deferred": deferred, "finalize": finalize},
+                hint_locals={
+                    "deferred": deferred,
+                    "finalize": finalize,
+                    "supplied_gas": supplied_gas,
+                },
                 layout="recursive_with_poseidon",
             )
         except VmException as error:
-            if attack is None:
+            if valid:
                 raise
             results.append({"case": attack, "rejected": True, "error": type(error).__name__})
         else:
-            assert attack is None, f"Cairo accepted malformed hint: {attack}"
+            assert valid, f"Cairo accepted malformed hint: {attack}"
             remaining = runner.vm_memory[runner.builtin_runners["output_builtin"].base]
             # Independent arithmetic for N=(3,2,3), newly read leaves=(2,1,0),
             # and newly expanded branches=(4,3,0). The commitment still hashes twice per node.
             charged = 529138
-            assert remaining == 10000000 - charged
+            assert remaining == supplied_gas - charged
             resources = runner.get_execution_resources()
             costs = {
                 "range_check_builtin": 70,
@@ -188,7 +204,7 @@ func main{output_ptr: felt*, range_check_ptr, bitwise_ptr: BitwiseBuiltin*, pose
             assert actual <= charged + 3 * (903 * 100 + 18 * 70)
             results.append(
                 {
-                    "case": "valid_shared_reads",
+                    "case": attack or "valid_shared_reads",
                     "extra_gas_charged": charged,
                     "complete_wrapper_gas_equivalent": actual,
                     "steps": resources.n_steps,
