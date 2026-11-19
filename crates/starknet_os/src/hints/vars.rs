@@ -136,7 +136,6 @@ define_string_enum! {
         (CommittedDataCount),
         (CommittedDataProof),
         (CommittedDataLeaves),
-        (CommittedDataIndices),
         (CommittedDataBranchCount),
         (CommittedDataLeafCount),
         (CommittedDataCacheStart),

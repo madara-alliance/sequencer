@@ -484,7 +484,6 @@ define_hint_enum!(
     (LoadCommittedDataRootUnion, load_committed_data_root_union),
     (StartCommittedDataFinalization, start_committed_data_finalization),
     (EndCommittedDataFinalization, end_committed_data_finalization),
-    (LoadCommittedDataBatch, load_committed_data_batch),
     (LoadUseCommittedData, load_use_committed_data),
     (LoadClass, load_class),
     (RelocateSha256Segment, relocate_sha256_segment),

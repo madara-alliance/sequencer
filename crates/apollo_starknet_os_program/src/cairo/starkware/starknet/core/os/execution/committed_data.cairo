@@ -145,7 +145,7 @@ from starkware.cairo.common.memcpy import memcpy
 // One constrained membership or non-membership read. Unpaid verification is never a provable syscall result.
 func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
     committed_data_root: felt, committed_data_key: felt, remaining_gas: felt
-) -> (value: felt, gas: felt, error: felt) {
+) -> (value: felt, gas: felt) {
     alloc_locals;
     local committed_data_value;
     local committed_data_terminal_key;
@@ -203,7 +203,7 @@ func committed_data_read_one{range_check_ptr, poseidon_ptr: PoseidonBuiltin*}(
         assert gas_sufficient = 1;
     }
     assert_nn(remaining_gas - charge);
-    return (value=result_value, gas=remaining_gas - charge, error=0);
+    return (value=result_value, gas=remaining_gas - charge);
 }
 
 // The leaf key is already authenticated. Prove the requested key follows every branch of
@@ -229,201 +229,6 @@ func committed_data_same_route{range_check_ptr}(
     return committed_data_same_route(
         high, low, terminal_high, terminal_low, siblings + 2, height - 1
     );
-}
-
-// A preorder multiproof expands only the union of requested membership paths. Counts are
-// consumed by constrained recursion, not trusted from the hint. Each leaf checks all ancestor
-// directions with two 128-bit masks, then hashes its full key/value exactly once.
-func committed_data_batch_node{
-    range_check_ptr,
-    poseidon_ptr: PoseidonBuiltin*,
-    bitwise_ptr: BitwiseBuiltin*,
-    proof: felt*,
-    branches_left,
-    leaves_left,
-}(
-    leaves: felt*,
-    leaf_count: felt,
-    parent_bit: felt,
-    mask_high: felt,
-    mask_low: felt,
-    path_high: felt,
-    path_low: felt,
-) -> (hash: felt, used: felt) {
-    alloc_locals;
-    if (proof[0] == 0) {
-        let hash = proof[1];
-        let proof = proof + 2;
-        return (hash=hash, used=0);
-    }
-    if (proof[0] == 1) {
-        assert_nn(leaves_left - 1);
-        let leaves_left = leaves_left - 1;
-        let index = proof[1];
-        assert_nn(index);
-        assert_nn(leaf_count - index - 1);
-        local key = leaves[2 * index];
-        local value = leaves[2 * index + 1];
-        let proof = proof + 2;
-        let (local high, local low) = split_felt(key);
-        let (actual_high) = bitwise_and(high, mask_high);
-        assert actual_high = path_high;
-        let (actual_low) = bitwise_and(low, mask_low);
-        assert actual_low = path_low;
-        let (hash) = committed_data_hash3(COMMITTED_DATA_LEAF_DOMAIN, key, value);
-        return (hash=hash, used=1);
-    }
-    assert proof[0] = 2;
-    local bit = proof[1];
-    assert_nn(bit);
-    assert_nn(parent_bit - bit - 1);
-    assert_nn(branches_left - 1);
-    let branches_left = branches_left - 1;
-    let proof = proof + 2;
-    let (local bit_high, local bit_low) = committed_data_mask_bit(bit);
-    let (local left, local left_used) = committed_data_batch_node(
-        leaves, leaf_count, bit, mask_high + bit_high, mask_low + bit_low, path_high, path_low
-    );
-    let (right, right_used) = committed_data_batch_node(
-        leaves,
-        leaf_count,
-        bit,
-        mask_high + bit_high,
-        mask_low + bit_low,
-        path_high + bit_high,
-        path_low + bit_low,
-    );
-    local used = left_used + right_used;
-    // Every expanded subtree must contain a requested leaf; opaque siblings stay opaque.
-    assert_nn(used - 1);
-    let (hash) = committed_data_hash3(COMMITTED_DATA_BRANCH_DOMAIN + bit, left, right);
-    return (hash=hash, used=used);
-}
-
-// Callers constrain bit to 0..251. The table is program data, not hint-controlled memory.
-func committed_data_mask_bit{range_check_ptr}(bit: felt) -> (high: felt, low: felt) {
-    let use_low = is_le(bit, 127);
-    if (use_low != 0) {
-        let (table) = get_label_location(committed_data_powers);
-        return (high=0, low=table[bit]);
-    }
-    let (table) = get_label_location(committed_data_powers);
-    return (high=table[bit - 128], low=0);
-}
-
-// Every requested key is checked against an authenticated leaf. Indices may repeat, so repeated
-// requests retain their order without repeating either leaf hashing or membership verification.
-func committed_data_batch_values{range_check_ptr}(
-    keys: felt*,
-    count: felt,
-    leaves: felt*,
-    leaf_count: felt,
-    indices: felt*,
-    values: felt*,
-    next_leaf: felt,
-) {
-    if (count == 0) {
-        assert next_leaf = leaf_count;
-        return ();
-    }
-    let index = indices[0];
-    assert_nn(index);
-    assert_nn(leaf_count - index - 1);
-    assert leaves[2 * index] = keys[0];
-    assert values[0] = leaves[2 * index + 1];
-    // First occurrences introduce consecutive leaf indices. Other occurrences may only reuse
-    // an already introduced leaf. The terminal equality proves every supplied leaf was requested.
-    if (index == next_leaf) {
-        return committed_data_batch_values(
-            keys + 1, count - 1, leaves, leaf_count, indices + 1, values + 1, next_leaf + 1
-        );
-    }
-    assert_nn(next_leaf - index - 1);
-    return committed_data_batch_values(
-        keys + 1, count - 1, leaves, leaf_count, indices + 1, values + 1, next_leaf
-    );
-}
-
-func verify_committed_data_batch{
-    range_check_ptr, poseidon_ptr: PoseidonBuiltin*, bitwise_ptr: BitwiseBuiltin*
-}(
-    root: felt,
-    keys: felt*,
-    count: felt,
-    proof: felt*,
-    leaves: felt*,
-    indices: felt*,
-    branch_count: felt,
-    leaf_count: felt,
-    values: felt*,
-) {
-    alloc_locals;
-    assert_nn(count - 1);
-    assert_nn(MAX_COMMITTED_DATA_READ_KEYS - count);
-    assert_nn(branch_count);
-    assert_nn(count * COMMITTED_DATA_TREE_HEIGHT - branch_count);
-    assert_nn(leaf_count - 1);
-    assert_nn(count - leaf_count);
-    let branches_left = branch_count;
-    let leaves_left = leaf_count;
-    with proof, branches_left, leaves_left {
-        let (hash, used) = committed_data_batch_node(
-            leaves, leaf_count, COMMITTED_DATA_TREE_HEIGHT, 0, 0, 0, 0
-        );
-        assert used = leaf_count;
-        assert hash = root;
-        assert branches_left = 0;
-        assert leaves_left = 0;
-    }
-    committed_data_batch_values(keys, count, leaves, leaf_count, indices, values, 0);
-    return ();
-}
-
-// Counts are verified before the gas comparison: the hint cannot invent a more expensive proof
-// to force an out-of-gas response. Insufficient budget rejects the proof instead of returning
-// a catchable error with unpaid verification work.
-func committed_data_read_batch{
-    range_check_ptr, poseidon_ptr: PoseidonBuiltin*, bitwise_ptr: BitwiseBuiltin*
-}(
-    committed_data_root: felt,
-    committed_data_keys: felt*,
-    committed_data_count: felt,
-    values: felt*,
-    remaining_gas: felt,
-) -> (gas: felt, error: felt) {
-    alloc_locals;
-    local committed_data_proof: felt*;
-    local committed_data_leaves: felt*;
-    local committed_data_indices: felt*;
-    local committed_data_branch_count;
-    local committed_data_leaf_count;
-    %{ LoadCommittedDataBatch %}
-    verify_committed_data_batch(
-        committed_data_root,
-        committed_data_keys,
-        committed_data_count,
-        committed_data_proof,
-        committed_data_leaves,
-        committed_data_indices,
-        committed_data_branch_count,
-        committed_data_leaf_count,
-        values,
-    );
-    // Match Blockifier batch_os_resources, including the output term for duplicate keys.
-    let steps = 1000 + 60 * committed_data_count + 160 * committed_data_leaf_count + 160 *
-        committed_data_branch_count - COMMITTED_DATA_CALL_CONTRACT_STEPS;
-    let range_checks = 30 + 4 * committed_data_count + 12 * committed_data_leaf_count + 6 *
-        committed_data_branch_count - COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS;
-    let poseidons = 2 * (committed_data_branch_count + committed_data_leaf_count);
-    let bitwise = 2 * committed_data_leaf_count;
-    local charge = steps * STEP_SIERRA_GAS + range_checks * RANGE_CHECK_SIERRA_GAS + poseidons *
-        POSEIDON_SIERRA_GAS + bitwise * BITWISE_SIERRA_GAS;
-    let gas_sufficient = is_le_felt(charge, remaining_gas);
-    with_attr error_message("Insufficient gas for committed-data verification") {
-        assert gas_sufficient = 1;
-    }
-    assert_nn(remaining_gas - charge);
-    return (gas=remaining_gas - charge, error=0);
 }
 
 // Record requests before reading values. Cold cells are hinted now and authenticated before
@@ -550,7 +355,7 @@ func committed_data_shared_dispatch{
     poseidon_ptr: PoseidonBuiltin*,
     bitwise_ptr: BitwiseBuiltin*,
     committed_data_cache: DictAccess*,
-}(root: felt, keys: felt*, count: felt, values: felt*, gas: felt) -> (gas: felt, error: felt) {
+}(root: felt, keys: felt*, count: felt, values: felt*, gas: felt) -> (gas: felt) {
     alloc_locals;
     local committed_data_root = root;
     local committed_data_keys: felt* = keys;
@@ -603,26 +408,24 @@ func committed_data_finish{
     poseidon_ptr: PoseidonBuiltin*,
     bitwise_ptr: BitwiseBuiltin*,
     committed_data_cache: DictAccess*,
-}(references: felt*, values: felt*, count: felt, charge: felt, gas: felt) -> (
-    gas: felt, error: felt
-) {
+}(references: felt*, values: felt*, count: felt, charge: felt, gas: felt) -> (gas: felt) {
     alloc_locals;
     local range_check_ptr = range_check_ptr;
     local poseidon_ptr: PoseidonBuiltin* = poseidon_ptr;
     local bitwise_ptr: BitwiseBuiltin* = bitwise_ptr;
     local committed_data_cache: DictAccess* = committed_data_cache;
     committed_data_copy_values(references, values, count);
-    let (gas, error) = committed_data_charge(charge, gas);
-    return (gas=gas, error=error);
+    let (gas) = committed_data_charge(charge, gas);
+    return (gas=gas);
 }
 
-func committed_data_charge{range_check_ptr}(charge: felt, gas: felt) -> (gas: felt, error: felt) {
+func committed_data_charge{range_check_ptr}(charge: felt, gas: felt) -> (gas: felt) {
     let sufficient = is_le_felt(charge, gas);
     with_attr error_message("Insufficient gas for committed-data verification") {
         assert sufficient = 1;
     }
     assert_nn(gas - charge);
-    return (gas=gas - charge, error=0);
+    return (gas=gas - charge);
 }
 
 // Authenticate the union in preorder. Opaque siblings are never expanded; every expanded
@@ -767,15 +570,13 @@ func committed_data_claim_sum{range_check_ptr}(claims: CommittedDataClaim*, call
     return (count=count + rest);
 }
 
-// Both branches return the same builtin pointers and gas/error shape.
+// Both branches return the same builtin pointers and remaining gas.
 func committed_data_dispatch{
     range_check_ptr,
     poseidon_ptr: PoseidonBuiltin*,
     bitwise_ptr: BitwiseBuiltin*,
     committed_data_cache: DictAccess*,
-}(root: felt, keys: felt*, count: felt, values: felt*, gas: felt, batch: felt) -> (
-    gas: felt, error: felt
-) {
+}(root: felt, keys: felt*, count: felt, values: felt*, gas: felt, batch: felt) -> (gas: felt) {
     alloc_locals;
     if (batch != 0) {
         local committed_data_root = root;
@@ -800,11 +601,10 @@ func committed_data_dispatch{
             assert saved_bitwise_ptr = bitwise_ptr;
             assert saved_cache = committed_data_cache;
         } else {
-            let (next_gas, prefix_error) = committed_data_shared_dispatch(
+            let (next_gas) = committed_data_shared_dispatch(
                 root, keys, committed_data_missing_index, values, gas
             );
-            assert prefix_error = 0;
-            let (adjusted_gas, _) = committed_data_charge(
+            let (adjusted_gas) = committed_data_charge(
                 COMMITTED_DATA_CALL_CONTRACT_STEPS * STEP_SIERRA_GAS +
                 COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS * RANGE_CHECK_SIERRA_GAS,
                 next_gas,
@@ -819,17 +619,16 @@ func committed_data_dispatch{
         let poseidon_ptr = saved_poseidon_ptr;
         let bitwise_ptr = saved_bitwise_ptr;
         let committed_data_cache = saved_cache;
-        let (value, next_gas, error) = committed_data_read_one(
+        let (value, next_gas) = committed_data_read_one(
             root, keys[committed_data_missing_index], prefix_gas
         );
-        assert error = 0;
         assert values[committed_data_missing_index] = value;
         let consumed = committed_data_missing_index + 1;
         if (consumed == count) {
-            return (gas=next_gas, error=0);
+            return (gas=next_gas);
         }
         // The suffix is another sub-read, not another outer CallContract allowance.
-        let (suffix_gas, _) = committed_data_charge(
+        let (suffix_gas) = committed_data_charge(
             COMMITTED_DATA_CALL_CONTRACT_STEPS * STEP_SIERRA_GAS +
             COMMITTED_DATA_CALL_CONTRACT_RANGE_CHECKS * RANGE_CHECK_SIERRA_GAS,
             next_gas,
@@ -838,9 +637,9 @@ func committed_data_dispatch{
             root, keys + consumed, count - consumed, values + consumed, suffix_gas, batch
         );
     }
-    let (value, gas, error) = committed_data_read_one(root, keys[0], gas);
+    let (value, gas) = committed_data_read_one(root, keys[0], gas);
     assert values[0] = value;
-    return (gas=gas, error=error);
+    return (gas=gas);
 }
 
 func execute_committed_data_call{
@@ -891,7 +690,7 @@ func execute_committed_data_call{
     let bitwise_ptr = selectable_builtins.bitwise;
     let committed_data_cache = outputs.committed_data_cache;
     with poseidon_ptr, bitwise_ptr, committed_data_cache {
-        let (local gas, local error) = committed_data_dispatch(
+        let (local gas) = committed_data_dispatch(
             request.calldata_start[0], keys, count, values, remaining_gas, batch
         );
     }
@@ -915,10 +714,6 @@ func execute_committed_data_call{
         ),
         non_selectable=builtin_ptrs.non_selectable,
     );
-    if (error != 0) {
-        committed_data_failure(gas, error);
-        return ();
-    }
     assert [cast(syscall_ptr, ResponseHeader*)] = ResponseHeader(gas=gas, failure_flag=0);
     let response = cast(syscall_ptr + ResponseHeader.SIZE, CallContractResponse*);
     assert response.retdata_end = response.retdata_start + count + batch;
