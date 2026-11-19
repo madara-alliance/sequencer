@@ -9,7 +9,7 @@ on:
 jobs:
   lock:
     name: 🔒 Lock closed issues and PRs
-    runs-on: namespace-profile-small-ubuntu-24-04-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: dessant/lock-threads@v2.0.3
         with:

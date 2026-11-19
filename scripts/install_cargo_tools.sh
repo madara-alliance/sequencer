@@ -38,9 +38,7 @@ function install_cargo_tool_if_needed() {
 }
 
 function install_cargo_tools() {
-    log_step "install_build_tools" "Installing cargo-insta..."
-    curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mitsuhiko/insta/releases/download/1.42.0/cargo-insta-installer.sh | sh
-    log_step "install_build_tools" "cargo-insta installed successfully"
+    install_cargo_tool_if_needed "cargo insta --version" "cargo-insta" "1.42.0"
 
     # Install sccache with rustc-wrapper disabled to avoid circular dependency
     # Using subshell ( ) so RUSTC_WRAPPER="" only affects this call and doesn't persist

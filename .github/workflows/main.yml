@@ -32,7 +32,7 @@ jobs:
           graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZER_TOKEN }}
 
   code_style:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     timeout-minutes: 30
@@ -84,7 +84,7 @@ jobs:
         run: cargo machete
 
   run-workspace-tests:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     timeout-minutes: 30
@@ -96,7 +96,7 @@ jobs:
       - run: cargo test -p workspace_tests
 
   run-tests:
-    runs-on: namespace-profile-xlarge-ubuntu-24-04-amd64
+    runs-on: blacksmith-32vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     timeout-minutes: 45
@@ -127,7 +127,7 @@ jobs:
           SEED: 0
 
   run-integration-tests:
-    runs-on: namespace-profile-large-ubuntu-24-04-amd64
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     timeout-minutes: 45
@@ -159,7 +159,7 @@ jobs:
 
   # TODO(dan): Once all cargo-deny issues are resolved, consider merging this into code_style job.
   cargo-deny:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     timeout-minutes: 10

@@ -44,9 +44,11 @@ jobs:
           graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZER_TOKEN }}
 
   blockifier_reexecution:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
+    env:
+      REEXECUTION_CREDENTIALS: ${{ secrets.SA_REEXECUTION_ARTIFACTS_READ_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/bootstrap
@@ -54,13 +56,23 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
       # Download the blockifier re-execution test data.
       - id: auth
+        if: env.REEXECUTION_CREDENTIALS != ''
         uses: "google-github-actions/auth@v2"
         with:
           credentials_json: ${{ secrets.SA_REEXECUTION_ARTIFACTS_READ_ACCESS_KEY }}
       - uses: "google-github-actions/setup-gcloud@v2"
+        if: env.REEXECUTION_CREDENTIALS != ''
       - run: echo "REEXECUTION_INPUT_FILES_PREFIX=$(cat ./crates/blockifier_reexecution/resources/offline_reexecution_files_prefix)" >> $GITHUB_ENV
+        if: env.REEXECUTION_CREDENTIALS != ''
       - run: gcloud storage cp -r gs://reexecution_artifacts/$REEXECUTION_INPUT_FILES_PREFIX/resources/* ./crates/blockifier_reexecution/resources/
+        if: env.REEXECUTION_CREDENTIALS != ''
       # Run blockifier re-execution tests.
       - run: cargo test --release -p blockifier_reexecution -- --include-ignored
+        if: env.REEXECUTION_CREDENTIALS != ''
+      - name: Run tests without private fixtures
+        if: env.REEXECUTION_CREDENTIALS == ''
+        run: |
+          cargo test --release -p blockifier_reexecution
+          echo "Ignored replay fixture tests require SA_REEXECUTION_ARTIFACTS_READ_ACCESS_KEY." >> "$GITHUB_STEP_SUMMARY"
       # Compile the rpc-tests, without running them.
       - run: cargo test --release -p blockifier_reexecution --features blockifier_regression_https_testing --no-run

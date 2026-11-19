@@ -20,6 +20,7 @@ env:
   pvc_storage_class_name: "premium-rwo"
   anvil_port: "8545"
   dockerfile_base_path: ./deployments/images/sequencer
+  CI_IMAGE_PREFIX: sequencer-ci
 
 permissions:
   contents: read
@@ -43,7 +44,7 @@ jobs:
           graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZER_TOKEN }}
 
   check-system-test-trigger:
-    runs-on: namespace-profile-small-ubuntu-24-04-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     outputs:
@@ -56,11 +57,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "pypy3.9"
-
-      - name: Set up pip dependency caching
-        uses: namespacelabs/nscloud-cache-action@v1
-        with:
-          cache: python
 
       - name: Install Python Dependencies
         run: pip install -r scripts/requirements.txt
@@ -82,11 +78,10 @@ jobs:
           echo "should_run=$should_run" >> $GITHUB_OUTPUT
 
   build_docker_images:
-    runs-on: namespace-profile-small-ubuntu-24-04-amd64
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     needs: check-system-test-trigger
     if: success() && needs.check-system-test-trigger.outputs.should_run == 'true'
     permissions:
-      id-token: write
       contents: read
     strategy:
       fail-fast: true
@@ -100,39 +95,33 @@ jobs:
             dockerfile: dummy_eth_to_strk_oracle.Dockerfile
     steps:
       - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Build ${{ matrix.svc }} image remotely
+      - name: Build ${{ matrix.svc }} image
         uses: docker/build-push-action@v6.18.0
         with:
           context: .
           file: ${{ env.dockerfile_base_path }}/${{ matrix.dockerfile }}
-          push: true
-          tags: ${{ env.NSC_CONTAINER_REGISTRY }}/${{ matrix.svc }}:${{ github.sha }}
+          push: false
+          tags: ${{ env.CI_IMAGE_PREFIX }}/${{ matrix.svc }}:${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/${{ matrix.svc }}.tar
+
+      - name: Save image for the system test
+        uses: actions/cache/save@v5
+        with:
+          key: hybrid-image-${{ github.run_id }}-${{ github.sha }}-${{ matrix.svc }}
+          path: ${{ runner.temp }}/${{ matrix.svc }}.tar
 
   system_test_hybrid:
     needs:
       - check-system-test-trigger
       - build_docker_images
-    runs-on: namespace-profile-large-ubuntu-24-04-amd64
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     if: success() && needs.check-system-test-trigger.outputs.should_run == 'true'
     timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Create registries.yaml for nscr.io
-        run: |
-          cat << EOF > registries.yaml
-          mirrors:
-            nscr.io:
-              endpoint:
-                - https://nscr.io
-          configs:
-            nscr.io:
-              auth:
-                username: token
-                password: $(cat $NSC_TOKEN_FILE | jq -r .bearer_token)
-          EOF
 
       - uses: ./.github/actions/bootstrap
         with:
@@ -152,7 +141,33 @@ jobs:
             --no-lb
             --wait
             --timeout 120s
-            --registry-config registries.yaml
+
+      - name: Restore Sequencer image
+        uses: actions/cache/restore@v5
+        with:
+          key: hybrid-image-${{ github.run_id }}-${{ github.sha }}-sequencer
+          path: ${{ runner.temp }}/sequencer.tar
+          fail-on-cache-miss: true
+      - name: Restore recorder image
+        uses: actions/cache/restore@v5
+        with:
+          key: hybrid-image-${{ github.run_id }}-${{ github.sha }}-dummy_recorder
+          path: ${{ runner.temp }}/dummy_recorder.tar
+          fail-on-cache-miss: true
+      - name: Restore oracle image
+        uses: actions/cache/restore@v5
+        with:
+          key: hybrid-image-${{ github.run_id }}-${{ github.sha }}-dummy_eth_to_strk_oracle
+          path: ${{ runner.temp }}/dummy_eth_to_strk_oracle.tar
+          fail-on-cache-miss: true
+      - name: Load images into the local cluster
+        env:
+          IMAGE_ARCHIVE_DIR: ${{ runner.temp }}
+        run: |
+          for service in sequencer dummy_recorder dummy_eth_to_strk_oracle; do
+            docker load --input "$IMAGE_ARCHIVE_DIR/$service.tar"
+            k3d image import "$CI_IMAGE_PREFIX/$service:$GITHUB_SHA" --cluster "$cluster_name"
+          done
 
       - name: Install crds
         working-directory: deployments/sequencer
@@ -207,7 +222,7 @@ jobs:
           echo "Deploying Dummy Recorder..."
           pipenv install
           cdk8s import
-          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.dummy_recorder_namespace }} --image ${{ env.NSC_CONTAINER_REGISTRY }}/dummy_recorder:${{ github.sha }}"
+          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.dummy_recorder_namespace }} --image ${{ env.CI_IMAGE_PREFIX }}/dummy_recorder:${{ github.sha }}"
           kubectl create namespace ${{ env.dummy_recorder_namespace }}
           kubectl apply -R -f ./dist
           echo "⏳ Waiting for Dummy Recorder to become ready..."
@@ -225,7 +240,7 @@ jobs:
           echo "Deploying Dummy Eth2Strk Oracle..."
           pipenv install
           cdk8s import
-          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.dummy_eth_to_strk_namespace }} --image ${{ env.NSC_CONTAINER_REGISTRY }}/dummy_eth_to_strk_oracle:${{ github.sha }}"
+          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.dummy_eth_to_strk_namespace }} --image ${{ env.CI_IMAGE_PREFIX }}/dummy_eth_to_strk_oracle:${{ github.sha }}"
           kubectl create namespace ${{ env.dummy_eth_to_strk_namespace }}
           kubectl apply -R -f ./dist
           echo "⏳ Waiting for Dummy Eth2Strk Oracle to become ready..."
@@ -290,7 +305,7 @@ jobs:
           pipenv install
           cdk8s import
           echo "Generating Kubernetes manifests using hybrid layout"
-          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.namespace }} -l ${{ env.layout }} -o ${{ env.overlay }} --image ${{ env.NSC_CONTAINER_REGISTRY }}/sequencer:${{ github.sha }}"
+          cdk8s synth --app "pipenv run python main.py --namespace ${{ env.namespace }} -l ${{ env.layout }} -o ${{ env.overlay }} --image ${{ env.CI_IMAGE_PREFIX }}/sequencer:${{ github.sha }}"
 
       - name: Deploy Sequencer
         working-directory: deployments/sequencer

@@ -51,10 +51,12 @@ jobs:
           graphite_token: ${{ secrets.GRAPHITE_CI_OPTIMIZER_TOKEN }}
 
   starknet_transaction_prover_ci:
-    runs-on: namespace-profile-xlarge-ubuntu-24-04-amd64
+    runs-on: blacksmith-32vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     timeout-minutes: 30
+    env:
+      RPC_FIXTURE_CREDENTIALS: ${{ secrets.SA_STARKNET_OS_RUNNER_ARTIFACTS }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/bootstrap
@@ -75,9 +77,10 @@ jobs:
 
       # Cache the rustup directory so the nightly toolchain isn't re-downloaded every run.
       - name: Cache rustup toolchains
-        uses: namespacelabs/nscloud-cache-action@v1
+        uses: actions/cache@v5
         with:
-          path: /home/runner/.rustup
+          path: ~/.rustup
+          key: ${{ runner.os }}-${{ runner.arch }}-rustup-${{ hashFiles('rust-toolchain.toml', 'crates/starknet_transaction_prover/rust-toolchain.toml') }}
 
       # Bootstrap installs the repo-wide stable toolchain (from root rust-toolchain.toml).
       # starknet_transaction_prover has its own rust-toolchain.toml specifying nightly, required by stwo
@@ -97,21 +100,30 @@ jobs:
 
       # Download RPC record fixtures from GCS for ignored integration tests.
       - id: auth
+        if: env.RPC_FIXTURE_CREDENTIALS != ''
         uses: "google-github-actions/auth@v2"
         with:
           credentials_json: ${{ secrets.SA_STARKNET_OS_RUNNER_ARTIFACTS }}
       - uses: "google-github-actions/setup-gcloud@v2"
+        if: env.RPC_FIXTURE_CREDENTIALS != ''
       - run: mkdir -p ./crates/starknet_transaction_prover/resources/rpc_records
+        if: env.RPC_FIXTURE_CREDENTIALS != ''
       - run: gcloud storage cp -r gs://starknet-os-runner-artifacts/rpc_records/* ./crates/starknet_transaction_prover/resources/rpc_records/
+        if: env.RPC_FIXTURE_CREDENTIALS != ''
 
       # Run tests sequentially (no parallelism) since proving is a heavy CPU and memory intensive task
       - name: Run proving integration tests
+        if: env.RPC_FIXTURE_CREDENTIALS != ''
         working-directory: crates/starknet_transaction_prover
         run: cargo test --release -p starknet_transaction_prover --features stwo_proving virtual_snos_prover_test -- --ignored --test-threads=1
 
+      - name: Report unavailable private RPC fixtures
+        if: env.RPC_FIXTURE_CREDENTIALS == ''
+        run: echo "Private RPC fixture tests require SA_STARKNET_OS_RUNNER_ARTIFACTS; build and ordinary tests ran above." >> "$GITHUB_STEP_SUMMARY"
+
   # Test that the starknet_transaction_prover Docker image builds successfully.
   docker-build:
-    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     needs: optimize_ci
     if: needs.optimize_ci.outputs.skip == 'false'
     timeout-minutes: 30
