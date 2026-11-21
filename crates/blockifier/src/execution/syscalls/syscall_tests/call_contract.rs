@@ -759,6 +759,16 @@ fn committed_data_disabled_or_unavailable_rejects_transaction_without_state_chan
         let Err(TransactionExecutionError::CommittedDataAvailability(error)) = result else {
             panic!("expected committed-data rejection, got {result:?}");
         };
+        if provider_failure {
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Committed-data provider failed: batch unavailable for root {:#x} (first \
+                     requested key 0x0, 1 requested): test provider unavailable",
+                    tree.root(),
+                )
+            );
+        }
         assert!(matches!(
             (enabled, provider_failure, error),
             (false, _, CommittedDataError::Disabled)
