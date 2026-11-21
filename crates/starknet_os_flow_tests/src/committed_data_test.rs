@@ -3,7 +3,8 @@ use std::sync::Arc;
 use blockifier::execution::syscalls::committed_data::{
     CommittedDataWitness,
     CommittedDataWitnesses,
-    read_os_resources,
+    read_values,
+    resources_gas,
 };
 use blockifier::execution::syscalls::vm_syscall_utils::SyscallSelector;
 use blockifier::test_utils::dict_state_reader::DictStateReader;
@@ -83,21 +84,8 @@ fn collect_profiled_committed_data_calls<'a>(
             }
         }
         serde_json::Value::Object(object) => {
-            let is_leaf_call = object.get("selector").and_then(serde_json::Value::as_str)
-                == Some("CallContract")
-                && object
-                    .get("inner_syscalls")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(Vec::is_empty);
-            let uses_poseidon = object
-                .get("resources")
-                .and_then(|resources| {
-                    resources.pointer("/builtin_instance_counter/poseidon_builtin")
-                })
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|count| count > 0);
-            if is_leaf_call && uses_poseidon {
-                calls.push(&object["resources"]);
+            if object.get("committed_request").is_some_and(|request| !request.is_null()) {
+                calls.push(trace);
             }
             for value in object.values() {
                 collect_profiled_committed_data_calls(value, calls);
@@ -111,6 +99,7 @@ fn collect_profiled_committed_data_calls<'a>(
 /// sequencer charges and reserves. Keep the ordinary CallContract allowance in both totals.
 fn validate_read_resources(
     output: &starknet_os::io::os_output::StarknetOsRunnerOutput,
+    witnesses: &CommittedDataWitnesses,
 ) -> Vec<usize> {
     use blockifier::blockifier_versioned_constants::VersionedConstants;
     use blockifier::bouncer::BuiltinWeights;
@@ -123,12 +112,26 @@ fn validate_read_resources(
     collect_profiled_committed_data_calls(&trace, &mut measured_calls);
     let mut report = Vec::new();
     let mut heights = Vec::new();
-    for measured in measured_calls {
+    for call in measured_calls {
+        let measured = &call["resources"];
+        let (root, keys): (Felt, Vec<Felt>) =
+            serde_json::from_value(call["committed_request"].clone()).unwrap();
+        assert_eq!(keys.len(), 1);
+        let proof = witnesses.get(root, keys[0]).unwrap();
+        let height = proof.siblings.len();
+        let mut gas = u64::MAX;
+        let (_, extension) = read_values(
+            true,
+            witnesses,
+            starknet_api::abi::abi_utils::selector_from_name("get_value").0,
+            &[root, keys[0]],
+            &mut gas,
+            &mut None,
+        )
+        .unwrap();
         let poseidons =
             measured["builtin_instance_counter"]["poseidon_builtin"].as_u64().unwrap_or(0) as usize;
-        let height = 0;
-        let expected = &get_const_syscall_resources(SyscallSelector::CallContract)
-            + &read_os_resources(height);
+        let expected = &get_const_syscall_resources(SyscallSelector::CallContract) + &extension;
         heights.push(height);
         let steps = usize::try_from(measured["n_steps"].as_u64().unwrap()).unwrap();
         let range_checks = usize::try_from(
@@ -164,7 +167,7 @@ fn validate_read_resources(
         report.push(serde_json::json!({
             "height": height, "actual": actual, "reserved": expected,
             "sierra": sierra, "sierra_bound": sierra_bound,
-            "extra_sierra_charged": blockifier::execution::syscalls::committed_data::read_gas(height),
+            "extra_sierra_charged": resources_gas(&extension),
             "proving": proving, "proving_bound": proving_bound,
         }));
     }
@@ -189,10 +192,15 @@ fn validate_read_resources(
 
 #[tokio::test]
 async fn committed_data_root_rotation_and_shared_reads_full_os_pie() {
-    let output = prepare().await.run();
+    let runner = prepare().await;
+    let witnesses = CommittedDataWitnesses::new(
+        runner.os_hints.os_hints_config.committed_data_witnesses.clone(),
+    )
+    .unwrap();
+    let output = runner.run();
     output.perform_default_validations();
     output.runner_output.cairo_pie.run_validity_checks().unwrap();
-    let heights = validate_read_resources(&output.runner_output);
+    let heights = validate_read_resources(&output.runner_output, &witnesses);
     assert_eq!(heights.len(), 62, "profile every committed-data read in the fixture");
     if let Some(path) = std::env::var_os("COMMITTED_DATA_POC_PIE_PATH") {
         output.runner_output.cairo_pie.write_zip_file(std::path::Path::new(&path), true).unwrap();
@@ -301,11 +309,12 @@ async fn committed_data_full_500k_snapshot_os_pie() {
     builder.os_hints_config.use_committed_data = true;
     builder.initial_state.block_context.committed_data_witnesses =
         Arc::new(CommittedDataWitnesses::new(witnesses.clone()).unwrap());
+    let pricing_witnesses = builder.initial_state.block_context.committed_data_witnesses.clone();
     builder.os_hints_config.committed_data_witnesses = witnesses;
     let output = builder.build().await.run();
     output.perform_default_validations();
     output.runner_output.cairo_pie.run_validity_checks().unwrap();
-    let mut heights = validate_read_resources(&output.runner_output);
+    let mut heights = validate_read_resources(&output.runner_output, &pricing_witnesses);
     heights.sort_unstable();
     expected_heights.sort_unstable();
     assert_eq!(heights.len(), expected_heights.len(), "profile every full-map read");
@@ -538,21 +547,21 @@ async fn committed_data_batches_match_os_and_bound_resources() {
         actual += &profile;
         let mut calldata = vec![root, Felt::from(keys.len())];
         calldata.extend_from_slice(&keys);
+        let mut gas = u64::MAX;
         let (_, extra) = read_values_shared(
             true,
             &pricing_witnesses,
             &cache,
             selector_from_name("get_values").0,
             &calldata,
-            &mut u64::MAX,
+            &mut gas,
             &mut None,
         )
         .unwrap();
         reserved += &(&get_const_syscall_resources(SyscallSelector::CallContract) + &extra);
     }
-    for finalization in &output.runner_output.committed_data_finalizations {
-        actual += finalization;
-    }
+    // Immediate finalization is already inside each measured committed syscall.
+    assert_eq!(output.runner_output.committed_data_finalizations.len(), calls.len());
     // Conservatively include every PIE memory hole, including ordinary contract bytecode.
     actual.n_memory_holes = output.runner_output.cairo_pie.execution_resources.n_memory_holes;
     let constants =
@@ -572,8 +581,7 @@ async fn committed_data_batches_match_os_and_bound_resources() {
     eprintln!("committed-data call plus finalization actual={actual:?} reserved={reserved:?}");
 }
 
-/// A canonical revert is omitted by SNOS. Its discarded read set must not discount the next
-/// transaction; successful calls may share within a block, and the next block starts cold.
+/// Each of the four admitted transactions verifies three calls. Omitted reverts add no proof.
 #[rstest::rstest]
 #[case::legacy_input(false)]
 #[case::per_block_input(true)]
@@ -625,7 +633,7 @@ async fn committed_data_shared_reads_follow_reverts_and_block_boundaries(
     let output = runner.run();
     output.perform_default_validations();
     output.runner_output.cairo_pie.run_validity_checks().unwrap();
-    assert_eq!(output.runner_output.committed_data_finalizations.len(), 2);
+    assert_eq!(output.runner_output.committed_data_finalizations.len(), 12);
 }
 
 /// Zero-default reads execute in Cairo across blocks, including repeated mixed batches.

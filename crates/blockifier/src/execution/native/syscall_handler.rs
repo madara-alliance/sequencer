@@ -508,8 +508,13 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .map_err(|e| self.handle_error(remaining_gas, e))?;
 
         if address == crate::execution::syscalls::committed_data::COMMITTED_DATA_ADDRESS {
-            let result = crate::execution::syscalls::committed_data::read_outcome(
+            let before_read = *remaining_gas;
+            let permission = crate::execution::syscalls::committed_data::read_permission(
                 self.base.context.tx_context.block_context.use_committed_data,
+                self.base.context.versioned_constants(),
+            );
+            let result = crate::execution::syscalls::committed_data::read_outcome_with_permission(
+                permission,
                 &self.base.context.tx_context.block_context.committed_data_witnesses,
                 &self.base.context.tx_context.block_context.committed_data_read_set,
                 entry_point_selector,
@@ -526,7 +531,15 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
                 },
                 |(_, resources)| resources.clone(),
             );
-            self.base.account_committed_data_read(&resources, result.is_err());
+            self.base.account_committed_data_read(
+                &resources,
+                result.is_err() && before_read == *remaining_gas,
+            );
+            if before_read != *remaining_gas {
+                self.base
+                    .context
+                    .update_revert_gas_with_next_remaining_gas(GasAmount(*remaining_gas));
+            }
             let (values, _) = result.map_err(|e| self.handle_error(remaining_gas, e.into()))?;
             log::debug!(
                 target: "committed_data_native",

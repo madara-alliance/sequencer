@@ -1,8 +1,5 @@
-//! Block-local accounting for the read set authenticated by Cairo at block finalization.
-//!
-//! A transaction works on a fork. Only admitted work may discount later reads; rejected
-//! transactions, failed fee probes and execution omitted by SNOS must discard their changes.
-//! Root identity is part of every key: publishing a new root never inherits the old discount.
+//! The block read set carries the private witnesses needed for replay.
+//! Each admitted request funds its own proof, regardless of prior reads.
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -50,9 +47,12 @@ impl CommittedDataReadSet {
     }
 }
 
-/// Per-call dictionary accesses, response copying and amortized dictionary finalization.
-/// Standard Patricia work is charged separately for each newly observed key.
+/// The cf40 block-sharing estimate retained for older tooling.
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
 pub fn shared_request_resources(count: usize) -> ExecutionResources {
+    cf40_request(count)
+}
+fn cf40_request(count: usize) -> ExecutionResources {
     use cairo_vm::types::builtin_name::BuiltinName;
     ExecutionResources {
         n_steps: 800 + 80 * count,
@@ -68,14 +68,21 @@ pub fn resources_gas(resources: &ExecutionResources) -> u64 {
     use cairo_vm::types::builtin_name::BuiltinName;
     let count = |name| resources.builtin_instance_counter.get(&name).copied().unwrap_or(0) as u64;
     resources.n_steps as u64 * STEP_SIERRA_GAS
+        + resources.n_memory_holes as u64 * 10
         + count(BuiltinName::range_check) * RANGE_CHECK_SIERRA_GAS
         + count(BuiltinName::poseidon) * POSEIDON_SIERRA_GAS
         + count(BuiltinName::bitwise) * BITWISE_SIERRA_GAS
 }
 
-/// Prototype upper bound for a complete 251-bit path, including compressed edges.
-/// A tighter production tariff requires profiling the shared standard verifier.
+/// The cf40 cold-path estimate retained for older tooling.
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
 pub fn standard_path_resources(count: usize) -> ExecutionResources {
+    cf40_paths(count)
+}
+pub(super) fn cf40_resources(count: usize, unique: usize) -> ExecutionResources {
+    &cf40_request(count) + &cf40_paths(unique)
+}
+fn cf40_paths(count: usize) -> ExecutionResources {
     if count == 0 {
         return ExecutionResources::default();
     }
@@ -91,8 +98,7 @@ pub fn standard_path_resources(count: usize) -> ExecutionResources {
     }
 }
 
-/// Both selectors and both lookup outcomes use the same block-local accounting.
-/// Cache entries become visible only after the complete request is available and paid.
+/// Both selectors fund per-call authentication. Publish the block witness set only after payment.
 pub fn read_values_shared(
     enabled: bool,
     witnesses: &CommittedDataWitnesses,
@@ -103,9 +109,12 @@ pub fn read_values_shared(
     failure: &mut Option<CommittedDataError>,
 ) -> Result<(Vec<Felt>, ExecutionResources), SyscallExecutorBaseError> {
     if !enabled {
-        return read_values(false, witnesses, selector, calldata, remaining_gas, failure);
+        let error = CommittedDataError::Disabled;
+        let info = error.to_string();
+        failure.get_or_insert(error);
+        return Err(SyscallExecutorBaseError::InvalidSyscallInput { input: selector, info });
     }
-    let (keys, batch) = read_keys(selector, calldata)?;
+    let (keys, batch) = metered_read_keys(selector, calldata, remaining_gas, failure)?;
     let root = calldata[0];
     let availability = |error: CommittedDataError, failure: &mut Option<CommittedDataError>| {
         let result = SyscallExecutorBaseError::InvalidSyscallInput {
@@ -115,32 +124,32 @@ pub fn read_values_shared(
         failure.get_or_insert(error);
         result
     };
-    if let Some(provider) = &witnesses.provider {
-        provider.prefetch(root, keys).map_err(|e| availability(e, failure))?;
+    if keys.iter().any(|key| !valid_key(*key)) {
+        return Err(availability(CommittedDataError::InvalidWitness, failure));
     }
-    let mut values = Vec::with_capacity(keys.len() + usize::from(batch));
-    if batch {
-        values.push(Felt::from(keys.len()));
-    }
-    for &key in keys {
-        if !valid_key(key) {
-            return Err(availability(CommittedDataError::InvalidWitness, failure));
-        }
-        let value = match witnesses.value(root, key).map_err(|e| availability(e, failure))? {
-            Some((value, _)) => value,
-            None => {
-                witnesses.absence(root, key).map_err(|e| availability(e, failure))?.read_value()
-            }
-        };
-        values.push(value);
-    }
-    let mut seen = read_set.0.lock().expect("Committed-data read set poisoned");
     let requested: HashSet<_> = keys.iter().map(|key| (root, *key)).collect();
-    let cold = requested.difference(&seen.witnesses).count();
-    if seen.witnesses.len() + cold > MAX_COMMITTED_DATA_WITNESSES {
+    let fits = |seen: &ReadSet| {
+        seen.witnesses.len() + requested.difference(&seen.witnesses).count()
+            <= MAX_COMMITTED_DATA_WITNESSES
+    };
+    if !fits(&read_set.0.lock().expect("Committed-data read set poisoned")) {
         return Err(availability(CommittedDataError::TooManyWitnesses, failure));
     }
-    let resources = &shared_request_resources(keys.len()) + &standard_path_resources(cold);
+    let minimum = resources_gas(&pricing::base_resources(keys.len(), requested.len()));
+    if *remaining_gas < minimum {
+        return Err(availability(
+            CommittedDataError::InsufficientGas { required: minimum, remaining: *remaining_gas },
+            failure,
+        ));
+    }
+    let (values, resources) = witnesses
+        .batch(root, keys)
+        .and_then(|proof| proof.priced_values(root, keys, batch))
+        .map_err(|error| availability(error, failure))?;
+    let mut seen = read_set.0.lock().expect("Committed-data read set poisoned");
+    if !fits(&seen) {
+        return Err(availability(CommittedDataError::TooManyWitnesses, failure));
+    }
     charge_authenticated_read(selector, resources_gas(&resources), remaining_gas, failure)?;
     seen.witnesses.extend(requested);
     Ok((values, resources))
@@ -150,7 +159,7 @@ pub fn read_values_shared(
 mod tests {
     use super::*;
     #[test]
-    fn standard_reads_cache_both_outcomes_and_publish_only_paid_forks() {
+    fn repeated_reads_pay_for_both_outcomes_and_publish_only_paid_forks() {
         let tree = CommittedDataSet::new(vec![(Felt::ONE, Felt::from(100))]).unwrap();
         let witnesses = CommittedDataWitnesses::new(vec![
             tree.lookup_witness(Felt::ZERO),
@@ -175,10 +184,10 @@ mod tests {
         let accepted = block.fork();
         let (values, cold) = call(&accepted, u64::MAX).unwrap();
         assert_eq!(values, vec![Felt::THREE, Felt::from(100), Felt::ZERO, Felt::from(100)]);
-        assert_eq!(cold, &shared_request_resources(3) + &standard_path_resources(2));
+        assert!(cold.n_memory_holes > 0);
         assert_eq!(call(&block, u64::MAX).unwrap().1, cold);
         block.replace_with(&accepted);
-        assert_eq!(call(&block, u64::MAX).unwrap().1, shared_request_resources(3));
+        assert_eq!(call(&block, u64::MAX).unwrap().1, cold);
         assert_eq!(block.witness_keys().len(), 2);
     }
 

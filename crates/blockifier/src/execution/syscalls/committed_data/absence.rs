@@ -2,8 +2,9 @@
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 
 use super::*;
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
 pub fn absence_os_resources(_height: usize) -> ExecutionResources {
-    read_os_resources(_height)
+    sharing::cf40_resources(1, 1)
 }
 pub fn read_outcome(
     enabled: bool,
@@ -15,6 +16,23 @@ pub fn read_outcome(
     failure: &mut Option<CommittedDataError>,
 ) -> Result<(Vec<Felt>, ExecutionResources), SyscallExecutorBaseError> {
     read_values_shared(enabled, witnesses, read_set, selector, calldata, remaining_gas, failure)
+}
+
+pub(crate) fn read_outcome_with_permission(
+    permission: Result<bool, CommittedDataError>,
+    witnesses: &CommittedDataWitnesses,
+    read_set: &CommittedDataReadSet,
+    selector: Felt,
+    calldata: &[Felt],
+    remaining_gas: &mut u64,
+    failure: &mut Option<CommittedDataError>,
+) -> Result<(Vec<Felt>, ExecutionResources), SyscallExecutorBaseError> {
+    let enabled = permission.map_err(|error| {
+        let info = error.to_string();
+        failure.get_or_insert(error);
+        SyscallExecutorBaseError::InvalidSyscallInput { input: selector, info }
+    })?;
+    read_outcome(enabled, witnesses, read_set, selector, calldata, remaining_gas, failure)
 }
 
 #[cfg(test)]

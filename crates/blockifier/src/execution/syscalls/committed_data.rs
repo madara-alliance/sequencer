@@ -28,14 +28,15 @@ pub const COMMITTED_DATA_ADDRESS: Felt =
     Felt::from_hex_unchecked("0x6c5f4559c7041984537bc078c71443fdc58b2e1bab302b341ec12b3d2cec44");
 mod absence;
 mod sharing;
-pub use absence::{absence_os_resources, read_outcome};
-pub use sharing::{
-    CommittedDataReadSet,
-    read_values_shared,
-    resources_gas,
-    shared_request_resources,
-    standard_path_resources,
-};
+#[allow(deprecated)]
+pub use absence::absence_os_resources;
+pub use absence::read_outcome;
+pub(crate) use absence::read_outcome_with_permission;
+pub use sharing::{CommittedDataReadSet, read_values_shared, resources_gas};
+#[allow(deprecated)]
+pub use sharing::{shared_request_resources, standard_path_resources};
+mod pricing;
+pub use pricing::read_permission;
 mod batch;
 pub use batch::CommittedDataBatchProof;
 mod mpt;
@@ -43,21 +44,25 @@ pub use mpt::*;
 /// Bound on distinct witnesses required by one block, shared by both read ABIs.
 pub const MAX_COMMITTED_DATA_WITNESSES: usize = 65_536;
 // The ordinary call-contract resources are still supplied by syscall accounting.
+#[cfg(test)]
 const CALL_CONTRACT_STEPS: usize = 903;
+#[cfg(test)]
 const CALL_CONTRACT_RANGE_CHECKS: usize = 18;
 const STEP_SIERRA_GAS: u64 = 100;
 const RANGE_CHECK_SIERRA_GAS: u64 = 70;
 const POSEIDON_SIERRA_GAS: u64 = 491;
 const BITWISE_SIERRA_GAS: u64 = 583;
 
-/// Cold single read. The prototype tariff deliberately ignores path depth.
+/// Legacy cf40 full-height estimate for compatibility. Exact pricing requires the requested proof.
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
 pub fn read_os_resources(
     _height: usize,
 ) -> cairo_vm::vm::runners::cairo_runner::ExecutionResources {
-    &shared_request_resources(1) + &standard_path_resources(1)
+    sharing::cf40_resources(1, 1)
 }
-pub fn read_gas(height: usize) -> u64 {
-    resources_gas(&read_os_resources(height))
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
+pub fn read_gas(_height: usize) -> u64 {
+    resources_gas(&sharing::cf40_resources(1, 1))
 }
 
 /// Bounded batch ABI: [root, number_of_keys, key_0, ...], returning [count, value_0, ...].
@@ -80,16 +85,18 @@ pub fn read_keys(
     Err(SyscallExecutorBaseError::Revert { error_data: vec![INVALID_ARGUMENT_FELT] })
 }
 
-/// A cold batch reserves a complete standard path for each distinct key.
+/// Legacy cf40 batch estimate. Exact pricing requires the requested proof, including edge siblings.
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
 pub fn batch_os_resources(
     count: usize,
     unique: usize,
     _branches: usize,
 ) -> cairo_vm::vm::runners::cairo_runner::ExecutionResources {
-    &shared_request_resources(count) + &standard_path_resources(unique)
+    sharing::cf40_resources(count, unique)
 }
-pub fn batch_gas(count: usize, unique: usize, branches: usize) -> u64 {
-    resources_gas(&batch_os_resources(count, unique, branches))
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
+pub fn batch_gas(count: usize, unique: usize, _branches: usize) -> u64 {
+    resources_gas(&sharing::cf40_resources(count, unique))
 }
 
 /// Shared VM/native dispatch. A batch fails as a whole; no partial values are returned.
@@ -104,20 +111,8 @@ pub fn read_values(
     (Vec<Felt>, cairo_vm::vm::runners::cairo_runner::ExecutionResources),
     SyscallExecutorBaseError,
 > {
-    // Preserve disabled-read rejection even for malformed calls to the reserved address.
-    if !use_committed_data {
-        return read_value(
-            false,
-            witnesses,
-            selector,
-            calldata,
-            remaining_gas,
-            transaction_failure,
-        )
-        .map(|(value, height)| (vec![value], read_os_resources(height)));
-    }
     read_values_shared(
-        true,
+        use_committed_data,
         witnesses,
         &CommittedDataReadSet::default(),
         selector,
@@ -127,16 +122,35 @@ pub fn read_values(
     )
 }
 
-/// Failed calls reserve the bounded worst case, including proof verification before out-of-gas.
+/// Only ABI failures can be admitted. A rejected transaction publishes no witness work.
 pub fn failed_read_resources(
     selector: Felt,
     calldata: &[Felt],
 ) -> cairo_vm::vm::runners::cairo_runner::ExecutionResources {
+    if read_keys(selector, calldata).is_err() {
+        return pricing::malformed_resources();
+    }
+    Default::default()
+}
+
+/// Fund the deterministic error response before returning a catchable invalid argument.
+pub fn metered_read_keys<'a>(
+    selector: Felt,
+    calldata: &'a [Felt],
+    gas: &mut u64,
+    failure: &mut Option<CommittedDataError>,
+) -> Result<(&'a [Felt], bool), SyscallExecutorBaseError> {
     match read_keys(selector, calldata) {
-        Ok((keys, true)) => {
-            batch_os_resources(keys.len(), keys.len(), keys.len() * COMMITTED_DATA_TREE_HEIGHT)
+        Ok(decoded) => Ok(decoded),
+        Err(err) => {
+            charge_authenticated_read(
+                selector,
+                resources_gas(&pricing::malformed_resources()),
+                gas,
+                failure,
+            )?;
+            Err(err)
         }
-        _ => read_os_resources(COMMITTED_DATA_TREE_HEIGHT),
     }
 }
 
@@ -165,6 +179,8 @@ fn charge_authenticated_read(
 /// Failures of permission, authentication, lookup, or the budget for authenticated proof work.
 #[derive(Debug, thiserror::Error)]
 pub enum CommittedDataError {
+    #[error("Unsupported gas schedule for exact committed-data pricing")]
+    UnsupportedReadSchedule,
     #[error(
         "Insufficient gas for committed-data verification: required {required}, remaining \
          {remaining}"
@@ -186,6 +202,18 @@ pub enum CommittedDataError {
     Unavailable { root: Felt, key: Felt },
     #[error("Committed-data provider failed: {0}")]
     Provider(String),
+}
+
+impl CommittedDataError {
+    /// Keep opaque provider failures actionable without copying every requested key into the error.
+    fn with_batch_context(self, root: Felt, keys: &[Felt]) -> Self {
+        let Self::Provider(detail) = self else { return self };
+        let request = match keys.first() {
+            Some(key) => format!("first requested key {key:#x}, {} requested", keys.len()),
+            None => "0 requested keys".to_owned(),
+        };
+        Self::Provider(format!("batch unavailable for root {root:#x} ({request}): {detail}"))
+    }
 }
 
 /// Indexed witnesses authenticated before execution; shared immutably by replay workers.
@@ -273,7 +301,9 @@ impl CommittedDataWitnesses {
         keys: &[Felt],
     ) -> Result<CommittedDataBatchProof, CommittedDataError> {
         match &self.provider {
-            Some(provider) => provider.batch(root, keys),
+            Some(provider) => {
+                provider.batch(root, keys).map_err(|error| error.with_batch_context(root, keys))
+            }
             None => {
                 CommittedDataBatchProof::new(root, keys, |key| Ok(self.get(root, key).cloned()))
             }
@@ -329,7 +359,7 @@ pub fn read_value(
         return Err(syscall_error);
     }
     validate_read_request(selector, calldata, *remaining_gas)?;
-    let (value, height) = match witnesses.value(calldata[0], calldata[1]) {
+    let (_, height) = match witnesses.value(calldata[0], calldata[1]) {
         Ok(Some(value)) => value,
         result => {
             let error = result
@@ -342,8 +372,17 @@ pub fn read_value(
             return Err(syscall_error);
         }
     };
-    charge_authenticated_read(selector, read_gas(height), remaining_gas, transaction_failure)?;
-    Ok((value, height))
+    let (values, _) = read_values_shared(
+        true,
+        witnesses,
+        &CommittedDataReadSet::default(),
+        selector,
+        calldata,
+        remaining_gas,
+        transaction_failure,
+    )?;
+    // The proof path supplies the authoritative value. The compatibility lookup supplies depth.
+    Ok((values[0], height))
 }
 
 /// Deterministic contract-input failures are ordinary syscall reverts in VM, Native and OS.
@@ -393,7 +432,32 @@ mod tests {
 
     use super::*;
     use crate::blockifier_versioned_constants::VersionedConstants;
-    use crate::utils::get_gas_cost_from_vm_resources;
+
+    #[test]
+    fn provider_batch_context_is_bounded_and_preserves_typed_errors() {
+        let root = Felt::from(0x1234_u32);
+        let mut keys = vec![Felt::TWO; MAX_COMMITTED_DATA_READ_KEYS];
+        keys[0] = Felt::ONE;
+        for (request, expected) in [
+            (&keys[..], "first requested key 0x1, 1024 requested"),
+            (&keys[..0], "0 requested keys"),
+        ] {
+            let error = CommittedDataError::Provider("Missing dataset".into())
+                .with_batch_context(root, request);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Committed-data provider failed: batch unavailable for root 0x1234 \
+                     ({expected}): Missing dataset"
+                )
+            );
+        }
+        let error = CommittedDataError::Unavailable { root, key: Felt::TWO }
+            .with_batch_context(root, &keys);
+        assert!(
+            matches!(error, CommittedDataError::Unavailable { root: r, key } if r == root && key == Felt::TWO)
+        );
+    }
 
     #[test]
     fn batch_reads_preserve_order_charge_resources_and_reject_partial_success() {
@@ -407,7 +471,14 @@ mod tests {
         .unwrap();
         let selector = selector_from_name("get_values").0;
         let calldata = [tree.root(), Felt::from(3), Felt::TWO, Felt::ZERO, Felt::TWO];
-        let charge = batch_gas(3, 2, 1);
+        let charge = resources_gas(
+            &witnesses
+                .batch(tree.root(), &calldata[2..])
+                .unwrap()
+                .priced_values(tree.root(), &calldata[2..], true)
+                .unwrap()
+                .1,
+        );
         let mut gas = charge;
         let mut failure = None;
         let (values, resources) =
@@ -467,8 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn resource_delta_matches_additional_gas_charge_at_every_depth() {
-        let gas_costs = &VersionedConstants::latest_constants().os_constants.gas_costs;
+    fn exact_price_schedule_matches_the_os_and_keeps_the_ordinary_call_allowance() {
+        let constants = VersionedConstants::latest_constants();
+        assert!(read_permission(true, constants).unwrap());
         let call_contract = crate::test_utils::get_const_syscall_resources(
             crate::execution::syscalls::vm_syscall_utils::SyscallSelector::CallContract,
         );
@@ -478,17 +550,12 @@ mod tests {
                 [&cairo_vm::types::builtin_name::BuiltinName::range_check],
             CALL_CONTRACT_RANGE_CHECKS
         );
-        for height in 0..=COMMITTED_DATA_TREE_HEIGHT {
-            assert_eq!(
-                get_gas_cost_from_vm_resources(
-                    &read_os_resources(height),
-                    &gas_costs.base,
-                    &gas_costs.builtins,
-                ),
-                read_gas(height),
-                "resource charge at height {height}"
-            );
-        }
+        let mut altered = constants.clone();
+        Arc::make_mut(&mut altered.os_constants).gas_costs.base.memory_hole_gas_cost += 1;
+        assert!(matches!(
+            read_permission(true, &altered),
+            Err(CommittedDataError::UnsupportedReadSchedule)
+        ));
     }
 
     #[test]
@@ -556,7 +623,15 @@ mod tests {
     fn reads_require_exact_tuple_and_charge_only_successful_reads() {
         let tree = CommittedDataSet::new(vec![(Felt::ZERO, Felt::from(42_u32))]).unwrap();
         let cache = CommittedDataWitnesses::new(vec![tree.witness(Felt::ZERO).unwrap()]).unwrap();
-        let mut gas = read_gas(0);
+        let charge = resources_gas(
+            &cache
+                .batch(tree.root(), &[Felt::ZERO])
+                .unwrap()
+                .priced_values(tree.root(), &[Felt::ZERO], false)
+                .unwrap()
+                .1,
+        );
+        let mut gas = charge;
         let selector = selector_from_name("get_value").0;
         let mut failure = None;
         assert!(
@@ -570,7 +645,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(gas, read_gas(0));
+        assert_eq!(gas, charge);
         assert!(matches!(failure, Some(CommittedDataError::Unavailable { .. })));
         assert_eq!(
             read_value(true, &cache, selector, &[tree.root(), Felt::ZERO], &mut gas, &mut failure)

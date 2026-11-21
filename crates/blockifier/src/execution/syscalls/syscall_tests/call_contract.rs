@@ -13,6 +13,7 @@ use starknet_api::execution_utils::format_panic_data;
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::fields::Calldata;
 use starknet_api::{calldata as calldata_macro, felt};
+use starknet_types_core::felt::Felt;
 use test_case::test_case;
 
 use crate::context::{BlockContext, ChainInfo};
@@ -573,6 +574,27 @@ fn test_nested_call_storage_revert(runnable_version: RunnableCairo1) {
     );
 }
 
+fn quoted_read_resources(
+    tree: &crate::execution::syscalls::committed_data::CommittedDataSet,
+    keys: &[Felt],
+) -> cairo_vm::vm::runners::cairo_runner::ExecutionResources {
+    use crate::execution::syscalls::committed_data::{CommittedDataWitnesses, read_values};
+    let proofs = keys
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|key| tree.lookup_witness(key))
+        .collect();
+    let proofs = CommittedDataWitnesses::new(proofs).unwrap();
+    let mut args = vec![tree.root(), Felt::from(keys.len())];
+    args.extend_from_slice(keys);
+    let mut gas = u64::MAX;
+    read_values(true, &proofs, selector_from_name("get_values").0, &args, &mut gas, &mut None)
+        .unwrap()
+        .1
+}
+
 #[cfg_attr(feature = "cairo_native", test_case(RunnableCairo1::Native; "native"))]
 #[test_case(RunnableCairo1::Casm; "vm")]
 fn committed_data_reads_require_permission_across_execution_engines(runnable: RunnableCairo1) {
@@ -612,14 +634,12 @@ fn committed_data_reads_require_permission_across_execution_engines(runnable: Ru
                 let info = result.unwrap();
                 assert!(!info.execution.failed);
                 info.check_native_execution(runnable.is_cairo_native());
+                let bound = quoted_read_resources(&tree, &[Felt::TWO.pow(251_u32) - Felt::ONE]);
                 assert!(
                     info.execution.gas_consumed
-                        >= crate::execution::syscalls::committed_data::read_gas(1)
+                        >= crate::execution::syscalls::committed_data::resources_gas(&bound)
                 );
-                for (builtin, minimum) in
-                    &crate::execution::syscalls::committed_data::read_os_resources(1)
-                        .builtin_instance_counter
-                {
+                for (builtin, minimum) in &bound.builtin_instance_counter {
                     assert!(
                         info.builtin_counters.get(&(*builtin).into()).copied().unwrap_or_default()
                             >= *minimum
@@ -739,6 +759,16 @@ fn committed_data_disabled_or_unavailable_rejects_transaction_without_state_chan
         let Err(TransactionExecutionError::CommittedDataAvailability(error)) = result else {
             panic!("expected committed-data rejection, got {result:?}");
         };
+        if provider_failure {
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Committed-data provider failed: batch unavailable for root {:#x} (first \
+                     requested key 0x0, 1 requested): test provider unavailable",
+                    tree.root(),
+                )
+            );
+        }
         assert!(matches!(
             (enabled, provider_failure, error),
             (false, _, CommittedDataError::Disabled)
@@ -759,8 +789,7 @@ fn committed_data_batch_dispatch_returns_values_in_order(runnable: RunnableCairo
         COMMITTED_DATA_ADDRESS,
         CommittedDataSet,
         CommittedDataWitnesses,
-        batch_gas,
-        batch_os_resources,
+        resources_gas,
     };
     let contract = FeatureContract::TestContract(CairoVersion::Cairo1(runnable));
     let tree = CommittedDataSet::new(vec![
@@ -795,9 +824,11 @@ fn committed_data_batch_dispatch_returns_values_in_order(runnable: RunnableCairo
     let info = call.execute_directly_given_block_context(&mut state, context).unwrap();
     assert!(!info.execution.failed);
     info.check_native_execution(runnable.is_cairo_native());
-    assert!(info.execution.gas_consumed >= batch_gas(3, 2, 1));
+    let absent = Felt::TWO.pow(251_u32) - Felt::ONE;
+    let bound = quoted_read_resources(&tree, &[absent, Felt::ZERO, absent]);
+    assert!(info.execution.gas_consumed >= resources_gas(&bound));
     assert_eq!(info.unpaid_committed_data_resources, Default::default());
-    for (builtin, minimum) in batch_os_resources(3, 2, 1).builtin_instance_counter {
+    for (builtin, minimum) in bound.builtin_instance_counter {
         assert!(info.builtin_counters.get(&builtin.into()).copied().unwrap_or_default() >= minimum);
     }
     // The compiled fixture forwards the special call's length-prefixed return data.
@@ -826,11 +857,11 @@ fn committed_data_out_of_gas_cannot_be_caught(runnable: RunnableCairo1) {
     let mut context = BlockContext::create_for_testing();
     context.use_committed_data = true;
     context.committed_data_witnesses =
-        Arc::new(CommittedDataWitnesses::new(vec![tree.witness(Felt::ZERO).unwrap()]).unwrap());
+        Arc::new(CommittedDataWitnesses::new(vec![tree.lookup_witness(Felt::ZERO)]).unwrap());
     let call = CallEntryPoint {
         entry_point_selector: selector_from_name("test_committed_data_catch"),
         calldata: calldata_macro![tree.root(), Felt::ONE, Felt::ZERO, Felt::ONE, Felt::from(3)],
-        initial_gas: 4_000_000,
+        initial_gas: 2_000_000,
         ..trivial_external_entry_point_new(contract)
     };
     let error = call.execute_directly_given_block_context(&mut state, context).unwrap_err();
@@ -857,7 +888,6 @@ fn committed_data_insufficient_gas_rejects_transaction(runnable: RunnableCairo1,
         CommittedDataSet,
         CommittedDataWitnesses,
     };
-    use crate::state::state_api::State;
     use crate::transaction::errors::TransactionExecutionError;
     use crate::transaction::test_utils::{
         create_test_init_data,
@@ -876,7 +906,7 @@ fn committed_data_insufficient_gas_rejects_transaction(runnable: RunnableCairo1,
     }
     let tree = CommittedDataSet::new(entries).unwrap();
     context.committed_data_witnesses =
-        Arc::new(CommittedDataWitnesses::new(vec![tree.witness(Felt::ZERO).unwrap()]).unwrap());
+        Arc::new(CommittedDataWitnesses::new(vec![tree.lookup_witness(Felt::ZERO)]).unwrap());
     let data = create_test_init_data(&context.chain_info, CairoVersion::Cairo1(runnable));
     let mut state = data.state;
     let (address, selector, args) = match mode {
@@ -896,7 +926,7 @@ fn committed_data_insufficient_gas_rejects_transaction(runnable: RunnableCairo1,
     };
     let mut bounds = default_all_resource_bounds();
     let ValidResourceBounds::AllResources(ref mut all) = bounds else { unreachable!() };
-    all.l2_gas.max_amount = GasAmount(4_000_000);
+    all.l2_gas.max_amount = GasAmount(2_000_000);
     let transaction = invoke_tx_with_default_flags(invoke_tx_args! {
         sender_address: data.account_address,
         resource_bounds: bounds,
@@ -932,14 +962,13 @@ fn committed_data_l1_failures_reject_without_state_changes(
         CommittedDataSet,
         CommittedDataWitnesses,
     };
-    use crate::state::state_api::State;
     use crate::transaction::errors::TransactionExecutionError;
     use crate::transaction::transactions::ExecutableTransaction;
     let mut context = BlockContext::create_for_testing();
     context.use_committed_data = true;
     Arc::make_mut(&mut context.versioned_constants.os_constants)
         .l1_handler_max_amount_bounds
-        .l2_gas = GasAmount(4_000_000);
+        .l2_gas = GasAmount(2_000_000);
     let contract = FeatureContract::TestContract(CairoVersion::Cairo1(runnable));
     let mut state = test_state(&context.chain_info, BALANCE, &[(contract, 1)]);
     let mut entries = vec![(Felt::ZERO, Felt::ONE)];
@@ -951,7 +980,7 @@ fn committed_data_l1_failures_reject_without_state_changes(
     let tree = CommittedDataSet::new(entries).unwrap();
     if !missing {
         context.committed_data_witnesses =
-            Arc::new(CommittedDataWitnesses::new(vec![tree.witness(Felt::ZERO).unwrap()]).unwrap());
+            Arc::new(CommittedDataWitnesses::new(vec![tree.lookup_witness(Felt::ZERO)]).unwrap());
     }
     let transaction = executable_l1_handler_tx(L1HandlerTxArgs {
         contract_address: contract.get_instance_address(0),
@@ -990,7 +1019,6 @@ fn committed_data_absence_returns_paid_zero(
         COMMITTED_DATA_ADDRESS,
         CommittedDataSet,
         CommittedDataWitnesses,
-        absence_os_resources,
         resources_gas,
     };
     let contract = FeatureContract::TestContract(CairoVersion::Cairo1(runnable));
@@ -1000,7 +1028,7 @@ fn committed_data_absence_returns_paid_zero(
     ])
     .unwrap();
     let witness = tree.lookup_witness(Felt::ONE);
-    let minimum_gas = resources_gas(&absence_os_resources(witness.siblings.len()));
+    let minimum_gas = resources_gas(&quoted_read_resources(&tree, &[Felt::ONE]));
     let mut context = BlockContext::create_for_testing();
     context.use_committed_data = true;
     context.committed_data_witnesses =
