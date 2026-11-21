@@ -8,12 +8,13 @@ Then add --rust-proofs /tmp/patricia-proofs.json to this script.
 Only private-input hints are substituted. All verifier instructions and standard Patricia
 hints run unchanged, including when deliberately incorrect values/preimages are supplied.
 """
-import copy
 from pathlib import Path
+from typing import NamedTuple
 from starkware.cairo.lang.compiler.cairo_compile import compile_cairo_files
 from starkware.cairo.lang.vm.cairo_runner import CairoRunner
 from starkware.cairo.lang.instances import all_cairo_instance
 from starkware.cairo.lang.vm.security import verify_secure_runner
+from starkware.cairo.lang.vm.vm_exceptions import InconsistentAutoDeductionError, VmException
 from starkware.cairo.common.poseidon_hash import poseidon_hash
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,11 +111,15 @@ def exact_class(root, keys, facts, height=251):
     sibling=(poseidon_hash(bottom,low)+remaining)%PROGRAM.prime if remaining else bottom
     return 1+int(remaining>0),int(sibling>251),len(keys)
 
-def check(entries, keys):
-    root, facts = tree(entries)
-    fixture = dict(root=root, facts=facts, keys=keys, values=entries)
-    result = run(fixture)
-    assert result['values'] == [entries.get(key, 0) for key in keys]
+class Quote(NamedTuple):
+    gas: int
+    steps: int
+    holes: int
+    checks: int
+    hashes: int
+
+
+def quote(root, keys, facts, entries):
     n, u = len(keys), len(set(keys))
     h, k, a = exact_class(root, set(keys), facts)
     assert a == sum(entries.get(key, 0) == 0 for key in set(keys))
@@ -124,37 +129,80 @@ def check(entries, keys):
     holes = 345 + 18*n + 31*u + 31*h + 50*a - 19*f
     rc = 9 + 5*n + 16*u + 20*h + 28*a - 16*f
     charge = 100*steps + 10*holes + 70*rc + 491*h
-    assert 2**64-1-result['first_gas'] == result['first_gas']-result['second_gas'] == charge
-    assert result['warm_rc'] <= rc and result['warm_steps'] <= steps
-    assert result['resources'].n_steps <= 2*steps
-    assert result['resources'].n_memory_holes <= 2*holes
+    return Quote(charge, steps, holes, rc, h)
+
+
+def check(entries, keys, second_keys=None):
+    root, facts = tree(entries)
+    second_keys = keys if second_keys is None else second_keys
+    fixture = dict(root=root, facts=facts, keys=keys, second_keys=second_keys, values=entries)
+    result = run(fixture)
+    assert result['values'] == [entries.get(key, 0) for key in keys]
+    assert result['second_values'] == [entries.get(key, 0) for key in second_keys]
+    first = quote(root, keys, facts, entries)
+    second = quote(root, second_keys, facts, entries)
+    assert 2**64-1-result['first_gas'] == first.gas
+    assert result['first_gas']-result['second_gas'] == second.gas
+    assert result['warm_steps'] <= second.steps and result['warm_rc'] <= second.checks
+    resources = result['resources']
+    assert resources.n_steps <= first.steps + second.steps
+    assert resources.n_memory_holes <= first.holes + second.holes
+    assert resources.builtin_instance_counter['range_check_builtin'] <= first.checks + second.checks
+    assert resources.builtin_instance_counter['poseidon_builtin'] == first.hashes + second.hashes
     return fixture
 
 
 def rejects(fixture):
     try:
         run(fixture)
-    except Exception:
+    except (VmException, InconsistentAutoDeductionError):
         return
     raise AssertionError('Forged input was accepted')
 
 
+def check_union():
+    # Each call authenticates and pays for its own union, even with a partial or full overlap.
+    entries = {key: key+100 for key in range(16)}
+    fixture = check(entries, [0, 1, 0], [0, 8])
+    check(entries, [0, 1, 0])
+    check({0:1, (1<<251)-1:PROGRAM.prime-1}, [0, 1, (1<<251)-1])
+    check({1<<bit:bit+1 for bit in range(251)}, [0, 1, 1<<250])
+    check({i:i+1 for i in range(400)}, list(range(400)))
+    root, facts = fixture['root'], fixture['facts']
+    rejects({**fixture, 'values': {**entries, 0: entries[0] + 1}})
+    rejects({**fixture, 'root': root + 1, 'facts': {**facts, root + 1: facts[root]}})
+    rejects({**fixture, 'facts': {**facts, root: (1, 2)}})
+    rejects({**fixture, 'keys': [1 << 251]})
+    required = sum(quote(root, fixture[name], facts, entries).gas
+                   for name in ('keys', 'second_keys'))
+    assert run({**fixture, 'gas': required})['second_gas'] == 0
+    rejects({**fixture, 'gas': required - 1})
+    print('PASS: Patricia union values, per-call charges, resource vectors and invalid proofs')
+
+
+def check_zero():
+    # Standard Patricia commits an explicit zero and an absent key to the same empty leaf.
+    check({}, [0, 1, (1<<251)-1])
+    check({2:100}, [2, 0, 3, 1<<250, 2])
+    entries = {0:0, 2:100, 4:200}
+    assert tree(entries) == tree({2:100, 4:200})
+    for keys in ([0], [1], [1,2,4], [2,1,4], [2,4,1], [1,2,3,0,1,4],
+                 [1,3,5], [1]*1024, [1,2]*512):
+        check(entries, keys)
+    absent = check({2: 100}, [3])
+    root, facts = absent['root'], absent['facts']
+    length, path, bottom = facts[root]
+    rejects({**absent, 'facts': {**facts, root: (length, path ^ 1, bottom)}})
+    charge = quote(root, absent['keys'], facts, absent['values']).gas
+    rejects({**absent, 'gas': charge - 1})
+    fixture = check({2:100, 3:125, 8:0, 10:200}, list(range(16)))
+    rejects({**fixture, 'values': {**fixture['values'], 6: 999}})
+    print('PASS: zero and missing reads, mixed ordering, duplicates and maximum-size requests')
+
+
 def main():
-    fixtures = [
-        check({}, [0, 1, (1<<251)-1]),
-        check({2:100}, [2, 0, 3, 1<<250, 2]),
-        check({2:100, 3:125, 8:0, 10:200}, list(range(16))),
-        check({0:1, (1<<251)-1:PROGRAM.prime-1}, [0, 1, (1<<251)-1]),
-        check({1<<bit:bit+1 for bit in range(251)}, [0, 1, 1<<250]),
-        check({i:i+1 for i in range(400)}, list(range(400))),
-    ]
-    bad = copy.deepcopy(fixtures[2]); bad['values'][2] += 1; rejects(bad)
-    bad = copy.deepcopy(fixtures[2]); bad['values'][6] = 999; rejects(bad)
-    bad = copy.deepcopy(fixtures[2]); bad['facts'][bad['root']+1] = bad['facts'][bad['root']]; bad['root'] += 1; rejects(bad)
-    bad = copy.deepcopy(fixtures[2]); bad['facts'][bad['root']] = (1, 2); rejects(bad)
-    bad = copy.deepcopy(fixtures[2]); bad['keys'] = [1<<251]; rejects(bad)
-    bad = copy.deepcopy(fixtures[2]); bad['gas'] = 0; rejects(bad)
-    print('PASS: 6 valid Cairo scenarios and 6 adversarial rejection scenarios')
+    check_union()
+    check_zero()
     print('Singleton reference root:', hex(tree({0:PROGRAM.prime-1})[0]))
     import argparse, json
     parser = argparse.ArgumentParser()
