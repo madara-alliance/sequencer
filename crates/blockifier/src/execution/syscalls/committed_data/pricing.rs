@@ -42,18 +42,18 @@ pub(super) fn malformed_resources() -> ExecutionResources {
 }
 
 #[derive(Default)]
-struct ReadClass {
+pub(super) struct ReadClass {
     // Count positions opened, including residual edge hashes; repeated fact hashes still cost
     // work.
-    hashes: usize,
+    pub(super) hashes: usize,
     // Distinct queried keys authenticated as zero, including absence.
-    absent: usize,
+    pub(super) absent: usize,
     // Authenticated frontier siblings greater than 251 cannot be compressed-length markers.
-    large: usize,
+    pub(super) large: usize,
 }
 
 impl ReadClass {
-    fn resources(
+    pub(super) fn resources(
         &self,
         count: usize,
         unique: usize,

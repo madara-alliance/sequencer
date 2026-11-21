@@ -142,10 +142,8 @@ pub fn read_values_shared(
             failure,
         ));
     }
-    let (values, resources) = witnesses
-        .batch(root, keys)
-        .and_then(|proof| proof.priced_values(root, keys, batch))
-        .map_err(|error| availability(error, failure))?;
+    let (values, resources) =
+        witnesses.priced_values(root, keys, batch).map_err(|error| availability(error, failure))?;
     let mut seen = read_set.0.lock().expect("Committed-data read set poisoned");
     if !fits(&seen) {
         return Err(availability(CommittedDataError::TooManyWitnesses, failure));

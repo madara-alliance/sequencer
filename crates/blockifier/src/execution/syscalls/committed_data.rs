@@ -35,6 +35,8 @@ pub(crate) use absence::read_outcome_with_permission;
 pub use sharing::{CommittedDataReadSet, read_values_shared, resources_gas};
 #[allow(deprecated)]
 pub use sharing::{shared_request_resources, standard_path_resources};
+mod flat;
+pub use flat::CommittedDataFlatValue;
 mod pricing;
 pub use pricing::read_permission;
 mod batch;
@@ -227,6 +229,16 @@ pub trait CommittedDataProvider: std::fmt::Debug + Send + Sync {
     ) -> Result<Option<CommittedDataWitness>, CommittedDataError> {
         Ok(None)
     }
+    /// Optional trusted-local fast path for present keys. Values and geometry must come from
+    /// the same complete, root-authenticated publication. Never forward unverified remote rows.
+    /// None retains proof authentication (including absence, old indexes and remote providers).
+    fn flat_values(
+        &self,
+        _root: Felt,
+        _keys: &[Felt],
+    ) -> Result<Option<Vec<CommittedDataFlatValue>>, CommittedDataError> {
+        Ok(None)
+    }
     /// Authenticate the exact requested path union, reusing cached trie nodes when available.
     fn batch(
         &self,
@@ -294,6 +306,23 @@ impl CommittedDataWitnesses {
                 CommittedDataBatchProof::new(root, keys, |key| Ok(self.get(root, key).cloned()))
             }
         }
+    }
+
+    pub(super) fn priced_values(
+        &self,
+        root: Felt,
+        keys: &[Felt],
+        batch: bool,
+    ) -> Result<
+        (Vec<Felt>, cairo_vm::vm::runners::cairo_runner::ExecutionResources),
+        CommittedDataError,
+    > {
+        if let Some(provider) = &self.provider {
+            if let Some(values) = provider.flat_values(root, keys)? {
+                return CommittedDataFlatValue::priced_values(keys, &values, batch);
+            }
+        }
+        self.batch(root, keys)?.priced_values(root, keys, batch)
     }
 
     pub fn get(&self, root: Felt, index: Felt) -> Option<&CommittedDataWitness> {
