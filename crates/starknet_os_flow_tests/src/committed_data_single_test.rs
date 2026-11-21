@@ -5,7 +5,9 @@ use apollo_starknet_os_program::test_programs::COMMITTED_DATA_TEST_BYTES;
 use blockifier::execution::syscalls::committed_data::{
     CommittedDataSet,
     CommittedDataWitness,
-    batch_gas,
+    CommittedDataWitnesses,
+    read_values,
+    resources_gas,
 };
 use blockifier::test_utils::dict_state_reader::DictStateReader;
 use cairo_vm::types::builtin_name::BuiltinName;
@@ -101,13 +103,21 @@ fn standard_reads_require_valid_witnesses_and_sufficient_gas() {
     let tree = CommittedDataSet::new(vec![(Felt::TWO, Felt::from(100))]).unwrap();
     for key in [Felt::ZERO, Felt::TWO, Felt::TWO.pow(250_u32)] {
         let proof = tree.lookup_witness(key);
-        let charge = batch_gas(1, 1, 0);
+        let mut gas = u64::MAX;
+        let bound = read_values(
+            true,
+            &CommittedDataWitnesses::new(vec![proof.clone()]).unwrap(),
+            starknet_api::abi::abi_utils::selector_from_name("get_value").0,
+            &[tree.root(), key],
+            &mut gas,
+            &mut None,
+        )
+        .unwrap()
+        .1;
+        let charge = resources_gas(&bound);
         let (result, resources) = read_measured(proof.clone(), charge, true).unwrap();
         assert_eq!(result, vec![Felt::ZERO.into(), Felt::ZERO.into()]);
-        assert!(
-            resources.n_steps
-                <= blockifier::execution::syscalls::committed_data::read_os_resources(0).n_steps
-        );
+        assert!(resources.n_steps <= bound.n_steps);
         assert!(read_authenticated(proof.clone(), charge - 1, true).is_err());
         let mut forged = proof;
         forged.value += Felt::ONE;

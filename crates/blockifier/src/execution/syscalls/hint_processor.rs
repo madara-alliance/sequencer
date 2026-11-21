@@ -534,8 +534,13 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         syscall_handler.base.maybe_block_direct_execute_call(selector)?;
 
         if *storage_address.0.key() == super::committed_data::COMMITTED_DATA_ADDRESS {
-            let result = super::committed_data::read_outcome(
+            let before_read = *remaining_gas;
+            let permission = super::committed_data::read_permission(
                 syscall_handler.base.context.tx_context.block_context.use_committed_data,
+                syscall_handler.base.context.versioned_constants(),
+            );
+            let result = super::committed_data::read_outcome_with_permission(
+                permission,
                 &syscall_handler.base.context.tx_context.block_context.committed_data_witnesses,
                 &syscall_handler.base.context.tx_context.block_context.committed_data_read_set,
                 selector.0,
@@ -547,7 +552,16 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
                 |_| super::committed_data::failed_read_resources(selector.0, &request.calldata.0),
                 |(_, resources)| resources.clone(),
             );
-            syscall_handler.base.account_committed_data_read(&resources, result.is_err());
+            syscall_handler.base.account_committed_data_read(
+                &resources,
+                result.is_err() && before_read == *remaining_gas,
+            );
+            if before_read != *remaining_gas {
+                syscall_handler
+                    .base
+                    .context
+                    .update_revert_gas_with_next_remaining_gas(GasAmount(*remaining_gas));
+            }
             let (values, _) = result?;
             let segment = create_retdata_segment(vm, syscall_handler, &values)?;
             return Ok(CallContractResponse { segment });

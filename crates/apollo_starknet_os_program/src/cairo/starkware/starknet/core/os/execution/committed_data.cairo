@@ -1,11 +1,11 @@
 // Standard Starknet Poseidon Patricia reads. Hints supply values and node preimages;
-// the existing OS verifier authenticates every distinct (root, key) at block end.
+// the OS independently authenticates each call before returning values and remaining gas.
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.memcpy import memcpy
 from starkware.cairo.common.dict import DictAccess, dict_read, dict_write
 from starkware.cairo.common.default_dict import default_dict_new, default_dict_finalize
 from starkware.cairo.common.cairo_builtins import PoseidonBuiltin, BitwiseBuiltin
-from starkware.cairo.common.math import assert_nn, assert_lt_felt
+from starkware.cairo.common.math import assert_nn, assert_lt_felt, assert_nn_le
 from starkware.cairo.common.patricia_with_sponge import (
     patricia_update_constants_new,
     traverse_prev_tree,
@@ -25,12 +25,6 @@ const COMMITTED_DATA_TREE_HEIGHT = 251;
 const MAX_COMMITTED_DATA_READ_KEYS = 1024;
 const COMMITTED_DATA_GET_VALUE_SELECTOR = 1088514629534027837943348492744869453336870381453867699032131389309368223152;
 const COMMITTED_DATA_GET_VALUES_SELECTOR = 915235083203333064963171029839308968026302113527340519125611694343636180392;
-
-// A root owns an append-only dictionary. Values are pointers so zero is cacheable.
-struct CommittedDataRootCache {
-    start: DictAccess*,
-    end: DictAccess*,
-}
 
 func committed_data_collect{
     range_check_ptr, leaf_cache: DictAccess*, cold_keys: felt*, cold_values: felt*
@@ -53,58 +47,65 @@ func committed_data_collect{
     return committed_data_collect(keys + 1, count - 1, references + 1);
 }
 
-func committed_data_root_cache{committed_data_cache: DictAccess*}(root: felt) -> (
-    start: DictAccess*, end: DictAccess*
-) {
-    let (cached) = dict_read{dict_ptr=committed_data_cache}(key=root);
-    if (cached == 0) {
-        let (start) = default_dict_new(0);
-        return (start=start, end=start);
-    }
-    let certificate = cast(cached, CommittedDataRootCache*);
-    return (start=certificate.start, end=certificate.end);
-}
-
 // The squashed dictionary fixes the exact set of reads. Convert its value pointers
 // into standard read-only Patricia accesses, including absent keys with value zero.
-func committed_data_fill_reads(entries: DictAccess*, count: felt, reads: DictAccess*) {
+func committed_data_fill_reads(
+    entries: DictAccess*, count: felt, reads: DictAccess*, absent_so_far: felt
+) -> (absent: felt) {
     if (count == 0) {
-        return ();
+        return (absent=absent_so_far);
     }
     let value = [cast(entries.new_value, felt*)];
     assert reads[0] = DictAccess(key=entries.key, prev_value=value, new_value=value);
-    return committed_data_fill_reads(entries + DictAccess.SIZE, count - 1, reads + DictAccess.SIZE);
+    if (value == 0) {
+        return committed_data_fill_reads(
+            entries + DictAccess.SIZE, count - 1, reads + DictAccess.SIZE, absent_so_far + 1
+        );
+    }
+    return committed_data_fill_reads(
+        entries + DictAccess.SIZE, count - 1, reads + DictAccess.SIZE, absent_so_far
+    );
+}
+
+// Count every authenticated sibling whose canonical felt exceeds the tree height.
+func count_large_siblings{range_check_ptr}(siblings: felt*, size: felt, large: felt) -> (
+    total: felt
+) {
+    if (size == 0) {
+        return (total=large);
+    }
+    let small = is_le_felt([siblings], COMMITTED_DATA_TREE_HEIGHT);
+    return count_large_siblings(siblings + 1, size - 1, large + 1 - small);
 }
 
 func committed_data_finalize{
     range_check_ptr, bitwise_ptr: BitwiseBuiltin*, poseidon_ptr: PoseidonBuiltin*
 }(start: DictAccess*, end: DictAccess*) {
-    %{ StartCommittedDataFinalization %}
-    let (roots, roots_end) = default_dict_finalize(start, end, 0);
-    committed_data_finalize_roots(roots, roots_end);
-    %{ EndCommittedDataFinalization %}
+    // Successful calls use private leaf dictionaries. The carried pointer is unchanged.
+    assert start = end;
     return ();
 }
 
-func committed_data_finalize_roots{
+// A single bounded request owns the entire chronological dictionary.
+func committed_data_verify{
     range_check_ptr, bitwise_ptr: BitwiseBuiltin*, poseidon_ptr: PoseidonBuiltin*
-}(roots: DictAccess*, roots_end: DictAccess*) {
+}(committed_data_root: felt, start: DictAccess*, end: DictAccess*) -> (
+    unique: felt, hashes: felt, absent: felt, large: felt
+) {
     alloc_locals;
-    if (roots == roots_end) {
-        return ();
-    }
-    local roots_next: DictAccess* = roots + DictAccess.SIZE;
-    local roots_end: DictAccess* = roots_end;
-    local committed_data_root = roots.key;
-    let certificate = cast(roots.new_value, CommittedDataRootCache*);
-    let (entries, entries_end) = default_dict_finalize(certificate.start, certificate.end, 0);
+    %{ StartCommittedDataFinalization %}
+    let (entries, entries_end) = default_dict_finalize(start, end, 0);
     local committed_data_count = (entries_end - entries) / DictAccess.SIZE;
     let (local committed_data_keys: DictAccess*) = alloc();
-    committed_data_fill_reads(entries, committed_data_count, committed_data_keys);
+    let (local absent) = committed_data_fill_reads(
+        entries, committed_data_count, committed_data_keys, 0
+    );
     %{ LoadCommittedDataRootUnion %}
     let (constants) = patricia_update_constants_new();
-    let (siblings) = alloc();
-    let hash_ptr = cast(poseidon_ptr, SpongeHashBuiltin*);
+    let (local siblings_start) = alloc();
+    let siblings = siblings_start;
+    local hash_start: SpongeHashBuiltin* = cast(poseidon_ptr, SpongeHashBuiltin*);
+    let hash_ptr = hash_start;
     with hash_ptr, siblings {
         traverse_prev_tree(
             patricia_update_constants=constants,
@@ -115,8 +116,38 @@ func committed_data_finalize_roots{
             new_root=committed_data_root,
         );
     }
+    local s = siblings - siblings_start;
+    local h = (hash_ptr - hash_start) / SpongeHashBuiltin.SIZE;
+    assert_nn_le(h, 2 * COMMITTED_DATA_TREE_HEIGHT * committed_data_count);
+    assert_nn_le(s, h + 2 * absent);
+    let (large) = count_large_siblings(siblings_start, s, 0);
     let poseidon_ptr = cast(hash_ptr, PoseidonBuiltin*);
-    return committed_data_finalize_roots(roots_next, roots_end);
+    %{ EndCommittedDataFinalization %}
+    return (unique=committed_data_count, hashes=h, absent=absent, large=large);
+}
+
+func binary_floor(unique: felt, absent: felt, large: felt) -> (floor: felt) {
+    let total = unique - absent + large;
+    if (total == 0) {
+        return (floor=0);
+    }
+    return (floor=total - 1);
+}
+
+// Coefficients combine the compiled step, hole, range-check and Poseidon envelopes.
+func committed_data_charge{range_check_ptr}(n: felt, u: felt, h: felt, a: felt, k: felt) -> (
+    charge: felt
+) {
+    let (f) = binary_floor(u, a, k);
+    assert_nn_le(a, u);
+    assert_nn_le(f, h);
+    let steps = 2415 + 86 * n + 231 * u + 249 * h + 287 * a - 167 * f;
+    let holes = 345 + 18 * n + 31 * u + 31 * h + 50 * a - 19 * f;
+    let checks = 9 + 5 * n + 16 * u + 20 * h + 28 * a - 16 * f;
+    return (
+        charge=steps * STEP_GAS_COST + holes * MEMORY_HOLE_GAS_COST + checks *
+        RANGE_CHECK_GAS_COST + h * POSEIDON_GAS_COST,
+    );
 }
 
 func committed_data_copy_values(references: felt*, values: felt*, count: felt) {
@@ -144,8 +175,8 @@ func committed_data_dispatch{
     let (local references) = alloc();
     let cold_keys = cold_keys_start;
     let cold_values = cold_values_start;
-    let (local leaf_start, leaf_end) = committed_data_root_cache(root);
-    let leaf_cache = leaf_end;
+    let (local leaf_start) = default_dict_new(0);
+    let leaf_cache = leaf_start;
     with cold_keys, cold_values, leaf_cache {
         committed_data_collect(keys, count, references);
     }
@@ -153,13 +184,8 @@ func committed_data_dispatch{
     local committed_data_cold_values: felt* = cold_values_start;
     local committed_data_cold_count = cold_keys - cold_keys_start;
     %{ LoadCommittedDataDeferred %}
-    tempvar certificate = new CommittedDataRootCache(start=leaf_start, end=leaf_cache);
-    dict_write{dict_ptr=committed_data_cache}(key=root, new_value=cast(certificate, felt));
-    // Deliberately conservative prototype tariff: one full-height path per new key.
-    // No unverified hint controls charges. Warm reads only pay dictionary/copy work.
-    local charge = (800 + 80 * count + 252000 * committed_data_cold_count) * 100 + (
-        20 + 4 * count + 25200 * committed_data_cold_count
-    ) * 70 + 502 * committed_data_cold_count * 491;
+    let (u, h, a, k) = committed_data_verify(root, leaf_start, leaf_cache);
+    let (local charge) = committed_data_charge(count, u, h, a, k);
     local range_check_ptr = range_check_ptr;
     local poseidon_ptr: PoseidonBuiltin* = poseidon_ptr;
     local bitwise_ptr: BitwiseBuiltin* = bitwise_ptr;
@@ -261,11 +287,20 @@ func execute_committed_data_call{
 }
 
 from starkware.cairo.common.math_cmp import is_le_felt, is_le
-from starkware.starknet.core.os.constants import ERROR_INVALID_ARGUMENT
+from starkware.starknet.core.os.constants import (
+    ERROR_INVALID_ARGUMENT,
+    STEP_GAS_COST,
+    MEMORY_HOLE_GAS_COST,
+    RANGE_CHECK_GAS_COST,
+    POSEIDON_GAS_COST,
+)
 
-@known_ap_change
-func committed_data_failure{syscall_ptr: felt*}(remaining_gas: felt, error: felt) {
-    assert [cast(syscall_ptr, ResponseHeader*)] = ResponseHeader(gas=remaining_gas, failure_flag=1);
+func committed_data_failure{syscall_ptr: felt*, range_check_ptr}(remaining_gas: felt, error: felt) {
+    let after_charge = remaining_gas - (
+        184 * STEP_GAS_COST + 43 * MEMORY_HOLE_GAS_COST + 9 * RANGE_CHECK_GAS_COST
+    );
+    assert_nn(after_charge);
+    assert [cast(syscall_ptr, ResponseHeader*)] = ResponseHeader(gas=after_charge, failure_flag=1);
     let reason = cast(syscall_ptr + ResponseHeader.SIZE, FailureReason*);
     assert reason.end = reason.start + 1;
     assert reason.start[0] = error;

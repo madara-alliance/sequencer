@@ -72,23 +72,62 @@ def run(fixture):
     runner.read_return_values()
     runner.vm.verify_auto_deductions()
     verify_secure_runner(runner)
+    runner.get_cairo_pie().run_validity_checks()
     result['resources'] = runner.get_execution_resources()
     return result
 
+
+def exact_class(root, keys, facts, height=251):
+    """Count opening occurrences, all large emissions and zero values, independent of VM output."""
+    if not keys:
+        return 0,0,0
+    if root == 0:
+        return 0,0,len(keys)
+    if height == 0:
+        assert len(keys)==1
+        return 0,0,0
+    node=facts[root]
+    if len(node)==2:
+        left,right=node
+        assert poseidon_hash(left,right)==root
+        lkeys={key for key in keys if not key & (1<<(height-1))}
+        rkeys=keys-lkeys
+        lh,lk,la=exact_class(left,lkeys,facts,height-1)
+        rh,rk,ra=exact_class(right,rkeys,facts,height-1)
+        return 1+lh+rh, lk+rk+int(not lkeys and left>251)+int(not rkeys and right>251), la+ra
+    length,path,bottom=node
+    assert 1<=length<=height and path<(1<<length)
+    assert (poseidon_hash(bottom,path)+length)%PROGRAM.prime==root
+    diffs={q:((q>>(height-length))% (1<<length)) ^ path for q in keys}
+    matches={q for q,diff in diffs.items() if diff==0}
+    if matches:
+        h,k,a=exact_class(bottom,matches,facts,height-length)
+        return 1+h,k,a+len(keys)-len(matches)
+    # The last query to diverge sees the whole residual committed-side child.
+    # Earlier divergences query both sides of their fork and emit no sibling there.
+    remaining=min(diff.bit_length()-1 for diff in diffs.values())
+    low=path % (1<<remaining)
+    sibling=(poseidon_hash(bottom,low)+remaining)%PROGRAM.prime if remaining else bottom
+    return 1+int(remaining>0),int(sibling>251),len(keys)
 
 def check(entries, keys):
     root, facts = tree(entries)
     fixture = dict(root=root, facts=facts, keys=keys, values=entries)
     result = run(fixture)
     assert result['values'] == [entries.get(key, 0) for key in keys]
-    cold = len(set(keys))
-    shared = (800+80*len(keys))*100 + (20+4*len(keys))*70
-    charge = shared + cold*(252000*100+25200*70+502*491)
-    assert result['first_gas'] == 2**64-1-charge
-    assert result['second_gas'] == result['first_gas']-shared
-    assert result['warm_rc'] <= 20+4*len(keys), (len(keys), result['warm_rc'])
-    assert result['warm_steps'] <= 800+80*len(keys), (len(keys), result['warm_steps'])
-    assert result['resources'].n_steps <= 2*(800+80*len(keys)) + 252000*cold
+    n, u = len(keys), len(set(keys))
+    h, k, a = exact_class(root, set(keys), facts)
+    assert a == sum(entries.get(key, 0) == 0 for key in set(keys))
+    f = max(k+u-a-1, 0)
+    assert 0 <= f <= h
+    steps = 2415 + 86*n + 231*u + 249*h + 287*a - 167*f
+    holes = 345 + 18*n + 31*u + 31*h + 50*a - 19*f
+    rc = 9 + 5*n + 16*u + 20*h + 28*a - 16*f
+    charge = 100*steps + 10*holes + 70*rc + 491*h
+    assert 2**64-1-result['first_gas'] == result['first_gas']-result['second_gas'] == charge
+    assert result['warm_rc'] <= rc and result['warm_steps'] <= steps
+    assert result['resources'].n_steps <= 2*steps
+    assert result['resources'].n_memory_holes <= 2*holes
     return fixture
 
 
