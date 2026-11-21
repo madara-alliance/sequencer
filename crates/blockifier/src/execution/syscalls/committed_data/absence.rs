@@ -1,30 +1,11 @@
-//! Zero-default reads backed by authenticated non-membership proofs.
-//! Unavailable evidence remains an availability failure; it never supplies a default value.
+//! Missing keys use the same standard Patricia verifier and tariff as present keys.
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 
 use super::*;
-
-// A second traversal compares both keys at every committed branch. High-bit extraction
-// is the worst case; the direct Cairo matrix includes memory holes in the step bound.
-const ABSENCE_STEPS_BASE: usize = 200;
-const ABSENCE_STEPS_PER_LEVEL: usize = 300;
-const ABSENCE_RANGE_CHECKS_BASE: usize = 20;
-const ABSENCE_RANGE_CHECKS_PER_LEVEL: usize = 20;
-
-/// Additional key decomposition/routing checks; leaf and branch hashes are unchanged.
-/// These bounds must cover Cairo steps plus memory holes at every supported depth.
-pub fn absence_os_resources(height: usize) -> ExecutionResources {
-    use cairo_vm::types::builtin_name::BuiltinName;
-    let mut resources = read_os_resources(height);
-    resources.n_steps += ABSENCE_STEPS_BASE + ABSENCE_STEPS_PER_LEVEL * height;
-    *resources.builtin_instance_counter.entry(BuiltinName::range_check).or_default() +=
-        ABSENCE_RANGE_CHECKS_BASE + ABSENCE_RANGE_CHECKS_PER_LEVEL * height;
-    resources
+#[deprecated(note = "PR10 estimate. Use read_values with authenticated witnesses for PR11 pricing.")]
+pub fn absence_os_resources(_height: usize) -> ExecutionResources {
+    sharing::cf40_resources(1, 1)
 }
-
-/// Return zero only after authenticating absence. Present runs retain the shared membership
-/// schedule; absence paths are paid independently, including duplicates and repeated calls.
-/// Stage accounting so an unavailable suffix or insufficient gas cannot warm a partial read.
 pub fn read_outcome(
     enabled: bool,
     witnesses: &CommittedDataWitnesses,
@@ -34,121 +15,24 @@ pub fn read_outcome(
     remaining_gas: &mut u64,
     failure: &mut Option<CommittedDataError>,
 ) -> Result<(Vec<Felt>, ExecutionResources), SyscallExecutorBaseError> {
-    let Ok((keys, batch)) = read_keys(selector, calldata) else {
-        return read_values_shared(
-            enabled,
-            witnesses,
-            read_set,
-            selector,
-            calldata,
-            remaining_gas,
-            failure,
-        );
-    };
-    if !enabled {
-        return read_values_shared(
-            enabled,
-            witnesses,
-            read_set,
-            selector,
-            calldata,
-            remaining_gas,
-            failure,
-        );
-    }
-    let root = calldata[0];
-    if let Some(provider) = &witnesses.provider {
-        provider.prefetch(root, keys).map_err(|error| availability(selector, error, failure))?;
-    }
-    // Provider errors are not absence. Authenticate every absent route before accounting work.
-    let mut absent = Vec::with_capacity(keys.len());
-    for key in keys {
-        let proof = match witnesses
-            .value(root, *key)
-            .map_err(|error| availability(selector, error, failure))?
-        {
-            Some(_) => None,
-            None => Some(
-                witnesses
-                    .absence(root, *key)
-                    .map_err(|error| availability(selector, error, failure))?
-                    .siblings
-                    .len(),
-            ),
-        };
-        absent.push(proof);
-    }
-    if absent.iter().all(Option::is_none) {
-        return read_values_shared(
-            enabled,
-            witnesses,
-            read_set,
-            selector,
-            calldata,
-            remaining_gas,
-            failure,
-        );
-    }
-    let staged = read_set.fork();
-    let mut gas = *remaining_gas;
-    let mut resources = ExecutionResources::default();
-    let mut values = Vec::with_capacity(keys.len() + usize::from(batch));
-    if batch {
-        values.push(Felt::from(keys.len()));
-    }
-    let mut index = 0;
-    while index < keys.len() {
-        if index > 0 {
-            // Each sub-read deducts CallContract's allowance; the outer call supplies it once.
-            let overhead = ExecutionResources {
-                n_steps: CALL_CONTRACT_STEPS,
-                builtin_instance_counter: [(
-                    cairo_vm::types::builtin_name::BuiltinName::range_check,
-                    CALL_CONTRACT_RANGE_CHECKS,
-                )]
-                .into(),
-                n_memory_holes: 0,
-            };
-            charge_authenticated_read(selector, resources_gas(&overhead), &mut gas, failure)?;
-            resources += &overhead;
-        }
-        if let Some(height) = absent[index] {
-            staged
-                .check_witness_capacity(root, keys[index])
-                .map_err(|error| availability(selector, error, failure))?;
-            let cost = absence_os_resources(height);
-            charge_authenticated_read(selector, resources_gas(&cost), &mut gas, failure)?;
-            staged.record_absence(root, keys[index]);
-            resources += &cost;
-            values.push(Felt::ZERO);
-            index += 1;
-        } else {
-            let end = (index..keys.len())
-                .find(|position| absent[*position].is_some())
-                .unwrap_or(keys.len());
-            let mut run = vec![root, Felt::from(end - index)];
-            run.extend_from_slice(&keys[index..end]);
-            let (members, cost) =
-                read_values_shared(true, witnesses, &staged, selector, &run, &mut gas, failure)?;
-            values.extend_from_slice(&members[1..]);
-            resources += &cost;
-            index = end;
-        }
-    }
-    read_set.replace_with(&staged);
-    *remaining_gas = gas;
-    Ok((values, resources))
+    read_values_shared(enabled, witnesses, read_set, selector, calldata, remaining_gas, failure)
 }
 
-fn availability(
+pub(crate) fn read_outcome_with_permission(
+    permission: Result<bool, CommittedDataError>,
+    witnesses: &CommittedDataWitnesses,
+    read_set: &CommittedDataReadSet,
     selector: Felt,
-    error: CommittedDataError,
+    calldata: &[Felt],
+    remaining_gas: &mut u64,
     failure: &mut Option<CommittedDataError>,
-) -> SyscallExecutorBaseError {
-    let result =
-        SyscallExecutorBaseError::InvalidSyscallInput { input: selector, info: error.to_string() };
-    failure.get_or_insert(error);
-    result
+) -> Result<(Vec<Felt>, ExecutionResources), SyscallExecutorBaseError> {
+    let enabled = permission.map_err(|error| {
+        let info = error.to_string();
+        failure.get_or_insert(error);
+        SyscallExecutorBaseError::InvalidSyscallInput { input: selector, info }
+    })?;
+    read_outcome(enabled, witnesses, read_set, selector, calldata, remaining_gas, failure)
 }
 
 #[cfg(test)]
@@ -218,7 +102,7 @@ mod tests {
     #[case::all_absent(vec![Felt::TWO, Felt::THREE, Felt::TWO])]
     #[case::alternating(vec![Felt::TWO, Felt::ONE, Felt::THREE, Felt::ZERO, Felt::TWO])]
     #[case::maximum_duplicates(vec![Felt::TWO; MAX_COMMITTED_DATA_READ_KEYS])]
-    fn mixed_reads_preserve_order_and_charge_repeated_absence(#[case] keys: Vec<Felt>) {
+    fn mixed_reads_preserve_order_and_cache_absence(#[case] keys: Vec<Felt>) {
         let tree =
             CommittedDataSet::new(vec![(Felt::ZERO, Felt::ZERO), (Felt::ONE, Felt::MAX)]).unwrap();
         let witnesses = CommittedDataWitnesses::new(
@@ -249,10 +133,6 @@ mod tests {
                 .collect();
             assert_eq!(values, expected);
             assert_eq!(u64::MAX - gas, resources_gas(&resources));
-            let absent_count = keys.iter().filter(|key| **key > Felt::ONE).count() as u64;
-            assert!(
-                resources_gas(&resources) >= absent_count * resources_gas(&absence_os_resources(1))
-            );
         }
     }
 

@@ -192,10 +192,18 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
             }
             use blockifier::execution::syscalls::committed_data::{
                 CommittedDataWitnesses,
-                read_keys,
+                metered_read_keys,
                 read_outcome,
+                read_permission,
             };
-            let (keys, _) = read_keys(request.function_selector.0, &request.calldata.0)?;
+            let enabled = read_permission(true, syscall_handler.versioned_constants())
+                .map_err(|e| invalid(&e.to_string()))?;
+            let (keys, _) = metered_read_keys(
+                request.function_selector.0,
+                &request.calldata.0,
+                remaining_gas,
+                &mut None,
+            )?;
             let root = request.calldata.0[0];
             // Zero-default batches authenticate every requested key, including absent keys.
             let unique: std::collections::BTreeSet<_> = keys.iter().copied().collect();
@@ -218,7 +226,7 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
                 .0;
             let read_set = syscall_handler.committed_data_billing.entry(block).or_default();
             let (values, _) = read_outcome(
-                true,
+                enabled,
                 &witnesses,
                 read_set,
                 request.function_selector.0,
