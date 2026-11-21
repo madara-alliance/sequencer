@@ -242,9 +242,12 @@ mod tests {
         impl CommittedDataProvider for Provider {
             fn flat_values(
                 &self,
-                _: Felt,
+                root: Felt,
                 keys: &[Felt],
             ) -> Result<Option<Vec<CommittedDataFlatValue>>, CommittedDataError> {
+                if root != self.tree.root() {
+                    return Err(CommittedDataError::Provider("flat index unavailable".into()));
+                }
                 if keys.iter().any(|&k| self.tree.lookup_witness(k).read_value() == Felt::ZERO) {
                     return Ok(None);
                 }
@@ -271,6 +274,14 @@ mod tests {
         let root = tree.root();
         let provider = Arc::new(Provider { tree, batches: AtomicUsize::new(0) });
         let witnesses = CommittedDataWitnesses::from_provider(provider.clone());
+        assert_eq!(
+            witnesses
+                .priced_values(Felt::ZERO, &[Felt::ONE, Felt::TWO], true)
+                .unwrap_err()
+                .to_string(),
+            "Committed-data provider failed: batch unavailable for root 0x0 (first requested key \
+             0x1, 2 requested): flat index unavailable"
+        );
         for (key, expected_batches) in [(Felt::ONE, 0), (Felt::TWO, 1)] {
             let expected = CommittedDataBatchProof::from_dataset(&provider.tree, &[key])
                 .unwrap()

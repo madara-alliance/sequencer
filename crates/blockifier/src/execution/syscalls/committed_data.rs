@@ -206,6 +206,18 @@ pub enum CommittedDataError {
     Provider(String),
 }
 
+impl CommittedDataError {
+    /// Keep opaque provider failures actionable without copying every requested key into the error.
+    fn with_batch_context(self, root: Felt, keys: &[Felt]) -> Self {
+        let Self::Provider(detail) = self else { return self };
+        let request = match keys.first() {
+            Some(key) => format!("first requested key {key:#x}, {} requested", keys.len()),
+            None => "0 requested keys".to_owned(),
+        };
+        Self::Provider(format!("batch unavailable for root {root:#x} ({request}): {detail}"))
+    }
+}
+
 /// Indexed witnesses authenticated before execution; shared immutably by replay workers.
 #[derive(Clone, Debug, Default)]
 pub struct CommittedDataWitnesses {
@@ -301,7 +313,9 @@ impl CommittedDataWitnesses {
         keys: &[Felt],
     ) -> Result<CommittedDataBatchProof, CommittedDataError> {
         match &self.provider {
-            Some(provider) => provider.batch(root, keys),
+            Some(provider) => {
+                provider.batch(root, keys).map_err(|error| error.with_batch_context(root, keys))
+            }
             None => {
                 CommittedDataBatchProof::new(root, keys, |key| Ok(self.get(root, key).cloned()))
             }
@@ -318,7 +332,10 @@ impl CommittedDataWitnesses {
         CommittedDataError,
     > {
         if let Some(provider) = &self.provider {
-            if let Some(values) = provider.flat_values(root, keys)? {
+            if let Some(values) = provider
+                .flat_values(root, keys)
+                .map_err(|error| error.with_batch_context(root, keys))?
+            {
                 return CommittedDataFlatValue::priced_values(keys, &values, batch);
             }
         }
@@ -447,6 +464,32 @@ mod tests {
 
     use super::*;
     use crate::blockifier_versioned_constants::VersionedConstants;
+
+    #[test]
+    fn provider_batch_context_is_bounded_and_preserves_typed_errors() {
+        let root = Felt::from(0x1234_u32);
+        let mut keys = vec![Felt::TWO; MAX_COMMITTED_DATA_READ_KEYS];
+        keys[0] = Felt::ONE;
+        for (request, expected) in [
+            (&keys[..], "first requested key 0x1, 1024 requested"),
+            (&keys[..0], "0 requested keys"),
+        ] {
+            let error = CommittedDataError::Provider("Missing dataset".into())
+                .with_batch_context(root, request);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Committed-data provider failed: batch unavailable for root 0x1234 \
+                     ({expected}): Missing dataset"
+                )
+            );
+        }
+        let error = CommittedDataError::Unavailable { root, key: Felt::TWO }
+            .with_batch_context(root, &keys);
+        assert!(
+            matches!(error, CommittedDataError::Unavailable { root: r, key } if r == root && key == Felt::TWO)
+        );
+    }
 
     #[test]
     fn batch_reads_preserve_order_charge_resources_and_reject_partial_success() {
