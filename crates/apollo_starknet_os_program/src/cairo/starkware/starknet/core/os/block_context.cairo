@@ -1,3 +1,4 @@
+from starkware.cairo.common.patricia_utils import PatriciaUpdateConstants
 from starkware.cairo.common.math import unsigned_div_rem
 from starkware.cairo.common.registers import get_fp_and_pc
 from starkware.starknet.common.new_syscalls import BlockInfo
@@ -38,6 +39,8 @@ struct OsGlobalContext {
     execute_syscalls_ptr: felt*,
     // A function pointer to the 'execute_deprecated_syscalls' function.
     execute_deprecated_syscalls_ptr: felt*,
+    // Immutable verifier constants shared by all committed-data calls in this OS run.
+    committed_data_patricia_constants: PatriciaUpdateConstants*,
 }
 
 // Represents information that is the same throughout the block.

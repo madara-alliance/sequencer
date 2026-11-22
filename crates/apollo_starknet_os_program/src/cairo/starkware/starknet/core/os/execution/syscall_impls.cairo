@@ -202,6 +202,7 @@ func execute_call_contract{
             request=request,
             remaining_gas=remaining_gas,
             use_committed_data=block_context.os_global_context.use_committed_data,
+            constants=block_context.os_global_context.committed_data_patricia_constants,
         );
         return ();
     }

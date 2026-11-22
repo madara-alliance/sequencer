@@ -74,6 +74,16 @@ def run(fixture):
     runner.vm.verify_auto_deductions()
     verify_secure_runner(runner)
     runner.get_cairo_pie().run_validity_checks()
+    # Constants must be initialized once outside both calls, never inside a traversal.
+    constants_pc = runner.program_base + PROGRAM.get_label(
+        'starkware.cairo.common.patricia_with_sponge.patricia_update_constants_new',
+        full_name_lookup=True,
+    )
+    constants_steps = [index for index, entry in enumerate(runner.vm.trace)
+                       if entry.pc == constants_pc]
+    assert len(constants_steps) == 1, constants_steps
+    assert constants_steps[0] < result['first_start'], constants_steps
+    result['constants_initializations'] = len(constants_steps)
     result['resources'] = runner.get_execution_resources()
     return result
 

@@ -10,6 +10,7 @@ from starkware.cairo.common.patricia_with_sponge import (
     patricia_update_constants_new,
     traverse_prev_tree,
 )
+from starkware.cairo.common.patricia_utils import PatriciaUpdateConstants
 from starkware.cairo.common.sponge_as_hash import SpongeHashBuiltin
 from starkware.starknet.core.os.output import OsCarriedOutputs
 from starkware.starknet.core.os.builtins import BuiltinPointers, SelectableBuiltins
@@ -25,6 +26,17 @@ const COMMITTED_DATA_TREE_HEIGHT = 251;
 const MAX_COMMITTED_DATA_READ_KEYS = 1024;
 const COMMITTED_DATA_GET_VALUE_SELECTOR = 1088514629534027837943348492744869453336870381453867699032131389309368223152;
 const COMMITTED_DATA_GET_VALUES_SELECTOR = 915235083203333064963171029839308968026302113527340519125611694343636180392;
+
+// Called once from OS global initialization. Disabled runs need no price-tree table.
+func committed_data_constants_new(use_committed_data: felt) -> (
+    constants: PatriciaUpdateConstants*
+) {
+    if (use_committed_data == 0) {
+        return (constants=cast(0, PatriciaUpdateConstants*));
+    }
+    let (constants) = patricia_update_constants_new();
+    return (constants=constants);
+}
 
 func committed_data_collect{
     range_check_ptr, leaf_cache: DictAccess*, cold_keys: felt*, cold_values: felt*
@@ -89,9 +101,12 @@ func committed_data_finalize{
 // A single bounded request owns the entire chronological dictionary.
 func committed_data_verify{
     range_check_ptr, bitwise_ptr: BitwiseBuiltin*, poseidon_ptr: PoseidonBuiltin*
-}(committed_data_root: felt, start: DictAccess*, end: DictAccess*) -> (
-    unique: felt, hashes: felt, absent: felt, large: felt
-) {
+}(
+    committed_data_root: felt,
+    start: DictAccess*,
+    end: DictAccess*,
+    constants: PatriciaUpdateConstants*,
+) -> (unique: felt, hashes: felt, absent: felt, large: felt) {
     alloc_locals;
     %{ StartCommittedDataFinalization %}
     let (entries, entries_end) = default_dict_finalize(start, end, 0);
@@ -101,7 +116,6 @@ func committed_data_verify{
         entries, committed_data_count, committed_data_keys, 0
     );
     %{ LoadCommittedDataRootUnion %}
-    let (constants) = patricia_update_constants_new();
     let (local siblings_start) = alloc();
     let siblings = siblings_start;
     local hash_start: SpongeHashBuiltin* = cast(poseidon_ptr, SpongeHashBuiltin*);
@@ -163,9 +177,15 @@ func committed_data_dispatch{
     poseidon_ptr: PoseidonBuiltin*,
     bitwise_ptr: BitwiseBuiltin*,
     committed_data_cache: DictAccess*,
-}(root: felt, keys: felt*, count: felt, values: felt*, gas: felt, batch: felt) -> (
-    gas: felt, error: felt
-) {
+}(
+    root: felt,
+    keys: felt*,
+    count: felt,
+    values: felt*,
+    gas: felt,
+    batch: felt,
+    constants: PatriciaUpdateConstants*,
+) -> (gas: felt, error: felt) {
     alloc_locals;
     local committed_data_root = root;
     local committed_data_keys: felt* = keys;
@@ -184,7 +204,7 @@ func committed_data_dispatch{
     local committed_data_cold_values: felt* = cold_values_start;
     local committed_data_cold_count = cold_keys - cold_keys_start;
     %{ LoadCommittedDataDeferred %}
-    let (u, h, a, k) = committed_data_verify(root, leaf_start, leaf_cache);
+    let (u, h, a, k) = committed_data_verify(root, leaf_start, leaf_cache, constants);
     let (local charge) = committed_data_charge(count, u, h, a, k);
     local range_check_ptr = range_check_ptr;
     local poseidon_ptr: PoseidonBuiltin* = poseidon_ptr;
@@ -201,7 +221,12 @@ func committed_data_dispatch{
 
 func execute_committed_data_call{
     range_check_ptr, syscall_ptr: felt*, builtin_ptrs: BuiltinPointers*, outputs: OsCarriedOutputs*
-}(request: CallContractRequest*, remaining_gas: felt, use_committed_data: felt) {
+}(
+    request: CallContractRequest*,
+    remaining_gas: felt,
+    use_committed_data: felt,
+    constants: PatriciaUpdateConstants*,
+) {
     alloc_locals;
     assert request.contract_address = COMMITTED_DATA_CONTRACT_ADDRESS;
     assert use_committed_data = 1;
@@ -248,7 +273,7 @@ func execute_committed_data_call{
     let committed_data_cache = outputs.committed_data_cache;
     with poseidon_ptr, bitwise_ptr, committed_data_cache {
         let (local gas, local error) = committed_data_dispatch(
-            request.calldata_start[0], keys, count, values, remaining_gas, batch
+            request.calldata_start[0], keys, count, values, remaining_gas, batch, constants
         );
     }
     tempvar outputs = new OsCarriedOutputs(
