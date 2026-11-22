@@ -10,7 +10,10 @@ from starkware.cairo.common.cairo_builtins import (
     PoseidonBuiltin,
 )
 from starkware.cairo.common.default_dict import default_dict_new
-from starkware.starknet.core.os.execution.committed_data import committed_data_finalize
+from starkware.starknet.core.os.execution.committed_data import (
+    committed_data_constants_new,
+    committed_data_finalize,
+)
 from starkware.cairo.common.dict import dict_new
 from starkware.cairo.common.dict_access import DictAccess
 from starkware.cairo.common.math import assert_not_equal
@@ -205,8 +208,9 @@ func execute_blocks{
     let (messages_to_l2: MessageToL2Header*) = alloc();
     let (committed_data_cache: DictAccess*) = default_dict_new(0);
     tempvar initial_carried_outputs = new OsCarriedOutputs(
-        messages_to_l1=messages_to_l1, messages_to_l2=messages_to_l2,
-        committed_data_cache=committed_data_cache
+        messages_to_l1=messages_to_l1,
+        messages_to_l2=messages_to_l2,
+        committed_data_cache=committed_data_cache,
     );
     let (
         contract_state_changes: DictAccess*, contract_class_changes: DictAccess*
@@ -292,6 +296,16 @@ func get_os_global_context{
     pedersen_ptr: HashBuiltin*, range_check_ptr, poseidon_ptr: PoseidonBuiltin*
 }(n_public_keys: felt, public_keys: felt*) -> OsGlobalContext* {
     alloc_locals;
+    // Execution permission is not chain configuration. Both inputs use the same syscall rules;
+    // false only rejects runs that access the permanently reserved committed-data address.
+    local use_committed_data;
+    %{ LoadUseCommittedData %}
+    assert use_committed_data * use_committed_data = use_committed_data;
+
+    let (local committed_data_patricia_constants) = committed_data_constants_new(
+        use_committed_data
+    );
+
     // Compiled class facts bundle.
     let (n_compiled_class_facts, compiled_class_facts, builtin_costs) = guess_compiled_class_facts(
         );
@@ -328,12 +342,6 @@ func get_os_global_context{
         assert virtual_os_config_hash = starknet_os_config_hash;
     }
 
-    // Execution permission is not chain configuration. Both inputs use the same syscall rules;
-    // false only rejects runs that access the permanently reserved committed-data address.
-    local use_committed_data;
-    %{ LoadUseCommittedData %}
-    assert use_committed_data * use_committed_data = use_committed_data;
-
     // Function pointers.
     let (execute_syscalls_ptr) = get_label_location(label_value=execute_syscalls);
     let (execute_deprecated_syscalls_ptr) = get_execute_deprecated_syscalls_ptr();
@@ -353,6 +361,7 @@ func get_os_global_context{
         builtin_params=get_builtin_params(),
         execute_syscalls_ptr=execute_syscalls_ptr,
         execute_deprecated_syscalls_ptr=execute_deprecated_syscalls_ptr,
+        committed_data_patricia_constants=committed_data_patricia_constants,
     );
     return os_global_context;
 }

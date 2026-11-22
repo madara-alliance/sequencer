@@ -4,6 +4,7 @@ from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, PoseidonBuiltin
 from starkware.cairo.common.default_dict import default_dict_new
 from starkware.starknet.core.os.execution.committed_data import (
+    committed_data_constants_new,
     committed_data_dispatch,
     committed_data_finalize,
 )
@@ -26,18 +27,24 @@ func main{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, poseidon_ptr: PoseidonB
         ids.second_keys = segments.gen_arg(second_keys)
         ids.gas = fixture.get('gas', 2**64 - 1)
     %}
+    let (disabled_constants) = committed_data_constants_new(0);
+    assert cast(disabled_constants, felt) = 0;
+    let (local constants) = committed_data_constants_new(1);
     let (local start) = default_dict_new(0);
     let committed_data_cache = start;
     let (local values) = alloc();
     let (local second_values) = alloc();
+    %{ result['first_start'] = step() %}
     with committed_data_cache {
-        let (local first_gas, _) = committed_data_dispatch(root, keys, count, values, gas, 1);
+        let (local first_gas, _) = committed_data_dispatch(
+            root, keys, count, values, gas, 1, constants
+        );
         %{
             result['warm_start'] = step()
             result['warm_rc_start'] = ids.range_check_ptr
         %}
         let (local second_gas, _) = committed_data_dispatch(
-            root, second_keys, second_count, second_values, first_gas, 1
+            root, second_keys, second_count, second_values, first_gas, 1, constants
         );
     }
     %{
