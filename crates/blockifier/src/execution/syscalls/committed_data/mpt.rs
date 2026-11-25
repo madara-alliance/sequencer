@@ -95,10 +95,15 @@ fn edge(hash: Felt, key: Felt, bottom: usize, top: usize) -> (Felt, Option<Vec<F
         return (hash, None);
     }
     let length = top - bottom;
-    let mut path = Felt::ZERO;
-    for bit in (bottom..top).rev() {
-        path = path * Felt::TWO + Felt::from(key_bit(key, bit as u8) as u8);
+    // Extract the edge bits before converting to a felt. Field multiplication per bit
+    // needlessly repeats Montgomery arithmetic and key encoding on every tree walk.
+    let key = key.to_bytes_le();
+    let mut path = [0u8; 32];
+    for bit in bottom..top {
+        let offset = bit - bottom;
+        path[offset / 8] |= ((key[bit / 8] >> (bit % 8)) & 1) << (offset % 8);
     }
+    let path = Felt::from_bytes_le(&path);
     (Poseidon::hash(&hash, &path) + Felt::from(length), Some(vec![Felt::from(length), path, hash]))
 }
 
@@ -378,6 +383,33 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn edge_paths_match_field_encoding_at_every_height() {
+        for key in [
+            Felt::ZERO,
+            Felt::ONE,
+            Felt::TWO.pow(251u32) - Felt::ONE,
+            Felt::from_hex_unchecked(
+                "0x123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+        ] {
+            for bottom in 0..COMMITTED_DATA_TREE_HEIGHT {
+                let mut expected = Felt::ZERO;
+                let mut weight = Felt::ONE;
+                for top in bottom + 1..=COMMITTED_DATA_TREE_HEIGHT {
+                    expected += weight * Felt::from(u8::from(key_bit(key, (top - 1) as u8)));
+                    weight *= Felt::TWO;
+                    let (hash, facts) = edge(Felt::THREE, key, bottom, top);
+                    let length = Felt::from(top - bottom);
+                    assert_eq!(facts, Some(vec![length, expected, Felt::THREE]));
+                    assert_eq!(hash, Poseidon::hash(&Felt::THREE, &expected) + length);
+                }
+            }
+        }
+        assert_eq!(edge(Felt::THREE, Felt::ONE, 7, 7), (Felt::THREE, None));
+        assert_eq!(edge(Felt::ZERO, Felt::ONE, 0, 251), (Felt::ZERO, None));
+    }
+
     #[test]
     fn incremental_values_match_rebuild_and_preserve_old_snapshots() {
         let maximum = Felt::TWO.pow(251_u32) - Felt::ONE;
