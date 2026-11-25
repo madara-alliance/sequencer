@@ -200,6 +200,69 @@ impl CommittedDataSet {
         };
         Ok(Self { entries, branches, root })
     }
+    /// Reuse a tree whose node hashes have already been authenticated by local storage.
+    ///
+    /// This checks the complete topology, key ranges and root edge, but deliberately does
+    /// not rehash binary nodes. The caller MUST authenticate every supplied branch hash
+    /// before calling this; never use it to decode remote data or unchecked disk records.
+    /// Use `new` for unauthenticated values.
+    pub fn from_authenticated_parts(
+        entries: Vec<CommittedDataEntry>,
+        branches: Vec<CommittedDataBranch>,
+        root: Felt,
+    ) -> Result<Self, CommittedDataError> {
+        let invalid = || CommittedDataError::InvalidWitness;
+        let count = entries.len();
+        if count > MAX_COMMITTED_DATA_VALUES
+            || branches.len() != count.saturating_sub(1)
+            || entries.iter().any(|(key, value)| !valid_key(*key) || *value == Felt::ZERO)
+            || entries.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(invalid());
+        }
+        // Each subtree covers one contiguous leaf interval. Adjacent intervals guarantee
+        // complete, non-overlapping coverage without cycles, aliases or unreachable nodes.
+        let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(branches.len());
+        for node in &branches {
+            let span = |id: u32| {
+                let id = id as usize;
+                if id < count { Some((id, id + 1, 0)) } else { spans.get(id - count).copied() }
+            };
+            let (start, middle, left_height) = span(node.left).ok_or_else(invalid)?;
+            let (right_start, end, right_height) = span(node.right).ok_or_else(invalid)?;
+            let bit = usize::from(node.bit);
+            if middle != right_start
+                || bit >= COMMITTED_DATA_TREE_HEIGHT
+                || left_height > bit
+                || right_height > bit
+                || key_bit(entries[start].0, node.bit)
+                || !key_bit(entries[right_start].0, node.bit)
+                || critical_bit(entries[start].0, entries[end - 1].0) != Some(node.bit)
+            {
+                return Err(invalid());
+            }
+            spans.push((start, end, bit + 1));
+        }
+        let actual_root = if count == 0 {
+            Felt::ZERO
+        } else {
+            let (hash, height) = match branches.last() {
+                Some(node) => {
+                    if spans.last().map(|&(start, end, _)| (start, end)) != Some((0, count)) {
+                        return Err(invalid());
+                    }
+                    (node.hash, usize::from(node.bit) + 1)
+                }
+                None => (entries[0].1, 0),
+            };
+            edge(hash, entries[0].0, height, COMMITTED_DATA_TREE_HEIGHT).0
+        };
+        if actual_root != root {
+            return Err(invalid());
+        }
+        Ok(Self { entries, branches, root })
+    }
+
     /// Copy an immutable snapshot and rehash only branches affected by value changes.
     /// Returns `None` for insertions or zero/deletions, which require rebuilding the topology.
     /// Repeated keys overwrite in slice order; callers still validate import uniqueness.
@@ -346,6 +409,13 @@ impl CommittedDataSet {
     }
 }
 
+fn critical_bit(first: Felt, last: Felt) -> Option<u8> {
+    first.to_bytes_be().iter().zip(last.to_bytes_be()).enumerate().find_map(|(i, (&a, b))| {
+        let xor = a ^ b;
+        (xor != 0).then(|| ((31 - i) * 8 + 7 - xor.leading_zeros() as usize) as u8)
+    })
+}
+
 fn build(
     entries: &[CommittedDataEntry],
     offset: u32,
@@ -355,17 +425,8 @@ fn build(
     if entries.len() == 1 {
         return Ok((offset, leaf(entries[0].0, entries[0].1)));
     }
-    let first = entries[0].0.to_bytes_be();
-    let last = entries[entries.len() - 1].0.to_bytes_be();
     // Keys are sorted and unique, so their first differing bit is the subtree's critical bit.
-    let bit = first
-        .iter()
-        .zip(last)
-        .enumerate()
-        .find_map(|(i, (&a, b))| {
-            let xor = a ^ b;
-            (xor != 0).then(|| ((31 - i) * 8 + 7 - xor.leading_zeros() as usize) as u8)
-        })
+    let bit = critical_bit(entries[0].0, entries[entries.len() - 1].0)
         .ok_or(CommittedDataError::DuplicateKey)?;
     let split = entries.partition_point(|entry| !key_bit(entry.0, bit));
     let (left, left_hash) = build(&entries[..split], offset, count, branches)?;
@@ -408,6 +469,91 @@ mod tests {
         }
         assert_eq!(edge(Felt::THREE, Felt::ONE, 7, 7), (Felt::THREE, None));
         assert_eq!(edge(Felt::ZERO, Felt::ONE, 0, 251), (Felt::ZERO, None));
+    }
+
+    #[test]
+    fn authenticated_parts_preserve_proofs_and_reject_invalid_topology() {
+        for entries in [
+            vec![],
+            vec![(Felt::ZERO, Felt::ONE)],
+            (0..128_u32).map(|key| (Felt::from(key), Felt::from(key + 1))).collect(),
+            (0..251_u32).map(|bit| (Felt::TWO.pow(bit), Felt::from(bit + 1))).collect(),
+        ] {
+            let expected = CommittedDataSet::new(entries).unwrap();
+            let restored = CommittedDataSet::from_authenticated_parts(
+                expected.entries.clone(),
+                expected.branches.clone(),
+                expected.root,
+            )
+            .unwrap();
+            assert_eq!(restored.entries(), expected.entries());
+            for key in expected
+                .entries
+                .iter()
+                .map(|entry| entry.0)
+                .chain([Felt::ZERO, Felt::MAX - Felt::ONE])
+            {
+                assert_eq!(restored.lookup_witness(key), expected.lookup_witness(key));
+                assert_eq!(restored.value_and_depth(key), expected.value_and_depth(key));
+            }
+            assert!(
+                CommittedDataSet::from_authenticated_parts(
+                    expected.entries.clone(),
+                    expected.branches.clone(),
+                    expected.root + Felt::ONE,
+                )
+                .is_err()
+            );
+            if expected.branches.is_empty() {
+                continue;
+            }
+            for invalid_id in [0, u32::MAX, expected.entries.len() as u32] {
+                let mut branches = expected.branches.clone();
+                branches[0].right = invalid_id; // Alias, out of bounds or self reference.
+                assert!(
+                    CommittedDataSet::from_authenticated_parts(
+                        expected.entries.clone(),
+                        branches,
+                        expected.root
+                    )
+                    .is_err()
+                );
+            }
+            let mut branches = expected.branches.clone();
+            branches[0].bit = 251;
+            assert!(
+                CommittedDataSet::from_authenticated_parts(
+                    expected.entries.clone(),
+                    branches,
+                    expected.root
+                )
+                .is_err()
+            );
+            let mut branches = expected.branches.clone();
+            branches.pop();
+            assert!(
+                CommittedDataSet::from_authenticated_parts(
+                    expected.entries.clone(),
+                    branches,
+                    expected.root
+                )
+                .is_err()
+            );
+            for (key, value) in
+                [(Felt::MAX, Felt::ONE), (Felt::ONE, Felt::ZERO), expected.entries[1]]
+            {
+                let mut entries = expected.entries.clone();
+                entries[0] = (key, value);
+                assert!(
+                    CommittedDataSet::from_authenticated_parts(
+                        entries,
+                        expected.branches.clone(),
+                        expected.root
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]
