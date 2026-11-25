@@ -195,6 +195,58 @@ impl CommittedDataSet {
         };
         Ok(Self { entries, branches, root })
     }
+    /// Copy an immutable snapshot and rehash only branches affected by value changes.
+    /// Returns `None` for insertions or zero/deletions, which require rebuilding the topology.
+    /// Repeated keys overwrite in slice order; callers still validate import uniqueness.
+    pub fn with_updated_values(&self, updates: &[CommittedDataEntry]) -> Option<Self> {
+        let mut next = Self {
+            entries: self.entries.clone(),
+            branches: self.branches.clone(),
+            root: self.root,
+        };
+        let mut changed = vec![false; self.entries.len()];
+        for &(key, value) in updates {
+            if value == Felt::ZERO {
+                return None;
+            }
+            let index = self.entries.binary_search_by_key(&key, |entry| entry.0).ok()?;
+            next.entries[index].1 = value;
+            changed[index] = value != self.entries[index].1;
+        }
+        // Topology is unchanged: visit each branch once, preserving hashes of unchanged subtrees.
+        // The arrays are copied so older roots remain usable by concurrent readers.
+        fn refresh(
+            tree: &mut CommittedDataSet,
+            id: usize,
+            changed: &[bool],
+        ) -> (Felt, Felt, usize, bool) {
+            let count = tree.entries.len();
+            if id < count {
+                let (key, value) = tree.entries[id];
+                return (value, key, 0, changed[id]);
+            }
+            let node = tree.branches[id - count];
+            let (left, key, left_height, left_changed) = refresh(tree, node.left as usize, changed);
+            let (right, right_key, right_height, right_changed) =
+                refresh(tree, node.right as usize, changed);
+            let dirty = left_changed || right_changed;
+            let hash = if dirty {
+                let left = edge(left, key, left_height, usize::from(node.bit)).0;
+                let right = edge(right, right_key, right_height, usize::from(node.bit)).0;
+                branch(node.bit, left, right)
+            } else {
+                node.hash
+            };
+            tree.branches[id - count].hash = hash;
+            (hash, key, usize::from(node.bit) + 1, dirty)
+        }
+        if changed.iter().any(|changed| *changed) {
+            let id = next.entries.len() + next.branches.len() - 1;
+            let (hash, key, height, _) = refresh(&mut next, id, &changed);
+            next.root = edge(hash, key, height, COMMITTED_DATA_TREE_HEIGHT).0;
+        }
+        Some(next)
+    }
     pub fn root(&self) -> Felt {
         self.root
     }
@@ -326,6 +378,68 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incremental_values_match_rebuild_and_preserve_old_snapshots() {
+        let maximum = Felt::TWO.pow(251_u32) - Felt::ONE;
+        for keys in [
+            vec![],
+            vec![Felt::ZERO],
+            vec![maximum],
+            (0..257_u32).map(Felt::from).collect(),
+            (0..251_u32).map(|bit| Felt::TWO.pow(bit)).chain([Felt::ZERO]).collect(),
+            (0..129_u32).map(|key| maximum - Felt::from(key * 7919)).collect(),
+        ] {
+            let mut values: Vec<_> =
+                keys.iter().enumerate().map(|(i, key)| (*key, Felt::from(i + 1))).collect();
+            let mut tree = CommittedDataSet::new(values.clone()).unwrap();
+            for round in 0..4 {
+                let original = tree.entries().to_vec();
+                let root = tree.root();
+                let mut patch = Vec::new();
+                for (i, entry) in values.iter_mut().enumerate() {
+                    if i % 4 == round {
+                        entry.1 = if i % 2 == 0 { Felt::MAX } else { Felt::from(1000 + i + round) };
+                        patch.push(*entry);
+                    }
+                }
+                patch.reverse(); // The cache API does not require sorted updates.
+                let updated = tree.with_updated_values(&patch).unwrap();
+                let rebuilt = CommittedDataSet::new(values.clone()).unwrap();
+                assert_eq!(updated.root(), rebuilt.root());
+                assert_eq!(updated.entries(), rebuilt.entries());
+                for key in [Felt::ZERO, maximum, Felt::from(12345_u32)]
+                    .into_iter()
+                    .chain(keys.first().copied())
+                    .chain(keys.get(keys.len() / 2).copied())
+                    .chain(keys.last().copied())
+                {
+                    assert_eq!(updated.lookup_witness(key), rebuilt.lookup_witness(key));
+                    assert!(updated.lookup_witness(key).verify());
+                    assert_eq!(updated.value_and_depth(key), rebuilt.value_and_depth(key));
+                }
+                assert_eq!(tree.root(), root);
+                assert_eq!(tree.entries(), original);
+                tree = updated;
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_values_leave_topology_changes_to_full_rebuild() {
+        let tree = CommittedDataSet::new(vec![(Felt::ONE, Felt::TWO)]).unwrap();
+        assert!(tree.with_updated_values(&[(Felt::THREE, Felt::ONE)]).is_none());
+        assert!(tree.with_updated_values(&[(Felt::ONE, Felt::ZERO)]).is_none());
+        assert!(tree.with_updated_values(&[(Felt::TWO.pow(251_u32), Felt::ONE)]).is_none());
+        assert_eq!(tree.with_updated_values(&[]).unwrap().root(), tree.root());
+        // A later overwrite can cancel an earlier change without invalidating cached hashes.
+        assert_eq!(
+            tree.with_updated_values(&[(Felt::ONE, Felt::THREE), (Felt::ONE, Felt::TWO)])
+                .unwrap()
+                .root(),
+            tree.root()
+        );
+    }
+
     #[test]
     fn standard_patricia_matches_independent_cairo_vectors() {
         let vectors: serde_json::Value = serde_json::from_str(include_str!(
